@@ -1,0 +1,19 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v0.15.2
+_src_path: gl:openscm/copier-core-python-repository
+conda_release: false
+email: anna.zehrung@unimelb.edu.au
+include_cli: false
+include_mypy: true
+include_ty: true
+name: Anna Zehrung
+notebook_based_docs: true
+package_manager: uv
+pandas_doctests: true
+plot_dependencies: true
+project_description_short: Playground exploration of CMIP data handling
+project_name_human: CMIP Data Manager
+project_name_pip: cmip-data-manager
+project_name_python: cmip_data_manager
+project_url: https://github.com/znicholls/CMIP-Data-Manager-Playground
+track_lock_file: true
