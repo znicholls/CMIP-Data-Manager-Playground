@@ -80,3 +80,20 @@ Some questions:
 ### Prompt things to check
 
 Does AI pick up that piControl and abrupt-4xCO2 don't have to have the same variant label, it should look at the parent metadata instead.
+
+To handle this:
+
+1. get AI to help you write a script that summarises the model-variants that had all the data for abrupt-4xCO2 but not all the data for piControl
+1. pick an example where this should work, but it isn't because we're not using the parent information
+1. use this example to help drive updates to the code
+1. check that, with the updates, our script is able to correctly identify that this model-variant does have everything we need for a Gregory calculation
+1. commit, push etc.
+
+### Other use cases
+
+1. Whatever search you need for your pattern effect analysis
+1. ERF diagnosis. For this, we need `rsut,rlut,rsdt` for `piClim-control` and then any one of the following (ideally all): `piClim-4xCO2`, `piClim-CH4`, `piClim-N2O`, `piClim-histaer`, `piClim-histghg`, `piClim-histnat`. Please make `hist-nat`, `hist-GHG` and `hist-aer` (and their parents) optional
+    - please also write a helper to print out a markdown table that has a row for each model-variant, then each experiment is a column (including the optional experiments) and an "X" in each cell for which the experiment is on ESGF for that model-variant. Sort from model-variants with the most to the least "X"'s in their row.
+
+Updating logic to handle differences in data nodes not creating different datasets. The dataset is the same, it's just available from a different place.
+Handle this during download support.
