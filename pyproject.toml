@@ -11,6 +11,8 @@ dependencies = [
     # If you use numpy, we suggest pinning to >2.1.0
     # based on the minimum supported python version
     "pandas>=2.2.0",  # pin based on minimum supported python version
+    "httpx>=0.27",  # ESGF search transport (sync + async)
+    "sqlmodel>=0.0.22",  # local database schema (pulls in SQLAlchemy + pydantic v2)
 ]
 readme = "README.md"
 classifiers = [
@@ -669,6 +671,7 @@ ignore = [
     "D",
     "S101",
     "PLR2004",
+    "TRY003",
 ]
 "docs/*" = [
     "D100",
