@@ -19,7 +19,7 @@ from __future__ import annotations
 import random
 import time
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, TypeVar
 
 import httpx
@@ -187,6 +187,35 @@ def thread_pool_map(max_workers: int = 8) -> MapFn:
 
     def mapper(func: Callable[[T], R], items: Iterable[T]) -> list[R]:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(func, items))
+
+    return mapper
+
+
+def process_pool_map(max_workers: int = 8) -> MapFn:
+    """
+    Build a `MapFn` that runs calls concurrently across separate processes
+
+    Unlike `thread_pool_map`, this uses processes, which is required for work that
+    is not thread-safe — notably reading netCDF headers, since `netCDF4`/HDF5 can
+    crash under concurrent use in a single process.  `func`, its arguments and its
+    results must all be picklable (so `func` must be importable, not a lambda or
+    closure).
+
+    Parameters
+    ----------
+    max_workers
+        Maximum number of worker processes.
+
+    Returns
+    -------
+    :
+        A callable with the same contract as `serial_map` but process-parallel.
+        Order is preserved and the first exception raised by any call propagates.
+    """
+
+    def mapper(func: Callable[[T], R], items: Iterable[T]) -> list[R]:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             return list(executor.map(func, items))
 
     return mapper

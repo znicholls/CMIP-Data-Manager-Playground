@@ -46,8 +46,12 @@ Issues = "https://github.com/znicholls/CMIP-Data-Manager-Playground/issues"
 plots = [
     "matplotlib>=3.7.1",  # pin based on minimum supported python version
 ]
+netcdf = [
+    "netCDF4>=1.6",  # read parent metadata from netCDF headers over HTTP byte-range
+]
 full = [
     "cmip-data-manager[plots]",
+    "cmip-data-manager[netcdf]",
 ]
 
 [dependency-groups]
@@ -618,6 +622,12 @@ show_error_codes = true
 show_error_context = true
 warn_unreachable = true
 follow_imports = "normal"
+
+[[tool.mypy.overrides]]
+# netCDF4 (optional `netcdf` extra) ships no type stubs.
+module = ["netCDF4"]
+ignore_missing_imports = true
+disallow_any_unimported = false
 
 [tool.ty.environment]
 extra-paths = ["stubs"]

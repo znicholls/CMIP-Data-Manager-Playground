@@ -18,13 +18,29 @@ which we call the *cells*.  Two matching strategies are built on top of it:
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from cmip_data_manager.esgf.models import DatasetRecord
 
-Cells = dict[tuple[str, str, str], set[str]]
+Cell = tuple[str, str, str]
+"""A single `(source_id, variant_label, experiment_id)` coordinate."""
+
+Cells = dict[Cell, set[str]]
 """`(source_id, variant_label, experiment_id) -> set of variable_id present`."""
+
+ParentResolver = Callable[[Cell], "Cell | None"]
+"""
+Return a cell's immediate parent cell, or `None` if it has none (or is unresolvable)
+
+This is the dependency-injection seam through which parent-aware matching reaches
+the netCDF headers: the search layer supplies a resolver backed by a client (see
+`cmip_data_manager.search.parentage.make_parent_resolver`), while tests supply a
+plain dictionary lookup.  Matching itself stays free of any I/O.
+"""
+
+_MAX_PARENT_HOPS = 5
+"""Guard against runaway/cyclic parent chains (e.g. ssp -> historical -> piControl)."""
 
 
 @dataclass(frozen=True, order=True)
@@ -49,6 +65,8 @@ class PairMatch:
     experiments: tuple[str, ...]
     optional_experiments: tuple[str, ...] = field(default_factory=tuple)
     optional_variables: tuple[str, ...] = field(default_factory=tuple)
+    parent_experiments: tuple[str, ...] = field(default_factory=tuple)
+    """Required experiments that were satisfied via a parent link, not directly."""
 
 
 def build_cells(records: Iterable[DatasetRecord]) -> Cells:
@@ -88,17 +106,76 @@ def _pairs(cells: Cells) -> list[ModelVariant]:
     return sorted({ModelVariant(s, v) for (s, v, _e) in cells})
 
 
-def pairs_all_experiments(
+def _covered_via_parent(
+    cells: Cells,
+    resolver: ParentResolver,
+    base_cell: Cell,
+    target_experiment: str,
+    needed: set[str],
+) -> bool:
+    """
+    Follow parent links from `base_cell` up to `target_experiment` and check coverage
+
+    Walks one hop at a time (e.g. `ssp245 -> historical -> piControl`), stopping when
+    it reaches the target experiment, runs out of parents, or would revisit a cell.
+    """
+    seen: set[Cell] = {base_cell}
+    cell = base_cell
+    for _ in range(_MAX_PARENT_HOPS):
+        parent = resolver(cell)
+        if parent is None or parent in seen:
+            return False
+        seen.add(parent)
+        if parent[2] == target_experiment:
+            return needed <= cells.get(parent, set())
+        cell = parent
+    return False
+
+
+def _experiment_covered(  # noqa: PLR0913 - a coverage check over several coordinates
+    cells: Cells,
+    resolver: ParentResolver | None,
+    key: tuple[str, str],
+    experiment: str,
+    needed: set[str],
+    via_parent: Mapping[str, str],
+) -> tuple[bool, bool]:
+    """
+    Report whether a pair covers `experiment`, and whether it did so via a parent
+
+    Coverage is checked directly first; only if that fails (and `experiment` has a
+    base experiment in `via_parent`) is the parent chain walked.
+    """
+    if needed <= cells.get((*key, experiment), set()):
+        return True, False
+    base = via_parent.get(experiment)
+    if base is None or resolver is None:
+        return False, False
+    reached = _covered_via_parent(cells, resolver, (*key, base), experiment, needed)
+    return reached, reached
+
+
+def pairs_all_experiments(  # noqa: PLR0913 - required/optional/parent matching knobs
     cells: Cells,
     required_vars: Sequence[str],
     required_experiments: Sequence[str],
     optional_experiments: Sequence[str] = (),
+    *,
+    resolver: ParentResolver | None = None,
+    via_parent: Mapping[str, str] | None = None,
 ) -> list[PairMatch]:
     """
     Find model variants covering all required variables in all required experiments
 
     This is the strict cross-product rule: a pair qualifies only if, for *every*
     required experiment, that experiment's cell contains *all* required variables.
+
+    A required experiment listed in `via_parent` may instead be satisfied through a
+    parent link.  For example `via_parent={"piControl": "abrupt-4xCO2"}` means "if
+    this variant has no `piControl` of its own, follow the parent chain from its
+    `abrupt-4xCO2` run" — which is how CMIP6 experiments whose parent is a *different*
+    variant (e.g. HadGEM3-GC31-LL abrupt `r1i1p1f3` / piControl `r1i1p1f1`) are
+    matched.  With no `resolver`/`via_parent` this is the plain strict rule.
 
     Parameters
     ----------
@@ -115,19 +192,42 @@ def pairs_all_experiments(
         Extra experiments to note when they also contain all required variables.
         These never affect whether a pair qualifies.
 
+    resolver
+        Resolves a cell to its parent cell, enabling `via_parent` matching.  When
+        `None`, only direct coverage counts.
+
+    via_parent
+        Maps a required experiment to the base experiment to walk its parent chain
+        from when it is not covered directly.
+
     Returns
     -------
     :
-        Matching pairs, sorted by model variant.
+        Matching pairs, sorted by model variant.  `parent_experiments` records any
+        required experiments that were satisfied via a parent link.
     """
     needed = set(required_vars)
+    links = dict(via_parent or {})
     matches: list[PairMatch] = []
     for pair in _pairs(cells):
         key = (pair.source_id, pair.variant_label)
-        if not all(
-            needed <= cells.get((*key, exp), set()) for exp in required_experiments
-        ):
+        # Short-circuit on the first uncovered experiment: this avoids resolving a
+        # parent (a network read) for a pair that is going to fail anyway, so list
+        # the cheap/base experiments first.
+        via_used: list[str] = []
+        covered = True
+        for exp in required_experiments:
+            ok, used_parent = _experiment_covered(
+                cells, resolver, key, exp, needed, links
+            )
+            if not ok:
+                covered = False
+                break
+            if used_parent:
+                via_used.append(exp)
+        if not covered:
             continue
+        via = tuple(via_used)
         optional = tuple(
             exp
             for exp in optional_experiments
@@ -138,6 +238,7 @@ def pairs_all_experiments(
                 model_variant=pair,
                 experiments=tuple(required_experiments),
                 optional_experiments=optional,
+                parent_experiments=via,
             )
         )
     return matches

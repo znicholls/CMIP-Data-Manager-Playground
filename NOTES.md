@@ -97,3 +97,49 @@ To handle this:
 
 Updating logic to handle differences in data nodes not creating different datasets. The dataset is the same, it's just available from a different place.
 Handle this during download support.
+
+
+### Anna's first day
+
+- Remove 'mon' hardcode -> frequency i
+s user specific
+- Test cases remove from src into scripts (scripts don't have type(?), intentional)
+- Test cases will be user specific. I will want to test more/less cases
+- parent/child variant_id differences : read NetCDF file header
+- will need to read through multiple chains (ie from ssp to hist to piControl)
+
+##### UC2 variant_id different between parent/child
+- Will need to add flag - > opt in explicitly about parent metadata
+
+HadGEM3-GC31-LL is the textbook case: abrupt-4xCO2 is r1i1p1f3, its parent piControl is r1i1p1f1. A Gregory calculation is perfectly valid here, but UC2 excludes it. This is exactly the concern flagged in NOTES.md:82 ("piControl and abrupt-4xCO2 don't have to have the same variant label, it should look at the parent metadata instead").
+
+Important catch: the fix isn't trivial, because the ESGF dataset search records don't carry parent metadata. I checked — the raw Solr doc for these datasets has no parent_* keys at all:
+
+keys mentioning parent: []
+
+parent_variant_label / parent_experiment_id live in the netCDF file global attributes (or the CMIP6 errata/CV), not in the Solr facets stored in DatasetRecord. So factoring in the parent means bringing in a second data source (file global attributes or a known-fixes table) — which is the "inject known fixes / grab parent data" work sketched in NOTES.md:
+
+### Anna's Second day
+- Working on parent/child
+- Threader doesn't work with netcdf? Seems slow to investigate headers
+- Only investigate parents if experiment can't find parent which matches variant_id
+- Testing all headers across all files is the massive bottlenck - now just testing first file header for each variable
+    - Will need to come back to this for mislabeled data.
+    - Eg EC-Earth3 1300 file reads down to 4 (for four variables)
+    For full live run could take 30-60 minutes
+    implement cross-cell parallelism (not sure what this is)
+Still open (unchanged, all deferred)
+
+- Per-read hard timeout — netcdf ignores the rc timeout for byte-range, so a stalled https mirror can still cost ~100s; the ~7 min is mostly those stalls + serial file searches. A real cap needs killing stuck worker processes.
+- Phase 3 (DB persistence) — cache the links so it's one-time and offline runs are parent-aware. Highest-leverage next step now that resolution is fast-ish but not free.
+- preferred_hosts (your future arg) and parallelising the per-cell file searches.
+
+Your esgf_cache.sqlite was never touched — all live work went to a scratch DB. Want me to do Phase 3 next, or stop here?
+
+- Another ssp119 chain assessment below
+- For next week this could actually be useful because it will be important for download...
+We've hit a different bottleneck now — and it's the real answer. Let me check process state before killing.
+
+  Ran 1 shell command
+
+The process has been stuck for 1h11m — and the cause is now clear from the curlcode: (28) lines: individual netCDF byte-range reads are blocking for 15–25 minutes each (899525 ms, 1545493 ms) on data nodes that accept the connection but never send bytes. netCDF4/libcurl has effectively no read timeout, so one stuck mirror pins a worker indefinitely. Let me kill it and assess.

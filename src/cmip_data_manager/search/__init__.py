@@ -9,27 +9,36 @@ intersect the results at `(source_id, variant_label, experiment_id)` granularity
 from __future__ import annotations
 
 from cmip_data_manager.search.aggregate import (
+    Cell,
     ModelVariant,
     PairMatch,
+    ParentResolver,
     build_cells,
     pairs_all_experiments,
     pairs_any_experiment,
 )
-from cmip_data_manager.search.use_cases import (
+from cmip_data_manager.search.parentage import (
+    ParentConflict,
+    parent_cell_of,
+    resolve_parent_links,
+)
+from cmip_data_manager.search.runner import (
+    ParentSpec,
     UseCase,
     UseCaseResult,
     discover_experiments,
     fetch_records,
+    per_variable_experiment,
     run_use_case,
-    uc1_tas_ssp245,
-    uc2_forcing,
-    uc3_carbon,
-    uc4_esm,
 )
 
 __all__ = [
+    "Cell",
     "ModelVariant",
     "PairMatch",
+    "ParentConflict",
+    "ParentResolver",
+    "ParentSpec",
     "UseCase",
     "UseCaseResult",
     "build_cells",
@@ -37,9 +46,8 @@ __all__ = [
     "fetch_records",
     "pairs_all_experiments",
     "pairs_any_experiment",
+    "parent_cell_of",
+    "per_variable_experiment",
+    "resolve_parent_links",
     "run_use_case",
-    "uc1_tas_ssp245",
-    "uc2_forcing",
-    "uc3_carbon",
-    "uc4_esm",
 ]
