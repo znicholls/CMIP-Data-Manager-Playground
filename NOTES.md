@@ -143,3 +143,51 @@ We've hit a different bottleneck now — and it's the real answer. Let me check 
   Ran 1 shell command
 
 The process has been stuck for 1h11m — and the cause is now clear from the curlcode: (28) lines: individual netCDF byte-range reads are blocking for 15–25 minutes each (899525 ms, 1545493 ms) on data nodes that accept the connection but never send bytes. netCDF4/libcurl has effectively no read timeout, so one stuck mirror pins a worker indefinitely. Let me kill it and assess.
+
+### Third day (13/7)
+ We have done test-case 1, searching for all data from ssp245 for the tas variable. You already have local search results in our SQLite database (the `esgf_cache.sqlite` file). Our next problem is this: for each file, we want to get information about its parent file. That information isn't in the search results, instead we have to get it from the actual files that sit underneath each dataset.
+
+  What solution would you suggest for adding this 'file-only metadata' information to each dataset search record?
+
+  Some context which will help.
+
+  To get the file-only metadata, you have to open the file. Each dataset search record should provide information about how to access the files that sit underneath it. We will need to somehow represent and engage with that information. We believe it's possible to just get the metadata (aka the file header), without having to download the full file, please check this and see how well supported it is. There can be lots of files that belong to a given dataset. We suspect that reading all the files' metadata will be too slow, so we'll have to just read the first file's metadata and assume that it's the same across all files, please tell us if you thiompromise.
+                                                                                                                                                                                                    Given how slow accessing metadata is likely to be, we suspect you'll need to paralstinct would be to use thread pools, but maybe we have to use process pools. Youcan tell us.
+  Then the other piece of information is that different data nodes have different access speeds, reliability etc. We want to gather information on data node health/statistics during this process. We want to track things like response time, download speed, number of retries requuccess was recorded for this node (some nodes are just dead so will neversuceed). When trying to access file metadata information, the options seem to be as follows: 1. The data node connects, we access the metadata, and this is a success. 2. The data node connects, but 'stalls' and can stay connected for up to 25 minutes, this is not a success. Wmum wait time and ideally some way to measure whether that wait time is sensibleor not (e.g. waiting 5 seconds is too short, but 5 hours is too long, how do we determine the right value between these two)? 3. The data node does not connect, we retry the connection x times
+  and the process is eventually successful, this is a success. Again, how many timesbefore we say it is a failure and how can we set this maximum retry numbersensibly? 4. The data node does not connect, we try multiple times, it does not connect. This is a failure.
+
+
+Answers to some questions:
+1. How process isolation + kill-on-overrun fits parallelisation
+
+The unit of work becomes: one header read = (spawn a child process, wait on it with a hard deadline, reap it — or kill it if it overruns). Parallelism is then a thread pool over those units:
+
+- Threads are the right fan-out here precisely because the heavy work isn't in the thread. Each thread just starts a child, blocks on wait([pipe], timeout), and collects the result. The netCDF + libcurl work runs in the child process, so the GIL isn't held during the wait, and netCDF's thread-unsafety is moot — it never runs in the threads. This is what lets us drop the old process-pool-for-thread-safety requirement.
+- Per-read kill is the whole point. Because each read owns its own process, we can terminate exactly the stalled one and leave the other 7 running. A shared ProcessPoolExecutor can't do this — you can't cancel a task already executing in a worker; one 25-minute stall poisons that worker and you'd have to tear the pool down.
+- Concurrency = pool size = max simultaneous child processes (say 8). Each child costs ~0.5–1 s to spawn + import netCDF, amortised against the read. One caveat worth flagging: against a fast node like NCI (~1.2 s reads), that spawn overhead is proportionally large (~50%). So for an all-NCI run you'd either widen the pool or, later, move to a small pool of persistent worker processes with a supervisor that kills+replaces any worker exceeding the deadline — same gua'd start with spawn-per-read (simple, correct) and keep the persistent-workervariant as a known optimisation.
+- Failures (HeaderReadTimeout, HeaderReadCrashed) are OSErrors, so the existing mirror-fallback catches them and tries the next mirror. Order is preserved by the thread map.
+2. Preferred node — and it's cheap to check
+                                                                                                                                                                                                 API: a preferred_hosts: tuple[str, ...] parameter threaded into the candidate-orde preferred → healthy-HTTPS → HTTPS → rest, minus ignore_hosts. You set("esgf.nci.org.au",); someone in Europe sets DKRZ/CEDA. NCI gets tried first whenever it's among a file's mirrors.
+                                                                                                                                                                                                 Is checking "does NCI have this file" expensive? No — measured ~0.2 s, and it batc
+- If the file search already returned an NCI mirror → free, it's just a list check.
+- If not (the origin-pinned search didn't surface it) → query NCI's own index by instance_id: 0.20 s, and I can OR many instance_ids into one 0.20 s query. Negligible next to 1–20 s reads.
+But one real finding: NCI coverage is partial. Of the 5 cached UC1 datasets I probed (EC-Earth3-CC, ACCESS-ESM1-5, CNRM-CM6-1, CanESM5), 0 were on NCI — even the Australian CSIRO ACCESS-ESM1-5 replica came from ORNL/ALCF — yet TaiESM1 was on NCI. So preferred-node must fall s the file (the ordering does this naturally: NCI-first if present, otherwise nextmirror). My recommendation: don't eagerly probe every file; use mirrors already in the search results, and optionally run one batched NCI probe per run to enrich mirror lists. Cheap and optional.
+3. Storage — do both, keyed per (dataset, variable)
+                                                                                                                                                                                                 Your instinct to worry about differing columns and cost is right, and the resoluti matters more than the format:
+
+- Store per (dataset_id, variable_id), not per file. All time-chunks of a variable share the same global attributes, and you already read one header per variable — so one row per variable. For UC1 (one variable) that's one row per dataset. Storing per file would be redundant
+- Full global-attrs JSON as the canonical column (attrs_json). A CMIP6 global-attr block is ~40–50 attributes, ~1–3 KB of text — genuinely cheap. At per-variable grain, thousands of datasets is single-digit MB. The JSON absorbs cross-model differences (your worry (a)) and serves future, unknown use cases without re-hitting the network (worry (b)).
+- Plus a handful of promoted, indexed, nullable columns for the keys you actually filter/join on — parent_source_id, parent_variant_label, parent_experiment_id, parent_activity_id, tracking_id, branch_time_in_parent. These are a denormalised index over the JSON, not a replacement.
+- Plus provenance: source_url (which mirror served it) and read_at (for staleness
+
+Rule of thumb: JSON is the source of truth; promoted columns are a fast index; reamote what you query. This means a new use case that wants, say, forcing_index justreads it from the stored JSON — or you promote it to a column later — with zero extra network. Cost (worry (c)) is a non-issue at KB-per-variable.
+
+---
+That fully specifies the decoupled design. Concretely, what I'd build:
+
+- esgf/headers.py — HeaderMetadata, general read_header(url, attrs=None) (all attrs by default), the mirror helpers + preferred_hosts ordering, and with_timeout. read_parent_info becomes a thin projection.
+- esgf/health.py — NodeHealth + recording wrapper.
+- db — a DatasetHeader table (JSON + promoted columns + provenance) with repository store_headers/get_headers.
+- A general enrich_headers(datasets, client, repo, health, *, preferred_hosts, ...pec, that any use case can run; wire it for UC1 in the script.
+
+Want me to start implementing this, beginning with esgf/headers.py + esgf/health.ption, no DB churn yet), then move to the DatasetHeader table and the UC1 enrichment wiring?
