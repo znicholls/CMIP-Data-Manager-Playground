@@ -58,10 +58,18 @@ class NodeStat:
     total_success_seconds: float = 0.0
     """Summed duration of successful reads (for the mean)."""
 
+    max_success_seconds: float = 0.0
+    """Slowest successful read seen (for sizing a data-driven timeout)."""
+
     @property
     def success_rate(self) -> float:
         """Fraction of attempts that succeeded (`0.0` if never attempted)."""
         return self.successes / self.attempts if self.attempts else 0.0
+
+    @property
+    def failure_rate(self) -> float:
+        """Fraction of attempts that did *not* succeed (`0.0` if never tried)."""
+        return 1.0 - self.success_rate if self.attempts else 0.0
 
     @property
     def mean_success_seconds(self) -> float | None:
@@ -112,12 +120,28 @@ class NodeHealth:
             if outcome is ReadOutcome.SUCCESS:
                 stat.successes += 1
                 stat.total_success_seconds += seconds
+                stat.max_success_seconds = max(stat.max_success_seconds, seconds)
             elif outcome is ReadOutcome.TIMEOUT:
                 stat.timeouts += 1
             elif outcome is ReadOutcome.CRASH:
                 stat.crashes += 1
             else:
                 stat.errors += 1
+
+    def restore(self, stat: NodeStat) -> None:
+        """
+        Seed a host's stats wholesale (e.g. from persisted `NodeHealthStat` rows)
+
+        Replaces any existing counters for `stat.host`, so a run can pick up where
+        earlier runs left off before recording fresh outcomes on top.
+
+        Parameters
+        ----------
+        stat
+            The accumulated stats to install for `stat.host`.
+        """
+        with self._lock:
+            self._stats[stat.host] = stat
 
     def stat(self, host: str) -> NodeStat | None:
         """Return the accumulated stats for `host`, or `None` if unseen."""
@@ -172,6 +196,132 @@ class NodeHealth:
                 if stat.attempts >= min_attempts
                 and stat.success_rate <= max_success_rate
             )
+
+    def rank_by_reliability(self, *, min_attempts: int = 1) -> list[NodeStat]:
+        """
+        Rank hosts best-to-worst by the share of reads that succeeded
+
+        Answers "which nodes fail the fewest header requests?".  Hosts are ordered
+        by ascending `failure_rate`, breaking ties in favour of the more-tried host
+        (more evidence) then alphabetically for determinism.
+
+        Parameters
+        ----------
+        min_attempts
+            Ignore hosts tried fewer than this many times (too little evidence).
+
+        Returns
+        -------
+        :
+            The qualifying hosts' stats, most reliable first.
+        """
+        with self._lock:
+            candidates = [
+                stat for stat in self._stats.values() if stat.attempts >= min_attempts
+            ]
+        return sorted(candidates, key=lambda s: (s.failure_rate, -s.attempts, s.host))
+
+    def rank_by_speed(self, *, min_successes: int = 1) -> list[NodeStat]:
+        """
+        Rank hosts fastest-to-slowest by mean successful-read time
+
+        Answers "which nodes respond quickest?".  Only hosts with at least
+        `min_successes` successful reads are ranked (a node with no success has no
+        meaningful speed), ordered by ascending `mean_success_seconds`.
+
+        Parameters
+        ----------
+        min_successes
+            Ignore hosts with fewer successful reads than this.
+
+        Returns
+        -------
+        :
+            The qualifying hosts' stats, fastest first.
+        """
+        with self._lock:
+            candidates = [
+                stat for stat in self._stats.values() if stat.successes >= min_successes
+            ]
+        return sorted(candidates, key=lambda s: (s.mean_success_seconds or 0.0, s.host))
+
+    def host_rank(
+        self, host: str, *, min_attempts: int = 1, unseen_score: float = 0.5
+    ) -> tuple[float, float]:
+        """
+        Return a best-first sort key for a host, from its observed health
+
+        Designed to be passed to `headers.order_candidates(..., host_rank=...)` so
+        mirror ordering reflects what a node has actually done.  The key is
+        `(failure_rate, mean_success_seconds)`: proven-reliable nodes sort ahead of
+        flaky ones, and faster nodes break ties among equally reliable ones.
+
+        A host with fewer than `min_attempts` attempts is *unseen* and gets a
+        neutral `failure_rate` of `unseen_score` (default `0.5`): it ranks behind
+        nodes that have proved themselves (failure rate below `0.5`) but ahead of
+        nodes that have proved unreliable (above `0.5`), so untried nodes still get
+        explored rather than being trusted or condemned on no evidence.
+
+        Parameters
+        ----------
+        host
+            Hostname to score.
+
+        min_attempts
+            Attempts below which a host is treated as unseen.
+
+        unseen_score
+            The neutral failure-rate score given to unseen hosts.
+
+        Returns
+        -------
+        :
+            The `(failure_rate, seconds)` sort key (lower is better).
+        """
+        with self._lock:
+            stat = self._stats.get(host)
+        if stat is None or stat.attempts < min_attempts:
+            return (unseen_score, 0.0)
+        return (stat.failure_rate, stat.mean_success_seconds or float("inf"))
+
+    def suggested_timeout(
+        self, *, safety: float = 1.5, floor: float = 10.0, default: float | None = None
+    ) -> float | None:
+        """
+        Suggest a read timeout from the slowest *healthy* read observed
+
+        The timeout only needs to outlast a genuinely slow-but-alive node; anything
+        beyond that is a stall to be cut off.  This takes the slowest successful
+        read seen on any host, pads it by `safety`, and floors it so a couple of
+        fast early reads cannot set an absurdly tight deadline.  For example, a
+        worst healthy read of 45s with `safety=1.5` suggests ~68s — meaningfully
+        tighter than a blanket 90s while still clearing a real 45s read.
+
+        Parameters
+        ----------
+        safety
+            Multiplier applied to the slowest healthy read (headroom).
+
+        floor
+            Lower bound on the suggested timeout.
+
+        default
+            Returned when no read has yet succeeded (no evidence to size from).
+
+        Returns
+        -------
+        :
+            The suggested timeout in seconds, or `default` if nothing has
+            succeeded.
+        """
+        with self._lock:
+            worst = max(
+                (s.max_success_seconds for s in self._stats.values() if s.successes),
+                default=0.0,
+            )
+        if worst <= 0.0:
+            return default
+        return max(floor, worst * safety)
 
 
 def recording(reader: Callable[[str], T], health: NodeHealth) -> Callable[[str], T]:

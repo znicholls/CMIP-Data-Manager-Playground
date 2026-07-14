@@ -11,11 +11,13 @@ from cmip_data_manager.esgf.headers import (
     HeaderReadCrashed,
     HeaderReadTimeout,
     candidate_urls_for_files,
+    header_key,
     http_download_url,
     http_download_urls,
     order_candidates,
     read_first_readable,
     simulation_key,
+    with_retry,
     with_timeout,
 )
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
@@ -85,6 +87,34 @@ def test_order_candidates_honours_preferred_order():
 def test_order_candidates_drops_ignored_hosts_and_dedupes():
     urls = ["https://a/f.nc", "https://a/f.nc", "https://bad/f.nc"]
     assert order_candidates(urls, ignore_hosts=frozenset({"bad"})) == ["https://a/f.nc"]
+
+
+def test_order_candidates_uses_host_rank_health():
+    urls = ["https://slow/f.nc", "https://fast/f.nc", "https://unseen/f.nc"]
+    rank = {"fast": (0.0, 1.0), "slow": (0.0, 9.0)}  # unseen absent -> neutral 0.5
+
+    def host_rank(host: str) -> tuple[float, float]:
+        return rank.get(host, (0.5, 0.0))
+
+    # fast (reliable+quick) first, slow (reliable but slow) next, unseen last.
+    assert order_candidates(urls, host_rank=host_rank) == [
+        "https://fast/f.nc",
+        "https://slow/f.nc",
+        "https://unseen/f.nc",
+    ]
+
+
+def test_order_candidates_preferred_beats_health():
+    urls = ["https://healthy/f.nc", "https://nci/f.nc"]
+
+    def host_rank(host: str) -> tuple[float, float]:
+        return {"healthy": (0.0, 0.1)}.get(host, (0.9, 0.0))  # nci looks unreliable
+
+    # An explicit preference still wins over learned health.
+    assert order_candidates(urls, preferred_hosts=("nci",), host_rank=host_rank) == [
+        "https://nci/f.nc",
+        "https://healthy/f.nc",
+    ]
 
 
 def test_candidate_urls_pool_across_a_simulations_files():
@@ -176,3 +206,97 @@ def test_with_timeout_timeout_is_an_oserror_so_fallback_skips_it():
     assert read_first_readable(["https://stall/f.nc", "https://ok/f.nc"], reader) == (
         "https://ok/f.nc"
     )
+
+
+def _rec(**fields):
+    base = {
+        "id": "d",
+        "source_id": "ACCESS-ESM1-5",
+        "experiment_id": "ssp245",
+        "variant_label": "r1i1p1f1",
+        "variable_id": "tas",
+        "table_id": "Amon",
+        "raw": {},
+    }
+    base.update(fields)
+    return DatasetRecord(**base)
+
+
+def test_header_key_includes_variable_and_table():
+    assert header_key(_rec()) == (
+        "ACCESS-ESM1-5",
+        "ssp245",
+        "r1i1p1f1",
+        "tas",
+        "Amon",
+    )
+
+
+def test_header_key_none_when_table_missing():
+    assert header_key(_rec(table_id=None)) is None
+
+
+def test_with_retry_succeeds_after_transient_failures():
+    calls = {"n": 0}
+
+    def flaky(url: str) -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("connection reset")
+        return url
+
+    read = with_retry(flaky, max_attempts=3, base=0.0, jitter=0.0)
+    assert read("https://node/f.nc") == "https://node/f.nc"
+    assert calls["n"] == 3
+
+
+def test_with_retry_gives_up_after_max_attempts():
+    calls = {"n": 0}
+
+    def always_fails(url: str) -> str:
+        calls["n"] += 1
+        raise OSError("refused")
+
+    read = with_retry(always_fails, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(OSError, match="refused"):
+        read("https://dead/f.nc")
+    assert calls["n"] == 3  # one try plus two retries, then propagates
+
+
+def test_with_retry_does_not_retry_a_stall():
+    calls = {"n": 0}
+
+    def staller(url: str) -> str:
+        calls["n"] += 1
+        raise HeaderReadTimeout(url, 90.0)
+
+    read = with_retry(staller, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(HeaderReadTimeout):
+        read("https://stalled/f.nc")
+    assert calls["n"] == 1  # a stall is given up on immediately
+
+
+def test_with_retry_does_not_retry_a_crash():
+    calls = {"n": 0}
+
+    def crasher(url: str) -> str:
+        calls["n"] += 1
+        raise HeaderReadCrashed(url, 1)
+
+    read = with_retry(crasher, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(HeaderReadCrashed):
+        read("https://corrupt/f.nc")
+    assert calls["n"] == 1
+
+
+def test_with_retry_backoff_sleeps_between_attempts():
+    slept: list[float] = []
+
+    def flaky(url: str) -> str:
+        if len(slept) < 2:
+            raise OSError("reset")
+        return url
+
+    read = with_retry(flaky, max_attempts=5, base=1.0, jitter=0.0, sleep=slept.append)
+    assert read("https://node/f.nc") == "https://node/f.nc"
+    assert slept == [1.0, 2.0]  # exponential: base*2**0, base*2**1

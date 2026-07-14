@@ -138,3 +138,74 @@ class DatasetChange(SQLModel, table=True):
     """Optional JSON with extra context (e.g. old/new timestamps)."""
 
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class DatasetHeader(SQLModel, table=True):
+    """
+    A netCDF file's cached global-attribute header
+
+    Keyed at the `(source_id, experiment_id, variant_label, variable_id,
+    table_id)` grain: one row per dataset.  `table_id` is part of the key because
+    the same variable can be published at several frequencies (`Amon` vs `day`).
+    The header describes the *simulation* and is assumed identical across a
+    simulation's variables, so a later "smart reader" can reuse a sibling
+    variable's row for the same `(source_id, experiment_id, variant_label)` rather
+    than re-reading — but each read is still filed under the exact dataset it came
+    from.
+
+    Storage is hybrid: the frequently-queried CMIP6 `parent_*`/`tracking_id`
+    attributes are promoted to indexed columns, while `attrs_json` retains the
+    complete header so nothing read is ever lost and new attributes can be promoted
+    later without a re-read.
+    """
+
+    source_id: str = Field(primary_key=True)
+    experiment_id: str = Field(primary_key=True)
+    variant_label: str = Field(primary_key=True)
+    variable_id: str = Field(primary_key=True)
+    table_id: str = Field(primary_key=True)
+
+    parent_source_id: str | None = Field(default=None, index=True)
+    parent_experiment_id: str | None = Field(default=None, index=True)
+    parent_variant_label: str | None = Field(default=None, index=True)
+    parent_activity_id: str | None = None
+    branch_time_in_parent: str | None = None
+    """Kept as text: attribute values are read as strings (e.g. `"60225.0"`)."""
+
+    tracking_id: str | None = None
+
+    attrs_json: str
+    """Every global attribute read, as JSON (the canonical copy)."""
+
+    source_url: str | None = None
+    """The exact mirror URL the header was read from (file-level provenance)."""
+
+    data_node: str | None = Field(default=None, index=True)
+    """Hostname of `source_url`; the data node that served the header."""
+
+    read_at: datetime = Field(default_factory=_utcnow)
+
+
+class NodeHealthStat(SQLModel, table=True):
+    """
+    Persisted per-data-node header-read outcomes
+
+    One row per host, carrying the accumulated counters so node health survives
+    across runs and can be ranked (by failure rate or response speed) with a plain
+    `ORDER BY`.  A run loads these into an in-memory registry, records fresh
+    outcomes against them, and writes them back.
+    """
+
+    host: str = Field(primary_key=True)
+    attempts: int = 0
+    successes: int = 0
+    timeouts: int = 0
+    crashes: int = 0
+    errors: int = 0
+    total_success_seconds: float = 0.0
+    """Summed duration of successful reads (numerator of the mean)."""
+
+    max_success_seconds: float = 0.0
+    """Slowest successful read seen; informs a data-driven read timeout."""
+
+    updated_at: datetime = Field(default_factory=_utcnow)

@@ -18,14 +18,18 @@ from cmip_data_manager.esgf.concurrency import (
     thread_pool_map,
 )
 from cmip_data_manager.esgf.headers import (
+    PROMOTED_ATTRS,
+    HeaderKey,
     HeaderMetadata,
     HeaderReadCrashed,
     HeaderReadTimeout,
     candidate_urls_for_files,
+    header_key,
     order_candidates,
     read_first_readable,
     read_header,
     simulation_key,
+    with_retry,
     with_timeout,
 )
 from cmip_data_manager.esgf.health import (
@@ -50,11 +54,13 @@ from cmip_data_manager.esgf.parents import (
 from cmip_data_manager.esgf.query import FacetQuery
 
 __all__ = [
+    "PROMOTED_ATTRS",
     "AmbiguousFieldError",
     "DatasetRecord",
     "ESGFSearchClient",
     "FacetQuery",
     "FileRecord",
+    "HeaderKey",
     "HeaderMetadata",
     "HeaderReadCrashed",
     "HeaderReadTimeout",
@@ -65,6 +71,7 @@ __all__ = [
     "ReadOutcome",
     "candidate_urls_for_files",
     "exponential_backoff",
+    "header_key",
     "http_download_url",
     "http_download_urls",
     "httpx_fetch",
@@ -79,5 +86,6 @@ __all__ = [
     "serial_map",
     "simulation_key",
     "thread_pool_map",
+    "with_retry",
     "with_timeout",
 ]

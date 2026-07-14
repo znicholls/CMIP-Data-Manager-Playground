@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from cmip_data_manager.esgf.headers import HeaderReadCrashed, HeaderReadTimeout
-from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome, recording
+from cmip_data_manager.esgf.health import (
+    NodeHealth,
+    NodeStat,
+    ReadOutcome,
+    recording,
+)
 
 
 def test_record_accumulates_success_rate_and_timing():
@@ -92,3 +97,66 @@ def test_recording_classifies_crash_and_generic_oserror():
 
     assert health.stat("corrupt").crashes == 1
     assert health.stat("dead").errors == 1
+
+
+def test_failure_rate_and_max_success_seconds():
+    health = NodeHealth()
+    health.record("https://a/f.nc", ReadOutcome.SUCCESS, 2.0)
+    health.record("https://a/g.nc", ReadOutcome.SUCCESS, 5.0)
+    health.record("https://a/h.nc", ReadOutcome.TIMEOUT, 90.0)
+    stat = health.stat("a")
+    assert stat.failure_rate == pytest.approx(1 / 3)
+    assert stat.max_success_seconds == 5.0
+
+
+def test_failure_rate_zero_when_never_attempted():
+    assert NodeStat(host="x").failure_rate == 0.0
+
+
+def test_rank_by_reliability_orders_best_first():
+    health = NodeHealth()
+    health.record("https://good/f.nc", ReadOutcome.SUCCESS, 1.0)
+    health.record("https://bad/f.nc", ReadOutcome.SUCCESS, 1.0)
+    health.record("https://bad/g.nc", ReadOutcome.ERROR, 1.0)
+    ranked = [s.host for s in health.rank_by_reliability()]
+    assert ranked == ["good", "bad"]
+
+
+def test_rank_by_reliability_skips_thinly_tried_hosts():
+    health = NodeHealth()
+    health.record("https://a/f.nc", ReadOutcome.SUCCESS, 1.0)
+    health.record("https://a/g.nc", ReadOutcome.SUCCESS, 1.0)
+    health.record("https://b/f.nc", ReadOutcome.SUCCESS, 1.0)  # only one attempt
+    ranked = [s.host for s in health.rank_by_reliability(min_attempts=2)]
+    assert ranked == ["a"]
+
+
+def test_rank_by_speed_only_hosts_with_success_fastest_first():
+    health = NodeHealth()
+    health.record("https://slow/f.nc", ReadOutcome.SUCCESS, 9.0)
+    health.record("https://fast/f.nc", ReadOutcome.SUCCESS, 1.0)
+    health.record("https://never/f.nc", ReadOutcome.TIMEOUT, 90.0)
+    ranked = [s.host for s in health.rank_by_speed()]
+    assert ranked == ["fast", "slow"]  # "never" excluded — no success
+
+
+def test_suggested_timeout_from_slowest_healthy_read():
+    health = NodeHealth()
+    health.record("https://a/f.nc", ReadOutcome.SUCCESS, 45.0)
+    health.record("https://b/f.nc", ReadOutcome.SUCCESS, 2.0)
+    # slowest healthy read 45s, padded by safety 1.5 -> ~67.5s
+    assert health.suggested_timeout(safety=1.5) == pytest.approx(67.5)
+
+
+def test_suggested_timeout_floor_and_default():
+    health = NodeHealth()
+    assert health.suggested_timeout(default=90.0) == 90.0  # no evidence yet
+    health.record("https://a/f.nc", ReadOutcome.SUCCESS, 1.0)
+    # 1s * 1.5 = 1.5s, floored to 10s
+    assert health.suggested_timeout(safety=1.5, floor=10.0) == 10.0
+
+
+def test_restore_replaces_host_stats():
+    health = NodeHealth()
+    health.restore(NodeStat(host="a", attempts=5, successes=4))
+    assert health.stat("a").successes == 4

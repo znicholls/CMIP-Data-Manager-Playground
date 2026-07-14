@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cmip_data_manager.esgf.headers import HeaderMetadata
+from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
 
@@ -92,3 +94,109 @@ def test_store_files_upserts(repository):
         [FileRecord(id="f0", dataset_id="ds0", size=2, raw={})]
     )
     assert stored == 1
+
+
+def _header(**attrs):
+    return HeaderMetadata(
+        attrs={
+            "parent_source_id": "ACCESS-ESM1-5",
+            "parent_experiment_id": "historical",
+            "parent_variant_label": "r1i1p1f1",
+            "tracking_id": "hdl:21.14100/abc",
+            "branch_time_in_parent": "60225.0",
+            "grid": "native atmosphere N96 grid",
+            **attrs,
+        },
+        source_url="https://esgf.nci.org.au/thredds/fileServer/x/tas.nc",
+    )
+
+
+_KEY = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "tas", "Amon")
+
+
+def test_store_and_get_header_roundtrips_all_attrs(repository):
+    stored = repository.store_headers({_KEY: _header()})
+    assert stored == 1
+    got = repository.get_header(_KEY)
+    assert got is not None
+    assert got.get("parent_experiment_id") == "historical"
+    assert got.get("grid") == "native atmosphere N96 grid"  # from attrs_json
+    assert got.source_url.endswith("tas.nc")
+
+
+def test_get_header_missing_is_none(repository):
+    assert repository.get_header(_KEY) is None
+
+
+def test_store_headers_upserts_on_same_key(repository):
+    repository.store_headers({_KEY: _header()})
+    repository.store_headers({_KEY: _header(parent_experiment_id="piControl")})
+    got = repository.get_header(_KEY)
+    assert got.get("parent_experiment_id") == "piControl"
+
+
+def test_table_id_distinguishes_same_variable(repository):
+    day_key = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "tas", "day")
+    repository.store_headers(
+        {
+            _KEY: _header(tracking_id="mon"),
+            day_key: _header(tracking_id="day"),
+        }
+    )
+    assert repository.get_header(_KEY).get("tracking_id") == "mon"
+    assert repository.get_header(day_key).get("tracking_id") == "day"
+
+
+def test_get_simulation_headers_spans_variables(repository):
+    rsut_key = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "rsut", "Amon")
+    other_sim = ("CanESM5", "ssp245", "r1i1p1f1", "tas", "Amon")
+    repository.store_headers(
+        {_KEY: _header(), rsut_key: _header(), other_sim: _header()}
+    )
+    headers = repository.get_simulation_headers("ACCESS-ESM1-5", "ssp245", "r1i1p1f1")
+    assert len(headers) == 2  # tas + rsut, not the CanESM5 simulation
+
+
+def test_node_health_persists_and_reloads(repository):
+    health = NodeHealth()
+    health.record("https://nci/f.nc", ReadOutcome.SUCCESS, 1.5)
+    health.record("https://nci/g.nc", ReadOutcome.SUCCESS, 2.5)
+    health.record("https://dead/f.nc", ReadOutcome.TIMEOUT, 90.0)
+    assert repository.save_node_health(health) == 2
+
+    reloaded = repository.load_node_health()
+    nci = reloaded.stat("nci")
+    assert nci.successes == 2
+    assert nci.max_success_seconds == 2.5
+    assert reloaded.stat("dead").timeouts == 1
+
+
+def test_node_health_save_accumulates_across_runs(repository):
+    first = NodeHealth()
+    first.record("https://nci/f.nc", ReadOutcome.SUCCESS, 1.0)
+    repository.save_node_health(first)
+
+    # A later run loads, records more, saves back.
+    later = repository.load_node_health()
+    later.record("https://nci/g.nc", ReadOutcome.ERROR, 1.0)
+    repository.save_node_health(later)
+
+    final = repository.load_node_health().stat("nci")
+    assert final.attempts == 2 and final.successes == 1 and final.errors == 1
+
+
+def test_rank_nodes_by_reliability_and_speed(repository):
+    health = NodeHealth()
+    # fast + flawless
+    health.record("https://nci/f.nc", ReadOutcome.SUCCESS, 1.0)
+    # slower but reliable
+    health.record("https://ceda/f.nc", ReadOutcome.SUCCESS, 8.0)
+    # sometimes fails
+    health.record("https://flaky/f.nc", ReadOutcome.SUCCESS, 3.0)
+    health.record("https://flaky/g.nc", ReadOutcome.ERROR, 1.0)
+    repository.save_node_health(health)
+
+    by_reliability = [r.host for r in repository.rank_nodes_by_reliability()]
+    assert by_reliability[-1] == "flaky"  # worst success rate ranks last
+    by_speed = [r.host for r in repository.rank_nodes_by_speed()]
+    assert by_speed[0] == "nci"  # fastest mean response first

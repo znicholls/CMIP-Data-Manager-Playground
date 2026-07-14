@@ -35,6 +35,8 @@ Two facts shape the design:
 from __future__ import annotations
 
 import multiprocessing as mp
+import random
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
@@ -65,9 +67,85 @@ high percentile of the *observed* healthy-read time once `NodeHealth` has data.
 DEFAULT_KILL_GRACE = 2.0
 """Seconds to wait for a terminated child to exit before escalating to `kill`."""
 
+DEFAULT_MAX_ATTEMPTS = 3
+"""
+Default total attempts (one try plus two retries) for a single mirror.
+
+A transient connection failure (refused/reset, a momentarily overloaded node)
+almost always clears within a retry or two, while a node that fails three times
+in a row is very likely down rather than blipping.  Kept deliberately small: this
+retries the *same* host, and `read_first_readable` already falls through to other
+mirrors, so a large count multiplies latency and starts to look like abuse.  Tune
+it later from `NodeHealth` — e.g. the attempts a recovering node actually needed.
+"""
+
+DEFAULT_RETRY_BASE = 1.0
+"""Base backoff delay in seconds; attempt `n` waits about `base * 2**(n-1)`."""
+
+DEFAULT_RETRY_CAP = 20.0
+"""Maximum backoff delay in seconds between attempts."""
+
+DEFAULT_RETRY_JITTER = 0.5
+"""Fractional random jitter (`[0, jitter] * delay`) to de-synchronise retries."""
+
 
 SimulationKey = tuple[str, str, str]
 """A simulation's identity: `(source_id, experiment_id, variant_label)`."""
+
+HeaderKey = tuple[str, str, str, str, str]
+"""A stored header's identity: a `SimulationKey` plus `variable_id` and `table_id`."""
+
+PROMOTED_ATTRS = (
+    "parent_source_id",
+    "parent_experiment_id",
+    "parent_variant_label",
+    "parent_activity_id",
+    "branch_time_in_parent",
+    "tracking_id",
+)
+"""Global attributes promoted to indexed columns when a header is stored."""
+
+
+def header_key(record: DatasetRecord) -> HeaderKey | None:
+    """
+    Return the `(source_id, experiment_id, variant_label, variable_id, table_id)`
+
+    This is the grain headers are *stored* at — one row per dataset.  It extends
+    `simulation_key` with the `variable_id` and `table_id`: `table_id` matters
+    because the same variable can be published at several frequencies (e.g. `tas`
+    in `Amon` vs `day`), which are distinct datasets a user may want kept apart.
+    `simulation_key` remains the coarser grain a future cross-variable reuse can
+    look up on.
+
+    Parameters
+    ----------
+    record
+        The dataset to key.
+
+    Returns
+    -------
+    :
+        The header key, or `None` if the dataset is missing any of the five facets.
+
+    Examples
+    --------
+    >>> from cmip_data_manager.esgf.models import DatasetRecord
+    >>> record = DatasetRecord(
+    ...     id="d",
+    ...     source_id="ACCESS-ESM1-5",
+    ...     experiment_id="ssp245",
+    ...     variant_label="r1i1p1f1",
+    ...     variable_id="tas",
+    ...     table_id="Amon",
+    ...     raw={},
+    ... )
+    >>> header_key(record)
+    ('ACCESS-ESM1-5', 'ssp245', 'r1i1p1f1', 'tas', 'Amon')
+    """
+    simulation = simulation_key(record)
+    if simulation is None or not record.variable_id or not record.table_id:
+        return None
+    return (*simulation, record.variable_id, record.table_id)
 
 
 def simulation_key(record: DatasetRecord) -> SimulationKey | None:
@@ -198,14 +276,21 @@ def order_candidates(
     *,
     preferred_hosts: Sequence[str] = (),
     ignore_hosts: frozenset[str] = frozenset(),
+    host_rank: Callable[[str], tuple[float, float]] | None = None,
 ) -> list[str]:
     """
     De-duplicate and rank mirror URLs, best first
 
-    Ordering is: any `preferred_hosts` first (in the order given — e.g. a nearby
-    node such as `esgf.nci.org.au`), then HTTPS before plain HTTP (the byte-range
-    driver only accepts HTTPS), preserving input order within a tier.  Hosts in
-    `ignore_hosts` are dropped entirely.
+    Ordering is, in priority order: any `preferred_hosts` first (in the order
+    given — e.g. a nearby node such as `esgf.nci.org.au`); then, if `host_rank` is
+    supplied, by learned node health (reliable-and-fast nodes first); then HTTPS
+    before plain HTTP (the byte-range driver only accepts HTTPS), preserving input
+    order within a tier.  Hosts in `ignore_hosts` are dropped entirely.
+
+    `host_rank` is an optional `host -> (score, score)` key (lower is better), so
+    this stays free of any dependency on `NodeHealth`: pass `NodeHealth.host_rank`
+    to have ordering reflect observed reliability and speed, or leave it `None` for
+    the static ordering.
 
     Parameters
     ----------
@@ -217,6 +302,10 @@ def order_candidates(
 
     ignore_hosts
         Hostnames to exclude (e.g. known-dead nodes from `NodeHealth`).
+
+    host_rank
+        Optional per-host sort key from observed health (e.g.
+        `NodeHealth.host_rank`); `None` disables the health tier.
 
     Returns
     -------
@@ -240,13 +329,14 @@ def order_candidates(
         if urlparse(url).hostname not in ignore_hosts:
             kept.setdefault(url, None)
 
-    def rank(url: str) -> tuple[int, int]:
+    def rank(url: str) -> tuple[int, tuple[float, float], int]:
         host = urlparse(url).hostname or ""
         try:
             preference = list(preferred_hosts).index(host)
         except ValueError:
             preference = len(preferred_hosts)
-        return (preference, 0 if urlparse(url).scheme == "https" else 1)
+        health = host_rank(host) if host_rank is not None else (0.0, 0.0)
+        return (preference, health, 0 if urlparse(url).scheme == "https" else 1)
 
     return sorted(kept, key=rank)
 
@@ -256,6 +346,7 @@ def candidate_urls_for_files(
     *,
     preferred_hosts: Sequence[str] = (),
     ignore_hosts: frozenset[str] = frozenset(),
+    host_rank: Callable[[str], tuple[float, float]] | None = None,
 ) -> list[str]:
     """
     Pool and rank every mirror URL across a simulation's files
@@ -275,6 +366,9 @@ def candidate_urls_for_files(
     ignore_hosts
         Hostnames to exclude.
 
+    host_rank
+        Optional per-host health sort key forwarded to `order_candidates`.
+
     Returns
     -------
     :
@@ -284,7 +378,10 @@ def candidate_urls_for_files(
     for file in files:
         urls.extend(http_download_urls(file))
     return order_candidates(
-        urls, preferred_hosts=preferred_hosts, ignore_hosts=ignore_hosts
+        urls,
+        preferred_hosts=preferred_hosts,
+        ignore_hosts=ignore_hosts,
+        host_rank=host_rank,
     )
 
 
@@ -473,5 +570,86 @@ def with_timeout(
             raise payload
         result: T = payload
         return result
+
+    return read
+
+
+def with_retry(  # noqa: PLR0913 - configurable but every knob has a sane default
+    reader: Callable[[str], T],
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    retry_on: tuple[type[Exception], ...] = (OSError,),
+    give_up_on: tuple[type[Exception], ...] = (HeaderReadTimeout, HeaderReadCrashed),
+    base: float = DEFAULT_RETRY_BASE,
+    cap: float = DEFAULT_RETRY_CAP,
+    jitter: float = DEFAULT_RETRY_JITTER,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Callable[[str], T]:
+    """
+    Wrap a reader so a *transient* read failure is retried on the same mirror
+
+    This covers the "node does not connect, but succeeds on a later attempt" case.
+    Retries back off exponentially with random jitter — spacing attempts out (not
+    hammering) and de-synchronising concurrent readers so a node is not tempted to
+    throttle or block us.
+
+    By default it retries any `OSError` **except** `HeaderReadTimeout` and
+    `HeaderReadCrashed`: a *stall* means the node answered but is hanging, so
+    burning another full deadline on it is wasteful — better to fall through to the
+    next mirror (`read_first_readable` will) — and a crash on a specific file is
+    unlikely to fix itself.  Only genuine connect-time failures are retried.
+
+    Compose it *outside* `recording` so every attempt is recorded as its own read
+    (retries then show up in `NodeHealth` failure counts), and inside
+    `read_first_readable` so a host that never recovers still yields to other
+    mirrors:
+
+    ```python
+    reader = with_retry(recording(with_timeout(read_header, seconds=90), health))
+    header = read_first_readable(candidate_urls, reader)
+    ```
+
+    Parameters
+    ----------
+    reader
+        The underlying `url -> value` read to retry.
+
+    max_attempts
+        Total attempts (including the first).  `1` disables retrying.
+
+    retry_on
+        Exception types that trigger a retry.
+
+    give_up_on
+        Exception types that are re-raised immediately, even if they also match
+        `retry_on` (they take precedence).
+
+    base, cap, jitter
+        Backoff shape: attempt `n` sleeps `min(cap, base * 2**(n-1))` plus up to
+        `jitter` of that as random padding.
+
+    sleep
+        Sleep function, injectable so tests need not actually wait.
+
+    Returns
+    -------
+    :
+        A reader with the same contract that retries transient failures.
+    """
+
+    def read(url: str) -> T:
+        attempt = 1
+        while True:
+            try:
+                return reader(url)
+            except give_up_on:
+                raise
+            except retry_on:
+                if attempt >= max_attempts:
+                    raise
+                delay = min(cap, base * (2 ** (attempt - 1)))
+                delay += random.uniform(0, jitter) * delay  # noqa: S311 - not crypto
+                sleep(delay)
+                attempt += 1
 
     return read

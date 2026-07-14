@@ -18,8 +18,11 @@ code that the online path uses.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import Engine
 from sqlmodel import Session, col, select
@@ -27,10 +30,14 @@ from sqlmodel import Session, col, select
 from cmip_data_manager.db.schema import (
     Dataset,
     DatasetChange,
+    DatasetHeader,
     File,
+    NodeHealthStat,
     QueryRun,
     RunMembership,
 )
+from cmip_data_manager.esgf.headers import PROMOTED_ATTRS, HeaderKey, HeaderMetadata
+from cmip_data_manager.esgf.health import NodeHealth, NodeStat
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
 _DATASET_SCALARS = (
@@ -216,6 +223,192 @@ class Repository:
             session.commit()
         return stored
 
+    def store_headers(self, headers: Mapping[HeaderKey, HeaderMetadata]) -> int:
+        """
+        Upsert cached header metadata, one row per dataset key
+
+        Keys are `(source_id, experiment_id, variant_label, variable_id,
+        table_id)`; the promoted `parent_*`/`tracking_id` columns are projected out
+        of each header and the full attribute set is kept as JSON.
+
+        Parameters
+        ----------
+        headers
+            Mapping of dataset key to the header read for it.
+
+        Returns
+        -------
+        :
+            Number of header rows written or updated.
+        """
+        stored = 0
+        with Session(self._engine) as session:
+            for key, metadata in headers.items():
+                columns = _header_columns(metadata)
+                existing = session.get(DatasetHeader, key)
+                if existing is None:
+                    source_id, experiment_id, variant_label, variable_id, table_id = key
+                    session.add(
+                        DatasetHeader(
+                            source_id=source_id,
+                            experiment_id=experiment_id,
+                            variant_label=variant_label,
+                            variable_id=variable_id,
+                            table_id=table_id,
+                            **columns,
+                        )
+                    )
+                else:
+                    for column, value in columns.items():
+                        setattr(existing, column, value)
+                    session.add(existing)
+                stored += 1
+            session.commit()
+        return stored
+
+    def get_header(self, key: HeaderKey) -> HeaderMetadata | None:
+        """
+        Return the cached header for one dataset key, or `None` if absent
+
+        Parameters
+        ----------
+        key
+            `(source_id, experiment_id, variant_label, variable_id, table_id)`.
+
+        Returns
+        -------
+        :
+            The stored header, or `None`.
+        """
+        with Session(self._engine) as session:
+            row = session.get(DatasetHeader, key)
+            return None if row is None else _metadata_from_header(row)
+
+    def get_simulation_headers(
+        self, source_id: str, experiment_id: str, variant_label: str
+    ) -> list[HeaderMetadata]:
+        """
+        Return every cached header for a simulation, across its variables/tables
+
+        This is the seam for a future cross-variable "smart reader": a caller that
+        wants `rsut` but has only ever read `tas` for the same `(source_id,
+        experiment_id, variant_label)` can find the existing header here instead of
+        re-reading.
+
+        Parameters
+        ----------
+        source_id, experiment_id, variant_label
+            The simulation to look up.
+
+        Returns
+        -------
+        :
+            The stored headers for that simulation (any variable/table); empty if
+            none have been read.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(
+                select(DatasetHeader).where(
+                    DatasetHeader.source_id == source_id,
+                    DatasetHeader.experiment_id == experiment_id,
+                    DatasetHeader.variant_label == variant_label,
+                )
+            ).all()
+            return [_metadata_from_header(row) for row in rows]
+
+    def save_node_health(self, health: NodeHealth) -> int:
+        """
+        Persist a node-health registry, upserting one row per host
+
+        Writes the current in-memory counters back to `NodeHealthStat` so health
+        accumulates across runs.  Load with `load_node_health` at the start of a
+        run, record onto it, then save it here at the end.
+
+        Parameters
+        ----------
+        health
+            The registry to persist.
+
+        Returns
+        -------
+        :
+            Number of host rows written or updated.
+        """
+        snapshot = health.snapshot()
+        with Session(self._engine) as session:
+            for host, stat in snapshot.items():
+                existing = session.get(NodeHealthStat, host)
+                columns = _node_health_columns(stat)
+                if existing is None:
+                    session.add(NodeHealthStat(host=host, **columns))
+                else:
+                    for column, value in columns.items():
+                        setattr(existing, column, value)
+                    session.add(existing)
+            session.commit()
+        return len(snapshot)
+
+    def load_node_health(self) -> NodeHealth:
+        """
+        Rebuild an in-memory node-health registry from persisted rows
+
+        Returns
+        -------
+        :
+            A `NodeHealth` seeded with every stored host's counters (empty if none
+            have been persisted).
+        """
+        health = NodeHealth()
+        with Session(self._engine) as session:
+            for row in session.exec(select(NodeHealthStat)).all():
+                health.restore(_stat_from_row(row))
+        return health
+
+    def rank_nodes_by_reliability(self) -> list[NodeHealthStat]:
+        """
+        Return persisted hosts best-to-worst by success rate
+
+        Answers "rank the nodes by the share of header requests that failed" from
+        the database directly.  Ordered by descending `successes/attempts`, with
+        more-tried hosts winning ties.
+
+        Returns
+        -------
+        :
+            The stored host rows, most reliable first.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(select(NodeHealthStat)).all()
+        return sorted(
+            rows,
+            key=lambda r: (
+                -(r.successes / r.attempts) if r.attempts else 0.0,
+                -r.attempts,
+                r.host,
+            ),
+        )
+
+    def rank_nodes_by_speed(self) -> list[NodeHealthStat]:
+        """
+        Return persisted hosts fastest-to-slowest by mean successful-read time
+
+        Answers "rank the nodes by speed of response".  Only hosts with at least
+        one success are included (a host that never succeeded has no speed);
+        ordered by ascending mean successful-read seconds.
+
+        Returns
+        -------
+        :
+            The stored host rows with successes, fastest first.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(select(NodeHealthStat)).all()
+        with_success = [row for row in rows if row.successes]
+        return sorted(
+            with_success,
+            key=lambda r: (r.total_success_seconds / r.successes, r.host),
+        )
+
     def get_dataset_records(self, use_case: str) -> list[DatasetRecord]:
         """
         Return the datasets from the latest cached run of a use case
@@ -344,6 +537,53 @@ def _record_from_dataset(dataset: Dataset) -> DatasetRecord:
     raw = json.loads(dataset.raw_json) if dataset.raw_json else {}
     scalars = {name: getattr(dataset, name) for name in _DATASET_SCALARS}
     return DatasetRecord(id=dataset.id, raw=raw, **scalars)
+
+
+def _header_columns(metadata: HeaderMetadata) -> dict[str, Any]:
+    """Return the storable columns of a header (excluding the key fields)."""
+    attrs = metadata.attrs
+    columns: dict[str, Any] = {name: attrs.get(name) for name in PROMOTED_ATTRS}
+    columns["attrs_json"] = json.dumps(attrs, sort_keys=True)
+    columns["source_url"] = metadata.source_url
+    columns["data_node"] = (
+        urlparse(metadata.source_url).hostname if metadata.source_url else None
+    )
+    columns["read_at"] = datetime.now(timezone.utc)
+    return columns
+
+
+def _metadata_from_header(row: DatasetHeader) -> HeaderMetadata:
+    """Rebuild a `HeaderMetadata` from a stored header row."""
+    attrs = json.loads(row.attrs_json) if row.attrs_json else {}
+    return HeaderMetadata(attrs=attrs, source_url=row.source_url)
+
+
+def _node_health_columns(stat: NodeStat) -> dict[str, Any]:
+    """Return the storable columns of a node-health stat (excluding the host)."""
+    return {
+        "attempts": stat.attempts,
+        "successes": stat.successes,
+        "timeouts": stat.timeouts,
+        "crashes": stat.crashes,
+        "errors": stat.errors,
+        "total_success_seconds": stat.total_success_seconds,
+        "max_success_seconds": stat.max_success_seconds,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def _stat_from_row(row: NodeHealthStat) -> NodeStat:
+    """Rebuild an in-memory `NodeStat` from a stored node-health row."""
+    return NodeStat(
+        host=row.host,
+        attempts=row.attempts,
+        successes=row.successes,
+        timeouts=row.timeouts,
+        crashes=row.crashes,
+        errors=row.errors,
+        total_success_seconds=row.total_success_seconds,
+        max_success_seconds=row.max_success_seconds,
+    )
 
 
 def _file_columns(record: FileRecord) -> dict[str, Any]:

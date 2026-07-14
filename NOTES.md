@@ -154,7 +154,7 @@ The process has been stuck for 1h11m — and the cause is now clear from the cur
   To get the file-only metadata, you have to open the file. Each dataset search record should provide information about how to access the files that sit underneath it. We will need to somehow represent and engage with that information. We believe it's possible to just get the metadata (aka the file header), without having to download the full file, please check this and see how well supported it is. There can be lots of files that belong to a given dataset. We suspect that reading all the files' metadata will be too slow, so we'll have to just read the first file's metadata and assume that it's the same across all files, please tell us if you thiompromise.
                                                                                                                                                                                                     Given how slow accessing metadata is likely to be, we suspect you'll need to paralstinct would be to use thread pools, but maybe we have to use process pools. Youcan tell us.
   Then the other piece of information is that different data nodes have different access speeds, reliability etc. We want to gather information on data node health/statistics during this process. We want to track things like response time, download speed, number of retries requuccess was recorded for this node (some nodes are just dead so will neversuceed). When trying to access file metadata information, the options seem to be as follows: 1. The data node connects, we access the metadata, and this is a success. 2. The data node connects, but 'stalls' and can stay connected for up to 25 minutes, this is not a success. Wmum wait time and ideally some way to measure whether that wait time is sensibleor not (e.g. waiting 5 seconds is too short, but 5 hours is too long, how do we determine the right value between these two)? 3. The data node does not connect, we retry the connection x times
-  and the process is eventually successful, this is a success. Again, how many timesbefore we say it is a failure and how can we set this maximum retry numbersensibly? 4. The data node does not connect, we try multiple times, it does not connect. This is a failure.
+  and the process is eventually successful, this is a success. Again, how many timesbefore we say it is a failure and how can we set this maximum retry number sensibly? 4. The data node does not connect, we try multiple times, it does not connect. This is a failure.
 
 
 Answers to some questions:
@@ -191,3 +191,39 @@ That fully specifies the decoupled design. Concretely, what I'd build:
 - A general enrich_headers(datasets, client, repo, health, *, preferred_hosts, ...pec, that any use case can run; wire it for UC1 in the script.
 
 Want me to start implementing this, beginning with esgf/headers.py + esgf/health.ption, no DB churn yet), then move to the DatasetHeader table and the UC1 enrichment wiring?
+
+#### Day four (14/7) Goals
+So yesterday I got Claude to build a headers.py to load and extract header metadata for experiments (making this independent of parent/child searches), and health.py to save data node success/failure stuff. Given the speed difference using NCI, we now include an option for a user to specify a preferred node (although I will double check that this is optional).
+
+Today, I'm going to start with confirming what headers is saving (note the Claude recommendation screenshot below to save entire metadata as json in a table rather than extracting specific columns - also note that subsequently I requested that data be saved per source/experiment/variant to be independent of variable).
+
+I also want to confirm what parallelisation is happening (and maybe double check that with you, because some of the limitations on where parallelisation can happen in this process goes a little over my head).
+
+Confirming what health.py data is saving, and how this can subsequently be used in future searches.
+A little or a lot of time could be spent on this? As we do more searches and connect to different nodes for different models, we will be building a picture (hopefully) of best -> bad nodes for that day. This will be different for a user sitting down with no cached data.
+Do we want to spend time here building something related to data node health where a user can specify how long they want to attempt connections to different nodes to build a good picture before download (you had an example yesterday of 10 minutes vs an hour which isn't a lot of time if download will be really long).
+
+
+Next:
+Re-build that parentage set-up in order to search for parent experiments (from one to multiple hops - Gregory use-case through to g6solar).
+This will be a good way to confirm that saved node health data (and saved header metadata) are being used in the way we want.
+
+After all this:
+Download data time?
+
+First major point for the day
+❯ Implement the DatasetHeader table and store/get methods. For the dataset header, is source_url related to the data node? Would it be worth retaining that information?
+  health.py thoughts. I would like you to build in a retry method. Recall that these following are the potential use-cases: When trying to access file metadata information, the options seem to be as follows: 1. The data node connects, we access the metadata, and this is a success. 2. The data node connects, but 'stalls' and can stay connected for up to 25 minutes, this is not a success. Wmum wait time and ideally some way to measure whether that wait time is sensibleor not (e.g. waiting 5 seconds is too short, but 5 hours is too long, how do we determine the right value between these two)? 3. The data node does not connect, we retry the connection x times
+    and the process is eventually successful, this is a success. Again, how many timesbefore we say it is a failure and how can we set this maximum retry number sensibly? 4. The data node does not connect, we try multiple times, it does not connect. This is a failure.
+  You include all of them except the re-tries, given some nodes may fail multiple times then succeed, but I would need your thoughts on what is a sensible number of retries (and how to retry without being blocked from the node). The timeout method is currently at 90s, but I also want to make sure the time-to-success (if a node is deemed healthy) is saved, as this could help estimate a more appropriate timeout time. For example, if a max time for successful nodes is 45s, then we could shorten the timeout time from 90s to closer to 45s. Does this make sense?
+  Also, in implementing the saved node health data, I would like your advice on if we use the saved health data as the health data is recorded, or if we trial a certain number of nodes/times to build a picture, before implementing the node preferences.
+
+# Meeting notes
+- Start live testing
+- Will want to build up a picture of time taken to search index node, search and save headers (with and without caching) and for parent/child differences + different variables
+- G6solar - paralellisation? How is this working?
+- Also for data node access, likely will want to make preference list rather than single preferred node. Also will want to allow users to specify max workers or back-off to avoid blocking. We can create a helper function to assess this and write to config but also allow users to assert themselves.
+- Markdown file - almost ready for prototyping
+- Download step shouldn't be too much of a headache (even remote vs local download, just have fspec// to point to file path)
+- Big challenge will be how well-coupled between CMIP generations. CMIP7 esgf next-gen API available, but no live data. Lively we go and test for CMIP5 and CMIP6 rather than CMIP6/7
+- Another thought: potentially will want to make a "hybrid local path" e.g. for users who have data on large archive (like NCI) but want to see if there is additional data they need and how to save it
