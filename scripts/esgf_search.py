@@ -35,6 +35,7 @@ from cmip_data_manager.search import (
     UseCase,
     build_cells,
     discover_experiments,
+    enrich_headers,
     pairs_all_experiments,
     pairs_any_experiment,
     per_variable_experiment,
@@ -56,6 +57,16 @@ FREQUENCY = ("mon",)
 
 PARENT_READS = process_pool_map(max_workers=8)
 """How to read netCDF parent headers online: process pool (netCDF isn't thread-safe)."""
+
+ENRICH_HEADERS = True
+"""Whether to read + cache header metadata (global attrs) for use case 1's datasets."""
+
+PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
+"""Data nodes to try first when reading headers (empty tuple = no preference)."""
+
+HEADER_READS = thread_pool_map(max_workers=8)
+"""How to fan out header reads: a thread pool — `with_timeout` isolates each read in
+its own child process, so a process pool here would be redundant."""
 
 IGNORE_HOSTS: frozenset[str] = frozenset(
     {
@@ -349,6 +360,21 @@ def main() -> None:
             print(
                 f"parent-metadata conflicts (skipped): {len(result.parent_conflicts)}"
             )
+        if ENRICH_HEADERS and SOURCE == "api" and use_case.name == "uc1_tas_ssp245":
+            outcome = enrich_headers(
+                result.records,
+                client=client,
+                repository=repository,
+                preferred_hosts=PREFERRED_HOSTS,
+                read_map=HEADER_READS,
+            )
+            print(
+                "header enrichment: "
+                f"read={outcome.read} reused={outcome.reused} "
+                f"stored={outcome.stored} skipped_cached={outcome.skipped_cached} "
+                f"failed={len(outcome.failed)}"
+            )
+
         if result.matches is None:
             continue
         print(f"matching model-variant pairs: {len(result.matches)}")

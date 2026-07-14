@@ -416,6 +416,64 @@ def read_first_readable(
     return None
 
 
+def _collapse_spaced_chars(text: str) -> str:
+    """
+    Collapse a value that arrived as single characters separated by single spaces
+
+    Some files store a string attribute as a netCDF character array, which
+    `netCDF4` can hand back with the letters spaced out (e.g.
+    `"h i s t o r i c a l"`).  When every space-separated token is one character,
+    the spaces are that artefact and are removed; any other value is left alone.
+    """
+    tokens = text.split(" ")
+    if len(tokens) > 1 and all(len(token) == 1 for token in tokens):
+        return "".join(tokens)
+    return text
+
+
+def _coerce_attr(value: object) -> str:
+    """
+    Coerce a raw netCDF attribute value to a string
+
+    Most global attributes are already strings or numbers, but some files store
+    text as a netCDF *character array*.  That can surface either as a numpy array
+    (one element per letter) or, once `netCDF4` has stringified it, as a string
+    with the letters spaced out — both are normalised back to the plain word.
+
+    Parameters
+    ----------
+    value
+        The value returned by `netCDF4`'s `getncattr` (a `str`, `bytes`, a numpy
+        scalar, or a numpy character array).
+
+    Returns
+    -------
+    :
+        The value as a clean string.
+
+    Examples
+    --------
+    >>> _coerce_attr("historical")
+    'historical'
+    >>> _coerce_attr("h i s t o r i c a l")
+    'historical'
+    >>> _coerce_attr(b"historical")
+    'historical'
+    >>> _coerce_attr(60225.0)
+    '60225.0'
+    """
+    if isinstance(value, str):
+        return _collapse_spaced_chars(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    # A numpy character array has a dtype whose kind is "S" (bytes) or "U" (str).
+    if getattr(getattr(value, "dtype", None), "kind", "") in ("S", "U"):
+        import numpy as np  # noqa: PLC0415 - only needed for the char-array case
+
+        return "".join(np.asarray(value).astype(str).ravel().tolist())
+    return str(value)
+
+
 def read_header(url: str, attrs: Iterable[str] | None = None) -> HeaderMetadata:
     # pragma: no cover - needs netCDF4 and the network
     """
@@ -444,7 +502,7 @@ def read_header(url: str, attrs: Iterable[str] | None = None) -> HeaderMetadata:
     with netCDF4.Dataset(f"{url}#bytes") as dataset:
         available = dataset.ncattrs()
         names = available if attrs is None else [n for n in attrs if n in available]
-        values = {name: str(dataset.getncattr(name)) for name in names}
+        values = {name: _coerce_attr(dataset.getncattr(name)) for name in names}
     return HeaderMetadata(attrs=values, source_url=url)
 
 

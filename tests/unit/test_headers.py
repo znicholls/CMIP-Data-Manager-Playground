@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import time
 
+import numpy as np
 import pytest
 
 from cmip_data_manager.esgf.headers import (
     HeaderReadCrashed,
     HeaderReadTimeout,
+    _coerce_attr,
     candidate_urls_for_files,
     header_key,
     http_download_url,
@@ -234,6 +236,31 @@ def test_header_key_includes_variable_and_table():
 
 def test_header_key_none_when_table_missing():
     assert header_key(_rec(table_id=None)) is None
+
+
+def test_coerce_attr_plain_string_and_number():
+    assert _coerce_attr("historical") == "historical"
+    assert _coerce_attr("CNRM-CM6-1-HR") == "CNRM-CM6-1-HR"  # hyphens, not spaced
+    assert _coerce_attr(60225.0) == "60225.0"
+    assert _coerce_attr(np.float64(60225.0)) == "60225.0"
+
+
+def test_coerce_attr_collapses_spaced_string():
+    # netCDF4 can return a char-array attribute already spaced out as a str.
+    assert _coerce_attr("h i s t o r i c a l") == "historical"
+    # A normal multi-word/hyphenated value is left untouched.
+    assert _coerce_attr("piControl") == "piControl"
+
+
+def test_coerce_attr_joins_char_arrays():
+    # The bug: a netCDF char array (one element per letter) must not be spaced out.
+    assert _coerce_attr(np.array(list("historical"), dtype="S1")) == "historical"
+    assert _coerce_attr(np.array(list("historical"), dtype="U1")) == "historical"
+    assert _coerce_attr(np.array("historical")) == "historical"  # 0-d string array
+
+
+def test_coerce_attr_bytes():
+    assert _coerce_attr(b"hdl:21.14100/abc") == "hdl:21.14100/abc"
 
 
 def test_with_retry_succeeds_after_transient_failures():

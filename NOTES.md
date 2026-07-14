@@ -227,3 +227,33 @@ First major point for the day
 - Download step shouldn't be too much of a headache (even remote vs local download, just have fspec// to point to file path)
 - Big challenge will be how well-coupled between CMIP generations. CMIP7 esgf next-gen API available, but no live data. Lively we go and test for CMIP5 and CMIP6 rather than CMIP6/7
 - Another thought: potentially will want to make a "hybrid local path" e.g. for users who have data on large archive (like NCI) but want to see if there is additional data they need and how to save it
+
+First live run after updates
+- UC1: SSP245 'tas', single variant per model
+- 11 mins for header (3 failed models)
+- Should be quicker now have node health data
+- Found bug in that an attrs (which should be str) was a netcdf character string
+- In re-run, is it hard coding node health list for always failed data?
+
+Bottom line
+
+- You can stay connected to a node and pull other files — HTTP allows it, and we already do it within one file's read.
+- We don't do it across files, on purpose: the per-read child process (our stall-kill mechanism) resets the connection every time.
+- Recovering cross-file reuse means grouping reads by host and moving to a persistent-worker + supervisor model. The payoff (saved handshakes) is modest versus the read latency, so it's a "later, if the full 553 run shows it matters" optimization rather than an obvious win now.
+
+Want me to note this as a documented future optimization (alongside the per-host cap), or move on to the full 553 run / from-scratch test?
+For the future:
+- Future optimizations noted to memory: (1) mid-run health learning, (2) per-host concurrency cap, (3) cross-file connection reuse.
+- Answered your gating question: no, this run does not learn mid-run — health is read once up front for the ignore-set and ordering, then only recorded (for the next run). Correct for a clean cold baseline; static IGNORE_HOSTS still shields it from the 75s diasjp nodes.
+- Wiped the cache (backed up to esgf_cache.sqlite.bak-20260714-145703 first — it held your uc2–uc5 work, restorable if needed).
+- Script now does the from-scratch flow: SEARCH_SOURCE="api" runs the UC1 index search live and caches it, ONE_VARIANT_PER_MODEL=False for all 553.
+
+For Claude
+
+We have a currently successful workflow which searches for specific CMIP6 data via the ESGF metagrid index nodes, stores this data in esgf_cache.sqlite, then - to access specific header information, such as parent variant id - connects to data nodes to access the global attrs metadata to save in a local database. The data search (step 1) is very quick, only a few seconds for our test-case1 (SSP245, monthly, 'tas'). The second step, connecting to nodes, loading header, saving header information, is the slow step. My understanding of this workflow is as follows: spawn 8 parallel workers, then using the data from the search step, try nodes until find a successful connection (may need to have retries, may fail, may stall - which is a fail). Extract header data, save, disconnect from node, start again for next file. The node health data is also saved and could be useful to learn from for future runs (although currently during a specific run we do not learn from this health data).
+
+We want to update this workflow in a few ways. What may be the most signficant update is that if we successfully connect to a 'healthy' node and extract header data from it, we should remain on this node and attempt to find and save files from other experiments. We do not want to be connecting/disconnecting/reconnecting. A few of my uncertainties with this, where I would like your help, are as follows: if we successfully connect to a node, will we only try to find model data on this node from models which have this node listed as a potential data source? How will we now handle stalling nodes? If a node has successfully connected (no stall), are the only two options that specific model data / files either are or are not available? I would like your thoughts on how to handle this in the workflow.
+
+The second workflow update is that we want to include workers for each specific node. We do not want to have a large risk of being blocked by the node, but to be the most efficient we want to utilise multiple workers. How many workers would you suggest starting with? And at what connection rate (jitters/exponential back-off)? Additionally, is there a way to save information related to how many workers can successfully be used for each node before an error/block is thrown? Eventually, we may want to be able to let a user specify the number of workers per node.
+
+If you have uncertainties, please ask.

@@ -1,5 +1,5 @@
 # ignore sqlite db
-*.sqlite
+*.sqlite*
 
 # Notebooks
 *.ipynb

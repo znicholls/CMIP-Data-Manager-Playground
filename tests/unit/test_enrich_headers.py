@@ -145,6 +145,72 @@ def test_enrich_records_failed_simulation(repository):
     assert repository.load_node_health().stat("dead").errors == 1
 
 
+def test_enrich_batches_file_lookups(repository):
+    sims = [
+        _ds("d1", variant="r1i1p1f1"),
+        _ds("d2", variant="r2i1p1f1"),
+        _ds("d3", variant="r3i1p1f1"),
+    ]
+    client = FakeClient(
+        {ds.id: [_file(f"f{ds.id}", ds.id, f"https://nci/{ds.id}.nc")] for ds in sims}
+    )
+
+    result = enrich_headers(
+        sims, client=client, repository=repository, file_lookup_batch=2, **_kw()
+    )
+
+    assert result.read == 3  # three distinct simulations, three reads
+    assert client.calls == 2  # 3 datasets batched by 2 -> two requests, not three
+    for ds in sims:
+        assert repository.get_header(header_key(ds)) is not None
+
+
+def test_enrich_batches_by_char_budget(repository):
+    # Long ids force a split by the character budget before the count cap is hit.
+    sims = [_ds("X" * 100 + str(i), variant=f"r{i}i1p1f1") for i in range(4)]
+    client = FakeClient(
+        {
+            ds.id: [_file(f"f{i}", ds.id, f"https://nci/{i}.nc")]
+            for i, ds in enumerate(sims)
+        }
+    )
+
+    result = enrich_headers(
+        sims,
+        client=client,
+        repository=repository,
+        file_lookup_batch=50,  # count cap won't trigger
+        file_lookup_max_chars=250,  # ~2 ids of ~100 chars per request
+        **_kw(),
+    )
+
+    assert result.read == 4
+    assert client.calls == 2  # 4 long ids, ~2 per char-budgeted request
+
+
+def test_enrich_honours_static_ignore_hosts(repository):
+    ds = _ds("d0")
+    client = FakeClient(
+        {
+            "d0": [
+                _file("f0", "d0", "https://blocked/tas.nc"),
+                _file("f1", "d0", "https://good/tas.nc"),
+            ]
+        }
+    )
+
+    result = enrich_headers(
+        [ds],
+        client=client,
+        repository=repository,
+        ignore_hosts=frozenset({"blocked"}),  # skipped on a cold run, no health yet
+        **_kw(),
+    )
+
+    assert result.read == 1
+    assert repository.get_header(header_key(ds)).get("served_by") == "good"
+
+
 def test_enrich_ignores_unreliable_hosts_from_health(repository):
     health = NodeHealth()
     for _ in range(3):  # condemn "dead" so it is excluded from candidates
