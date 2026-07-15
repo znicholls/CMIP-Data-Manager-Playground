@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from cmip_data_manager.db.repository import HeaderAttempt
 from cmip_data_manager.esgf.headers import HeaderMetadata
 from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
@@ -185,6 +188,23 @@ def test_node_health_save_accumulates_across_runs(repository):
     assert final.attempts == 2 and final.successes == 1 and final.errors == 1
 
 
+def test_node_health_persists_blocks_and_learned_concurrency(repository):
+    health = NodeHealth()
+    health.record("https://busy/f.nc", ReadOutcome.BLOCKED, 0.5)
+    # Learned per-node concurrency, seeded onto the stat the way the AIMD
+    # controller will (round-trips through the persisted columns).
+    stat = health.stat("busy")
+    stat.max_safe_concurrency = 4
+    stat.last_concurrency = 3
+    health.restore(stat)
+    repository.save_node_health(health)
+
+    reloaded = repository.load_node_health().stat("busy")
+    assert reloaded.blocks == 1
+    assert reloaded.max_safe_concurrency == 4
+    assert reloaded.last_concurrency == 3
+
+
 def test_rank_nodes_by_reliability_and_speed(repository):
     health = NodeHealth()
     # fast + flawless
@@ -200,3 +220,94 @@ def test_rank_nodes_by_reliability_and_speed(repository):
     assert by_reliability[-1] == "flaky"  # worst success rate ranks last
     by_speed = [r.host for r in repository.rank_nodes_by_speed()]
     assert by_speed[0] == "nci"  # fastest mean response first
+
+
+def _attempt(**overrides):
+    """Build a HeaderAttempt with sensible defaults for the attempt-log tests."""
+    fields = {
+        "source_id": "CanESM5",
+        "experiment_id": "ssp245",
+        "variant_label": "r1i1p1f1",
+        "outcome": "success",
+        "host": "nci",
+        "url": "https://nci/tas.nc",
+        "variable_id": "tas",
+        "table_id": "Amon",
+        "seconds": 1.5,
+        "attempt_no": 1,
+    }
+    fields.update(overrides)
+    return HeaderAttempt(**fields)
+
+
+def test_record_header_attempts_is_append_only(repository):
+    assert repository.record_header_attempts([]) == 0  # nothing to write
+    n = repository.record_header_attempts(
+        [_attempt(url="https://nci/a.nc"), _attempt(url="https://nci/b.nc")]
+    )
+    assert n == 2
+    # Recording the same logical attempt again appends rather than upserting.
+    repository.record_header_attempts([_attempt(url="https://nci/a.nc")])
+    assert len(repository.get_header_attempts()) == 3
+
+
+def test_get_header_attempts_filters(repository):
+    repository.record_header_attempts(
+        [
+            _attempt(host="ucar", source_id="CESM2-WACCM", outcome="timeout"),
+            _attempt(host="nci", source_id="CanESM5", outcome="success"),
+            _attempt(host="ucar", source_id="CESM2-WACCM", outcome="error"),
+        ]
+    )
+    by_host = repository.get_header_attempts(host="ucar")
+    assert len(by_host) == 2
+    assert {a.source_id for a in by_host} == {"CESM2-WACCM"}
+    only_timeout = repository.get_header_attempts(host="ucar", outcome="timeout")
+    assert [a.outcome for a in only_timeout] == ["timeout"]
+    assert repository.get_header_attempts(source_id="CanESM5", limit=1)[0].host == "nci"
+
+
+def test_get_header_attempts_newest_first(repository):
+    repository.record_header_attempts([_attempt(url="https://nci/first.nc")])
+    repository.record_header_attempts([_attempt(url="https://nci/second.nc")])
+    urls = [a.url for a in repository.get_header_attempts()]
+    assert urls == ["https://nci/second.nc", "https://nci/first.nc"]
+
+
+def test_header_attempt_summary_rolls_up_by_host(repository):
+    repository.record_header_attempts(
+        [
+            _attempt(host="ornl", outcome="success"),
+            _attempt(host="ornl", outcome="success"),
+            _attempt(host="ornl", outcome="timeout"),
+            _attempt(host="ucar", outcome="error"),
+        ]
+    )
+    summary = {s.key: s for s in repository.header_attempt_summary(group_by="host")}
+    assert summary["ornl"].attempts == 3
+    assert summary["ornl"].successes == 2
+    assert summary["ornl"].failures == 1
+    assert summary["ornl"].outcomes == {"success": 2, "timeout": 1}
+    assert summary["ucar"].failures == 1
+    # Most-attempts host ranks first.
+    assert repository.header_attempt_summary()[0].key == "ornl"
+
+
+def test_header_attempt_summary_by_source_id_and_none_host(repository):
+    repository.record_header_attempts(
+        [
+            _attempt(source_id="CanESM5", host="nci"),
+            _attempt(source_id="MIROC6", host=None, outcome="no_candidate"),
+        ]
+    )
+    by_source = {
+        s.key: s for s in repository.header_attempt_summary(group_by="source_id")
+    }
+    assert by_source["MIROC6"].failures == 1
+    by_host = {s.key: s for s in repository.header_attempt_summary(group_by="host")}
+    assert "(none)" in by_host  # a null host groups under "(none)"
+
+
+def test_header_attempt_summary_rejects_bad_group_by(repository):
+    with pytest.raises(ValueError, match="group_by"):
+        repository.header_attempt_summary(group_by="variant_label")

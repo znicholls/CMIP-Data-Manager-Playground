@@ -64,9 +64,14 @@ ENRICH_HEADERS = True
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""
 
-HEADER_READS = thread_pool_map(max_workers=8)
-"""How to fan out header reads: a thread pool — `with_timeout` isolates each read in
-its own child process, so a process pool here would be redundant."""
+HEADER_MAX_WORKERS = 12
+"""Cap on header reads in flight across all data nodes (the shared local budget)."""
+
+HEADER_NODE_CONCURRENCY = 2
+"""Default cap on simultaneous reads to a single data node (conservative)."""
+
+HEADER_NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
+"""Per-node caps overriding the default (NCI tolerates more, and is fast)."""
 
 IGNORE_HOSTS: frozenset[str] = frozenset(
     {
@@ -366,7 +371,10 @@ def main() -> None:
                 client=client,
                 repository=repository,
                 preferred_hosts=PREFERRED_HOSTS,
-                read_map=HEADER_READS,
+                ignore_hosts=IGNORE_HOSTS,
+                max_workers=HEADER_MAX_WORKERS,
+                node_concurrency=HEADER_NODE_CONCURRENCY,
+                node_concurrency_overrides=HEADER_NODE_CONCURRENCY_OVERRIDES,
             )
             print(
                 "header enrichment: "

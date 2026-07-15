@@ -271,6 +271,40 @@ def http_download_url(file: FileRecord) -> str | None:
     return urls[0] if urls else None
 
 
+def https_twin(url: str) -> str | None:
+    """
+    Return the `https://` form of an `http://` URL, or `None` if not applicable
+
+    ESGF sometimes indexes a replica's `HTTPServer` mirror only as `http://`, but
+    the same THREDDS path also serves over `https://` — and the netCDF byte-range
+    reader needs HTTPS (plain HTTP tends to refuse the range read or fail an
+    unfollowed redirect).  Synthesising the twin lets an http-only mirror still be
+    read over https, while the original http URL is kept as a fallback for the rare
+    node that genuinely serves only http.
+
+    Parameters
+    ----------
+    url
+        A candidate URL.
+
+    Returns
+    -------
+    :
+        The scheme-upgraded `https://` URL, or `None` if `url` is not `http://`.
+
+    Examples
+    --------
+    >>> https_twin("http://esgf-data.ucar.edu/thredds/fileServer/a.nc")
+    'https://esgf-data.ucar.edu/thredds/fileServer/a.nc'
+    >>> https_twin("https://already/secure.nc") is None
+    True
+    """
+    prefix = "http://"
+    if url.startswith(prefix):
+        return "https://" + url[len(prefix) :]
+    return None
+
+
 def order_candidates(
     urls: Iterable[str],
     *,
@@ -355,6 +389,11 @@ def candidate_urls_for_files(
     file: this pools the `HTTPServer` mirrors of all the given files (any variable,
     any time-chunk, any replica) and ranks them with `order_candidates`.
 
+    Each `http://` mirror also contributes an `https://` twin (see `https_twin`),
+    since some replicas are indexed only as `http://` yet serve — readably — over
+    https; the twin is ranked ahead of the original by `order_candidates`, with the
+    http URL kept as a fallback.
+
     Parameters
     ----------
     files
@@ -376,7 +415,11 @@ def candidate_urls_for_files(
     """
     urls: list[str] = []
     for file in files:
-        urls.extend(http_download_urls(file))
+        for url in http_download_urls(file):
+            twin = https_twin(url)
+            if twin is not None:
+                urls.append(twin)
+            urls.append(url)
     return order_candidates(
         urls,
         preferred_hosts=preferred_hosts,
@@ -540,6 +583,113 @@ class HeaderReadCrashed(OSError):
         )
 
 
+class HeaderReadBlocked(OSError):
+    """
+    Raised when a data node signals it is *rate-limiting or refusing* us
+
+    Distinct from an ordinary `OSError`: this is **host-level distress** (an HTTP
+    `429`/`403`/`503`, a "too many requests" body) rather than a per-file problem,
+    so it should drive a node's concurrency *down* and never be retried on the same
+    host.  Still an `OSError`, so `read_first_readable` falls through to the next
+    mirror like any other failure.  `promote_blocks` produces it from a plain
+    `OSError` whose message matches a block signature (`is_block_signal`).
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(
+            f"Data node for {url!r} signalled a block/rate-limit: {reason}"
+        )
+
+
+# Substrings (matched case-insensitively) that mark a read failure as a node-level
+# *block* — an explicit rate-limit or refusal — rather than an ordinary transient
+# error.  A single connection reset is deliberately *not* here: one reset is treated
+# as a transient error (retryable); reset *bursts* are an aggregate signal handled
+# by the concurrency controller, not this per-error classifier.
+_BLOCK_SIGNATURES = (
+    "429",
+    "too many requests",
+    "rate limit",
+    "403",
+    "forbidden",
+    "503",
+    "service unavailable",
+)
+
+
+def is_block_signal(exc: BaseException) -> bool:
+    """
+    Return whether an exception looks like a data node blocking/rate-limiting us
+
+    Inspects the exception's text for an explicit rate-limit or refusal signature
+    (an HTTP `429`/`403`/`503`, "too many requests", ...).  This is a heuristic: the
+    netCDF/libcurl byte-range driver surfaces HTTP status as `OSError` message text,
+    so there is no structured status code to read.
+
+    Parameters
+    ----------
+    exc
+        The exception raised by a read.
+
+    Returns
+    -------
+    :
+        `True` if the message matches a known block signature.
+
+    Examples
+    --------
+    >>> is_block_signal(OSError("HTTP error 429: Too Many Requests"))
+    True
+    >>> is_block_signal(OSError("Connection refused"))
+    False
+    """
+    text = str(exc).lower()
+    return any(signature in text for signature in _BLOCK_SIGNATURES)
+
+
+def promote_blocks(reader: Callable[[str], T]) -> Callable[[str], T]:
+    """
+    Wrap a reader so a block/rate-limit `OSError` is re-raised as `HeaderReadBlocked`
+
+    An ordinary `OSError` whose message matches `is_block_signal` is a node-level
+    block, not a per-file error, so it is promoted to `HeaderReadBlocked` — which
+    the concurrency controller uses to back a node off and which `with_retry`
+    declines to retry.  Already-typed failures (`HeaderReadTimeout`,
+    `HeaderReadCrashed`, `HeaderReadBlocked`) pass through unchanged.
+
+    Compose it *inside* `recording` (so the block is recorded as such) and inside
+    `with_retry` (so it is not retried on the same host):
+
+    ```python
+    reader = with_retry(recording(promote_blocks(with_timeout(read_header)), health))
+    ```
+
+    Parameters
+    ----------
+    reader
+        The underlying `url -> value` read to classify.
+
+    Returns
+    -------
+    :
+        A reader with the same contract that raises `HeaderReadBlocked` on a block.
+    """
+
+    def read(url: str) -> T:
+        try:
+            return reader(url)
+        except (HeaderReadTimeout, HeaderReadCrashed, HeaderReadBlocked):
+            raise
+        except OSError as exc:
+            if is_block_signal(exc):
+                raise HeaderReadBlocked(url, str(exc)) from exc
+            raise
+
+    return read
+
+
 def _run_reader(reader: Callable[[str], T], url: str, conn: Connection) -> None:
     """Child entry point: send `("ok", result)` or `("err", exception)` back."""
     try:
@@ -637,7 +787,11 @@ def with_retry(  # noqa: PLR0913 - configurable but every knob has a sane defaul
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry_on: tuple[type[Exception], ...] = (OSError,),
-    give_up_on: tuple[type[Exception], ...] = (HeaderReadTimeout, HeaderReadCrashed),
+    give_up_on: tuple[type[Exception], ...] = (
+        HeaderReadTimeout,
+        HeaderReadCrashed,
+        HeaderReadBlocked,
+    ),
     base: float = DEFAULT_RETRY_BASE,
     cap: float = DEFAULT_RETRY_CAP,
     jitter: float = DEFAULT_RETRY_JITTER,
@@ -651,11 +805,14 @@ def with_retry(  # noqa: PLR0913 - configurable but every knob has a sane defaul
     hammering) and de-synchronising concurrent readers so a node is not tempted to
     throttle or block us.
 
-    By default it retries any `OSError` **except** `HeaderReadTimeout` and
-    `HeaderReadCrashed`: a *stall* means the node answered but is hanging, so
-    burning another full deadline on it is wasteful — better to fall through to the
-    next mirror (`read_first_readable` will) — and a crash on a specific file is
-    unlikely to fix itself.  Only genuine connect-time failures are retried.
+    By default it retries any `OSError` **except** `HeaderReadTimeout`,
+    `HeaderReadCrashed` and `HeaderReadBlocked`: a *stall* means the node answered
+    but is hanging, so burning another full deadline on it is wasteful — better to
+    fall through to the next mirror (`read_first_readable` will); a crash on a
+    specific file is unlikely to fix itself; and a *block* means the node is
+    rate-limiting us, so retrying the same host only hammers it (the concurrency
+    controller backs it off instead).  Only genuine connect-time failures are
+    retried.
 
     Compose it *outside* `recording` so every attempt is recorded as its own read
     (retries then show up in `NodeHealth` failure counts), and inside

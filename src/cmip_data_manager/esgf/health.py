@@ -26,7 +26,11 @@ from enum import Enum
 from typing import TypeVar
 from urllib.parse import urlparse
 
-from cmip_data_manager.esgf.headers import HeaderReadCrashed, HeaderReadTimeout
+from cmip_data_manager.esgf.headers import (
+    HeaderReadBlocked,
+    HeaderReadCrashed,
+    HeaderReadTimeout,
+)
 
 T = TypeVar("T")
 
@@ -40,6 +44,11 @@ class ReadOutcome(Enum):
 
     CRASH = "crash"
     """The worker died mid-read (`HeaderReadCrashed`)."""
+
+    BLOCKED = "blocked"
+    """The node rate-limited or refused us (`HeaderReadBlocked`) — host-level
+    distress that should drive the node's concurrency down, kept distinct from a
+    per-file `ERROR`."""
 
     ERROR = "error"
     """Any other `OSError` (connection refused, missing byte-range, ...)."""
@@ -55,11 +64,31 @@ class NodeStat:
     timeouts: int = 0
     crashes: int = 0
     errors: int = 0
+    blocks: int = 0
+    """Reads that ended in a node-level block/rate-limit (`ReadOutcome.BLOCKED`)."""
+
     total_success_seconds: float = 0.0
     """Summed duration of successful reads (for the mean)."""
 
     max_success_seconds: float = 0.0
     """Slowest successful read seen (for sizing a data-driven timeout)."""
+
+    max_safe_concurrency: int = 0
+    """
+    Highest per-node connection count (`L_n`) observed running cleanly on this host.
+
+    Learned by the adaptive concurrency controller (AIMD): the ceiling this node
+    tolerated without a block signal.  `0` means "not yet learned".
+    """
+
+    last_concurrency: int = 0
+    """
+    The per-node connection count (`L_n`) this host converged on at the end of a run.
+
+    Persisted so a later run can seed the node's starting concurrency from where it
+    settled rather than re-probing from the conservative default.  `0` means "not
+    yet learned".
+    """
 
     @property
     def success_rate(self) -> float:
@@ -77,6 +106,48 @@ class NodeStat:
         if not self.successes:
             return None
         return self.total_success_seconds / self.successes
+
+
+@dataclass(frozen=True)
+class AttemptRecord:
+    """One header-read attempt: the URL tried, how it ended, and how long it took."""
+
+    url: str
+    outcome: ReadOutcome
+    seconds: float
+
+
+class AttemptLog:
+    """
+    A thread-safe collector of individual read attempts
+
+    Where `NodeHealth` keeps per-host *aggregates*, this keeps the raw per-attempt
+    records (including `with_retry` sub-attempts) so a caller can persist the full
+    trail.  Pass one to `recording(reader, health, attempts=log)` and every read
+    appends its `(url, outcome, seconds)`; reads run across threads, so appends are
+    lock-guarded.
+
+    Examples
+    --------
+    >>> log = AttemptLog()
+    >>> log.add("https://good/f.nc", ReadOutcome.SUCCESS, 1.2)
+    >>> [(r.url, r.outcome.value) for r in log.records()]
+    [('https://good/f.nc', 'success')]
+    """
+
+    def __init__(self) -> None:
+        self._records: list[AttemptRecord] = []
+        self._lock = threading.Lock()
+
+    def add(self, url: str, outcome: ReadOutcome, seconds: float) -> None:
+        """Append one attempt record (thread-safe)."""
+        with self._lock:
+            self._records.append(AttemptRecord(url, outcome, seconds))
+
+    def records(self) -> list[AttemptRecord]:
+        """Return the attempts recorded so far, in append order (a copy)."""
+        with self._lock:
+            return list(self._records)
 
 
 class NodeHealth:
@@ -125,8 +196,34 @@ class NodeHealth:
                 stat.timeouts += 1
             elif outcome is ReadOutcome.CRASH:
                 stat.crashes += 1
+            elif outcome is ReadOutcome.BLOCKED:
+                stat.blocks += 1
             else:
                 stat.errors += 1
+
+    def record_concurrency(self, host: str, *, max_safe: int, last: int) -> None:
+        """
+        Record the per-node concurrency the adaptive controller learned for a host
+
+        `max_safe` accumulates as the largest safe level ever seen (across runs);
+        `last` is overwritten with where the cap converged this run, to seed the
+        next one.  Creates the host's stats if this is the first thing recorded.
+
+        Parameters
+        ----------
+        host
+            The data node (hostname).
+
+        max_safe
+            Highest simultaneous read count that ran cleanly on this host this run.
+
+        last
+            The per-node cap this host converged on at the end of the run.
+        """
+        with self._lock:
+            stat = self._stats.setdefault(host, NodeStat(host))
+            stat.max_safe_concurrency = max(stat.max_safe_concurrency, max_safe)
+            stat.last_concurrency = last
 
     def restore(self, stat: NodeStat) -> None:
         """
@@ -324,7 +421,12 @@ class NodeHealth:
         return max(floor, worst * safety)
 
 
-def recording(reader: Callable[[str], T], health: NodeHealth) -> Callable[[str], T]:
+def recording(
+    reader: Callable[[str], T],
+    health: NodeHealth,
+    *,
+    attempts: AttemptLog | None = None,
+) -> Callable[[str], T]:
     """
     Wrap a reader so every read's outcome and duration are recorded
 
@@ -341,7 +443,12 @@ def recording(reader: Callable[[str], T], health: NodeHealth) -> Callable[[str],
         The read to observe (typically a timeout-wrapped `read_header`).
 
     health
-        Registry to record into.
+        Registry to record aggregate per-host outcomes into.
+
+    attempts
+        Optional per-attempt log; when given, each read also appends its raw
+        `(url, outcome, seconds)` record (including `with_retry` sub-attempts), for
+        callers that persist the full trail.
 
     Returns
     -------
@@ -349,20 +456,28 @@ def recording(reader: Callable[[str], T], health: NodeHealth) -> Callable[[str],
         A reader with the same contract that records before returning/raising.
     """
 
+    def emit(url: str, outcome: ReadOutcome, seconds: float) -> None:
+        health.record(url, outcome, seconds)
+        if attempts is not None:
+            attempts.add(url, outcome, seconds)
+
     def read(url: str) -> T:
         started = time.monotonic()
         try:
             result = reader(url)
         except HeaderReadTimeout:
-            health.record(url, ReadOutcome.TIMEOUT, time.monotonic() - started)
+            emit(url, ReadOutcome.TIMEOUT, time.monotonic() - started)
             raise
         except HeaderReadCrashed:
-            health.record(url, ReadOutcome.CRASH, time.monotonic() - started)
+            emit(url, ReadOutcome.CRASH, time.monotonic() - started)
+            raise
+        except HeaderReadBlocked:
+            emit(url, ReadOutcome.BLOCKED, time.monotonic() - started)
             raise
         except OSError:
-            health.record(url, ReadOutcome.ERROR, time.monotonic() - started)
+            emit(url, ReadOutcome.ERROR, time.monotonic() - started)
             raise
-        health.record(url, ReadOutcome.SUCCESS, time.monotonic() - started)
+        emit(url, ReadOutcome.SUCCESS, time.monotonic() - started)
         return result
 
     return read

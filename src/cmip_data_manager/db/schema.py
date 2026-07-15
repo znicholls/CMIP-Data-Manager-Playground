@@ -186,6 +186,54 @@ class DatasetHeader(SQLModel, table=True):
     read_at: datetime = Field(default_factory=_utcnow)
 
 
+class HeaderReadAttempt(SQLModel, table=True):
+    """
+    One header-read attempt against a data node — an append-only log
+
+    Where `DatasetHeader` keeps only the *winning* read and `NodeHealthStat` keeps
+    per-host *aggregates*, this is the raw, timestamped per-attempt fact table:
+    every URL tried for every simulation, in order, with its outcome and duration —
+    including `with_retry` sub-attempts and simulations that fully failed.  It is
+    append-only (never upserted), so it accumulates a history.
+
+    It underpins two things the aggregates cannot:
+
+    - **diagnosis** — for a simulation that failed, exactly which nodes and URLs were
+      attempted and how each ended (timeout, crash, block, error);
+    - **ad-hoc questions** — because `created_at`, `host`, `source_id`,
+      `variable_id` and `outcome` are all indexed, a plain `GROUP BY` answers "how
+      did node X do today?", "what happened to CanESM5's headers?", or "which nodes
+      served `tas` on this day?", and a success-one-day / failure-the-next flip is
+      visible by grouping a simulation's rows on `created_at`.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+    source_id: str = Field(index=True)
+    experiment_id: str = Field(index=True)
+    variant_label: str = Field(index=True)
+    variable_id: str | None = Field(default=None, index=True)
+    table_id: str | None = None
+
+    host: str | None = Field(default=None, index=True)
+    """Data node the attempt hit; `None` on a `no_candidate` record."""
+
+    url: str | None = None
+    """Exact mirror URL attempted; `None` on a `no_candidate` record."""
+
+    outcome: str = Field(index=True)
+    """`success`, `timeout`, `crash`, `blocked`, `error`, `no_candidate` (no mirror
+    was indexed), or `stranded` (a mirror existed but was evicted before this
+    simulation was tried)."""
+
+    seconds: float = 0.0
+    """Wall-clock duration of the attempt (`0` for a `no_candidate` record)."""
+
+    attempt_no: int = 1
+    """1-based ordinal of this attempt among retries of the same `(host, url)`."""
+
+
 class NodeHealthStat(SQLModel, table=True):
     """
     Persisted per-data-node header-read outcomes
@@ -202,10 +250,19 @@ class NodeHealthStat(SQLModel, table=True):
     timeouts: int = 0
     crashes: int = 0
     errors: int = 0
+    blocks: int = 0
+    """Reads ending in a node-level block/rate-limit (HTTP 429/403/503)."""
+
     total_success_seconds: float = 0.0
     """Summed duration of successful reads (numerator of the mean)."""
 
     max_success_seconds: float = 0.0
     """Slowest successful read seen; informs a data-driven read timeout."""
+
+    max_safe_concurrency: int = 0
+    """Highest per-node connection count seen running cleanly (0 = not learned)."""
+
+    last_concurrency: int = 0
+    """Per-node connection count this host converged on last run (0 = not learned)."""
 
     updated_at: datetime = Field(default_factory=_utcnow)

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from cmip_data_manager.esgf.headers import (
+    HeaderReadBlocked,
     HeaderReadCrashed,
     HeaderReadTimeout,
     _coerce_attr,
@@ -16,7 +17,10 @@ from cmip_data_manager.esgf.headers import (
     header_key,
     http_download_url,
     http_download_urls,
+    https_twin,
+    is_block_signal,
     order_candidates,
+    promote_blocks,
     read_first_readable,
     simulation_key,
     with_retry,
@@ -124,9 +128,43 @@ def test_candidate_urls_pool_across_a_simulations_files():
         _file("f1", "https://nci/tas.nc|x|HTTPServer", variable_id="tas"),
         _file("f2", "http://far/rsut.nc|x|HTTPServer", variable_id="rsut"),
     ]
+    # The http-only mirror contributes an https twin (ranked ahead), keeping the
+    # original http URL as a fallback.
     assert candidate_urls_for_files(files, preferred_hosts=("nci",)) == [
         "https://nci/tas.nc",
+        "https://far/rsut.nc",
         "http://far/rsut.nc",
+    ]
+
+
+def test_https_twin_upgrades_only_http_urls():
+    assert https_twin("http://a/f.nc") == "https://a/f.nc"
+    assert https_twin("https://a/f.nc") is None
+    assert https_twin("gsiftp://a/f.nc") is None
+
+
+def test_candidate_urls_add_https_twin_for_http_only_mirror():
+    # A replica indexed only as http still yields an https attempt first.
+    files = [_file("f", "http://ucar/tas.nc|x|HTTPServer", variable_id="tas")]
+    assert candidate_urls_for_files(files) == [
+        "https://ucar/tas.nc",
+        "http://ucar/tas.nc",
+    ]
+
+
+def test_candidate_urls_no_duplicate_when_both_schemes_indexed():
+    # When the index already lists both schemes, the twin does not double them up.
+    files = [
+        _file(
+            "f",
+            "http://ornl/tas.nc|x|HTTPServer",
+            "https://ornl/tas.nc|x|HTTPServer",
+            variable_id="tas",
+        )
+    ]
+    assert candidate_urls_for_files(files) == [
+        "https://ornl/tas.nc",
+        "http://ornl/tas.nc",
     ]
 
 
@@ -327,3 +365,66 @@ def test_with_retry_backoff_sleeps_between_attempts():
     read = with_retry(flaky, max_attempts=5, base=1.0, jitter=0.0, sleep=slept.append)
     assert read("https://node/f.nc") == "https://node/f.nc"
     assert slept == [1.0, 2.0]  # exponential: base*2**0, base*2**1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HTTP error 429: Too Many Requests",
+        "server said 403 Forbidden",
+        "503 Service Unavailable",
+        "you have hit the rate limit",
+    ],
+)
+def test_is_block_signal_matches_rate_limit_and_refusal(message):
+    assert is_block_signal(OSError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Connection refused", "Connection reset by peer", "NetCDF: HDF error"],
+)
+def test_is_block_signal_ignores_ordinary_errors(message):
+    assert not is_block_signal(OSError(message))
+
+
+def test_promote_blocks_reraises_block_signal_as_blocked():
+    def reader(url: str) -> str:
+        raise OSError("HTTP 429 Too Many Requests")
+
+    read = promote_blocks(reader)
+    with pytest.raises(HeaderReadBlocked) as excinfo:
+        read("https://busy/f.nc")
+    assert excinfo.value.url == "https://busy/f.nc"
+    assert "429" in excinfo.value.reason
+
+
+def test_promote_blocks_passes_through_ordinary_and_typed_errors():
+    def erroring(url: str) -> str:
+        raise OSError("Connection refused")
+
+    def stalling(url: str) -> str:
+        raise HeaderReadTimeout(url, 90.0)
+
+    with pytest.raises(OSError, match="refused"):
+        promote_blocks(erroring)("https://dead/f.nc")
+    # An already-typed failure is not re-wrapped.
+    with pytest.raises(HeaderReadTimeout):
+        promote_blocks(stalling)("https://stalled/f.nc")
+
+
+def test_promote_blocks_returns_value_on_success():
+    assert promote_blocks(lambda url: url.upper())("https://a/f.nc") == "HTTPS://A/F.NC"
+
+
+def test_with_retry_does_not_retry_a_block():
+    calls = {"n": 0}
+
+    def blocked(url: str) -> str:
+        calls["n"] += 1
+        raise HeaderReadBlocked(url, "429 Too Many Requests")
+
+    read = with_retry(blocked, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(HeaderReadBlocked):
+        read("https://busy/f.nc")
+    assert calls["n"] == 1  # not retried — the controller backs the node off instead

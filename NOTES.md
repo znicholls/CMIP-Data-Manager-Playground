@@ -257,3 +257,180 @@ We want to update this workflow in a few ways. What may be the most signficant u
 The second workflow update is that we want to include workers for each specific node. We do not want to have a large risk of being blocked by the node, but to be the most efficient we want to utilise multiple workers. How many workers would you suggest starting with? And at what connection rate (jitters/exponential back-off)? Additionally, is there a way to save information related to how many workers can successfully be used for each node before an error/block is thrown? Eventually, we may want to be able to let a user specify the number of workers per node.
 
 If you have uncertainties, please ask.
+
+#### Day 5 (15/7)
+Goals:
+- Updates to workflow
+- Remain on a node for same source_id (wouldn't remain on single node indefinitely, slows process down)
+- Multiple workers per node (node can handle this, but might be different per node)
+- See how stalls (kill time) works in this framework
+- Test on SSP, then Gregory (one hop), then G6solar (3 hops?)
+- MM use-case with search: check that we can answer a 'Malte-style' workflow i.e. answer a question like "I want to do some analysis on historical. At maximum, I want to use these 20 variables. Show me a summary of the number of models depending on whether I require only these 5 variables (pick a random 5), these 10 variables (pick some set of 10) or all 20 variables"
+
+Starting point from yesterday
+"we should remain on this node and attempt to find and save files from other experiments" -> "we should remain on this node and attempt to find and save files from other experiments for the same source ID (model), this 'same' idea should be configurable by the user, set source_id as the default for now"
+
+"We do not want to be connecting/disconnecting/reconnecting" -> "From experience, if we can get data for a given source ID from a node, it will also be able to provide other data for the same source ID"
+
+Having read the response: ok, we give up on the idea of being able to reuse a TCP connection.
+
+End-to-end workflow outline
+
+1. Search + plan (unchanged): load cached datasets, group into simulations, skip cached, reuse sibling headers.
+2. File lookup + invert (unchanged lookup, new step): batch-query files, then build host → {serviceable simulations} and each simulation's ranked host list.
+3. Seed limits: load persisted NodeHealth; set each L_n from persisted last_concurrency, drop known-dead hosts into ignore.
+4. Build per-node queues ordered by affinity_key (default source_id).
+5. Dispatch loop over a pool of G workers, gated by per-host semaphores:
+  - assign each sim to its best host under-cap (affinity-preferred), spill to next-best only to avoid idling a capable node;
+  - each read stays with_retry(recording(with_timeout(read_header))) — the stall-kill is unchanged.
+6. Outcome routing:
+  - success → store, update health, AIMD-increase eligibility, advance the affinity group on that node;
+  - file-level failure (404/crash/single stall) → requeue sim to its next-best host;
+  - node-level failure / block signal → AIMD-decrease L_n; on repeated distress, circuit-break the node and drain its queue back to alternatives.
+7. Persist: node health incl. learned L_n, and headers.
+
+Q: preferencing nodes, three options on cold run: no preference, single node preference, ranked preference
+- This already exists in the workflow to account for health data.
+- No new workflow here.
+- If warm run (have health data), and a user inputs a preferenced list of nodes, then the way to also include health data is "preference leads, health vetoes and fills"
+## Implementation plan: node-centric header enrichment (best-node assignment + per-node pools)
+
+Decided design (with Claude, 15/7). Turns the current **simulation-centric** header step
+(one global 8-thread pool, each read independently picks the best mirror) into a
+**node-centric** one: assign each simulation to its best healthy host, run per-node bounded
+work queues in parallel, reassign on failure, and learn each node's safe concurrency.
+
+### Mental model (three concurrency levels)
+
+- **Local workers (G)** — one shared thread pool on our machine (start G ≈ 12–16). Total
+  reads in flight *anywhere*. Bounds our own parallelism.
+- **Nodes** — the ESGF data servers; many worked in parallel. Each hosts only *some* files.
+- **Per-node connections (L_n)** — an adaptive cap per host, enforced by a
+  `threading.Semaphore(L_n)` ("bag of L_n tickets"): a worker takes a ticket before reading
+  from host *n*, returns it after. Invariant: `in_flight(n) ≤ L_n` ∀ n, and `Σ in_flight ≤ G`.
+  ("in-flight" = read started but not returned yet.)
+
+### Dispatcher / preferencing
+
+- From the file lookup, invert into `host → {serviceable simulations}` (ground truth from
+  the index — no probing needed). Each simulation keeps its ranked candidate-host list
+  (`order_candidates`: preferred → learned health → https).
+- **Dispatch rule:** keep G workers fed; assign each pending sim to its *best host that is
+  under its cap* (walk the ranked list). Preferred/fast nodes (NCI) get first refusal up to
+  their cap.
+- **Anti-bottleneck (spill):** never leave a capable node idle. Spill a sim to its next-best
+  host only when its preferred host is saturated **and** a capable alternative is idle. So NCI
+  stays saturated (drains fast) while slower nodes work the overflow in parallel — no single
+  node bottlenecks and none idles.
+- **Affinity (soft):** within a node's queue, cluster by `affinity_key` (default `source_id`,
+  because a model's datasets usually share one origin node). Once a node serves a group, prefer
+  keeping that group's remaining sims on it — but never at the cost of idling/bottlenecking.
+  New DI seam `affinity_key: Callable[[DatasetRecord], Hashable]`; users can pass
+  `experiment_id`, `(source_id, experiment_id)`, or `None` (pure best-node fill). Ordering only,
+  never correctness.
+
+### Preference modes (all via existing `preferred_hosts`)
+
+1. none → `()`  2. single → `("esgf.nci.org.au",)`  3. ranked → `("nci…", "ceda…", "dkrz…")`.
+- **Cold run:** preference is the only steering signal; ranked list obeyed literally.
+- **Warm re-run — "preference leads, health vetoes & fills":** (1) a preferred node health has
+  *proven* unreliable (unreliable_hosts / circuit-broken) is dropped entirely; (2) a merely-slow
+  preferred node still leads (user knows their context); health only orders the *unranked* nodes;
+  (3) every node starts with its *learned* L_n from the DB, not the cold default.
+
+### Outcome routing (once "connected" is not binary)
+
+Separate three things: node reachable ≠ file present ≠ file readable.
+- **success** → store, record health, advance the affinity group, count toward AIMD increase.
+- **file-level failure** (404/index-mismatch, `HeaderReadCrashed`, a single stall) → requeue that
+  sim to its *next-best* host; keep using the node for others.
+- **node-level failure / block signal** (HTTP 429/403, connection-reset burst, latency cliff) →
+  AIMD-decrease L_n; after `DEFAULT_MAX_ATTEMPTS` (3) consecutive node-level failures,
+  **circuit-break** the node: evict it and drain its queue back to alternatives.
+- Stall-kill mechanism (`with_timeout` subprocess kill) is unchanged — still needed.
+
+### Adaptive per-node concurrency (AIMD)
+
+- Start L_n = 2 (NCI 4), or seed from persisted `last_concurrency`.
+- **Increase (+1)** after a streak of clean successes at current L_n with no block signals, up to
+  a **hard ceiling of 6–8** (shared scientific infra — stay polite).
+- **Decrease** on a block signal: `L_n = max(1, L_n // 2)`, then a cooldown before increasing again.
+- Ordinary file failures (404 / one corrupt file) do **not** back off concurrency — only host
+  distress does.
+- **Persist** so learning survives runs (mirrors the `suggested_timeout` pattern).
+
+### Data-model changes (`db/schema.py` `NodeHealthStat` + `health.py` `NodeStat`)
+
+- `max_safe_concurrency: int` — highest L_n that ran clean.
+- `last_concurrency: int` — where it converged; seeds next run.
+- `block_events: int`, `last_block_at: datetime | None` — for cross-run cooldown.
+- New `ReadOutcome.BLOCKED` (429/403/RST-burst) distinct from `ERROR`, so AIMD-decrease and
+  the health veto only fire on genuine host distress.
+
+### Config knobs (script-level, DI-injected)
+
+- `preferred_hosts` (the 3 modes above), `affinity_key`, global `max_workers` (G),
+  `default_node_concurrency` (2) + per-node overrides `node_concurrency: dict[str, int]`
+  (pins L_n, disables AIMD for that host), `node_concurrency_ceiling` (6–8),
+  `circuit_break_after` (= DEFAULT_MAX_ATTEMPTS).
+
+### Suggested phasing
+
+1. Schema + `NodeStat` fields + `ReadOutcome.BLOCKED` + block detection in `recording`.
+2. `host → simulations` inversion + `affinity_key` seam (pure, unit-testable).
+3. Dispatcher: per-host semaphores + best-host-under-cap + spill + requeue (replaces the single
+   `read_map` over `plan.to_read` in `enrich_headers`).
+4. Circuit breaker + AIMD controller (mid-run learning) + persistence.
+5. Wire knobs into `scripts/enrich_uc1_headers.py`; live-test UC1 (SSP245 tas), compare timing
+   vs the 191s baseline; then Gregory (1 hop) and G6solar (multi-hop).
+
+### Testing
+
+- Inject a fake reader (no network) that returns/raises per URL to exercise: spill when a node is
+  capped, requeue on file-level failure, circuit-break on repeated node-level failure, AIMD
+  up/down, and preference-vs-health ordering. Keep coverage ≥ 90%, mypy --strict, ruff.
+
+### Open / deferred
+
+- Cross-file *connection* reuse (persistent-worker + supervisor) still deferred — modest payoff vs
+  read latency given subprocess-per-read; revisit only if the full 553 run shows it matters.
+- Global inter-request throttle per node (small randomized spacing) — fold in with AIMD if block
+  signals appear.
+
+Starting point from yesterday
+"we should remain on this node and attempt to find and save files from other experiments" -> "we should remain on this node and attempt to find and save files from other experiments for the same source ID (model), this 'same' idea should be configurable by the user, set source_id as the default for now"
+
+"We do not want to be connecting/disconnecting/reconnecting" -> "From experience, if we can get data for a given source ID from a node, it will also be able to provide other data for the same source ID"
+
+Having read the response: ok, we give up on the idea of being able to reuse a TCP connection.
+
+End-to-end workflow outline
+
+1. Search + plan (unchanged): load cached datasets, group into simulations, skip cached, reuse sibling headers.
+2. File lookup + invert (unchanged lookup, new step): batch-query files, then build host → {serviceable simulations} and each simulation's ranked host list.
+3. Seed limits: load persisted NodeHealth; set each L_n from persisted last_concurrency, drop known-dead hosts into ignore.
+4. Build per-node queues ordered by affinity_key (default source_id).
+5. Dispatch loop over a pool of G workers, gated by per-host semaphores:
+  - assign each sim to its best host under-cap (affinity-preferred), spill to next-best only to avoid idling a capable node;
+  - each read stays with_retry(recording(with_timeout(read_header))) — the stall-kill is unchanged.
+6. Outcome routing:
+  - success → store, update health, AIMD-increase eligibility, advance the affinity group on that node;
+  - file-level failure (404/crash/single stall) → requeue sim to its next-best host;
+  - node-level failure / block signal → AIMD-decrease L_n; on repeated distress, circuit-break the node and drain its queue back to alternatives.
+7. Persist: node health incl. learned L_n, and headers.
+
+Q: preferencing nodes, three options on cold run: no preference, single node preference, ranked preference
+- This already exists in the workflow to account for health data.
+- No new workflow here.
+- If warm run (have health data), and a user inputs a preferenced list of nodes, then the way to also include health data is "preference leads, health vetoes and fills"
+
+Fix after first live run:
+Root problem: eviction fired on 3 consecutive failures, and affinity clustering makes consecutive dispatches hit the same model — so one model with missing files on a mirror evicted that mirror for everyone. It killed Globus (93% healthy, 228 successes) and stranded 214 sims.
+
+The fix — rate-based eviction: a node is evicted only once it has ≥ evict_after_attempts (6) reads and an overall success rate ≤ evict_max_success_rate (0.2). The scheduler now tracks cumulative attempts/successes per host instead of a raw failure streak. Effect on last run's nodes:
+- Dead nodes (ucar 0/12, gfdl 0/9, apcc21 0/9) → still evicted quickly. ✓
+- Globus (228/244 = 93%) and ORNL (39/66 = 59%) → never cross 0.2, so they survive. ✓
+
+
+failure cause for most of the models!! http vs https -> see https_twin in header.py
+- This should fire regardless of if warm/cold run

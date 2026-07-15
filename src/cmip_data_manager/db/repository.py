@@ -18,7 +18,7 @@ code that the online path uses.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -32,6 +32,7 @@ from cmip_data_manager.db.schema import (
     DatasetChange,
     DatasetHeader,
     File,
+    HeaderReadAttempt,
     NodeHealthStat,
     QueryRun,
     RunMembership,
@@ -78,6 +79,44 @@ class RunResult:
     def has_changes(self) -> bool:
         """Whether the run added, removed or modified anything."""
         return bool(self.added or self.removed or self.modified)
+
+
+@dataclass(frozen=True)
+class HeaderAttempt:
+    """
+    One header-read attempt to persist to the `HeaderReadAttempt` log
+
+    The write-side counterpart of the schema row: `enrich_headers` builds these
+    from the `AttemptLog` (joining each URL back to its simulation, host and
+    variable) and hands them to `record_header_attempts`.
+    """
+
+    source_id: str
+    experiment_id: str
+    variant_label: str
+    outcome: str
+    host: str | None = None
+    url: str | None = None
+    variable_id: str | None = None
+    table_id: str | None = None
+    seconds: float = 0.0
+    attempt_no: int = 1
+
+
+@dataclass(frozen=True)
+class AttemptSummary:
+    """A per-key roll-up of `HeaderReadAttempt` rows (see `header_attempt_summary`)."""
+
+    key: str
+    """The grouped value (a host or a `source_id`)."""
+
+    attempts: int
+    successes: int
+    failures: int
+    """Attempts that did not succeed (every non-`success` outcome)."""
+
+    outcomes: dict[str, int] = field(default_factory=dict)
+    """Count of each raw `outcome` value in this group."""
 
 
 class Repository:
@@ -409,6 +448,157 @@ class Repository:
             key=lambda r: (r.total_success_seconds / r.successes, r.host),
         )
 
+    def record_header_attempts(self, attempts: Sequence[HeaderAttempt]) -> int:
+        """
+        Append per-attempt header-read records to the log
+
+        Append-only: every attempt (including retries and fully-failed
+        simulations) becomes its own `HeaderReadAttempt` row, so the log builds a
+        history across runs rather than being overwritten.
+
+        Parameters
+        ----------
+        attempts
+            The attempts to record.
+
+        Returns
+        -------
+        :
+            Number of rows written.
+        """
+        if not attempts:
+            return 0
+        with Session(self._engine) as session:
+            for attempt in attempts:
+                session.add(
+                    HeaderReadAttempt(
+                        source_id=attempt.source_id,
+                        experiment_id=attempt.experiment_id,
+                        variant_label=attempt.variant_label,
+                        variable_id=attempt.variable_id,
+                        table_id=attempt.table_id,
+                        host=attempt.host,
+                        url=attempt.url,
+                        outcome=attempt.outcome,
+                        seconds=attempt.seconds,
+                        attempt_no=attempt.attempt_no,
+                    )
+                )
+            session.commit()
+        return len(attempts)
+
+    def get_header_attempts(  # noqa: PLR0913 - optional filters, all keyword-only
+        self,
+        *,
+        host: str | None = None,
+        source_id: str | None = None,
+        experiment_id: str | None = None,
+        variant_label: str | None = None,
+        outcome: str | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[HeaderReadAttempt]:
+        """
+        Return logged header-read attempts, filtered and newest-first
+
+        The queryable window onto the attempt log: any combination of the
+        (indexed) filters narrows it, so "how did node X do?" (`host=...`), "what
+        happened to this model?" (`source_id=...`) or "today's failures"
+        (`since=..., outcome="timeout"`) are each one call.
+
+        Parameters
+        ----------
+        host, source_id, experiment_id, variant_label, outcome
+            Exact-match filters; omit any to leave that dimension unconstrained.
+
+        since
+            Keep only attempts recorded at or after this time.
+
+        limit
+            Cap on rows returned (the newest ones); unbounded if omitted.
+
+        Returns
+        -------
+        :
+            Matching attempts, most recent first.
+        """
+        statement = select(HeaderReadAttempt)
+        if host is not None:
+            statement = statement.where(HeaderReadAttempt.host == host)
+        if source_id is not None:
+            statement = statement.where(HeaderReadAttempt.source_id == source_id)
+        if experiment_id is not None:
+            statement = statement.where(
+                HeaderReadAttempt.experiment_id == experiment_id
+            )
+        if variant_label is not None:
+            statement = statement.where(
+                HeaderReadAttempt.variant_label == variant_label
+            )
+        if outcome is not None:
+            statement = statement.where(HeaderReadAttempt.outcome == outcome)
+        if since is not None:
+            statement = statement.where(HeaderReadAttempt.created_at >= since)
+        statement = statement.order_by(col(HeaderReadAttempt.id).desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        with Session(self._engine) as session:
+            return list(session.exec(statement).all())
+
+    def header_attempt_summary(
+        self, *, group_by: str = "host", since: datetime | None = None
+    ) -> list[AttemptSummary]:
+        """
+        Roll up logged attempts by host or source_id
+
+        Builds the "picture of the day" the raw log supports: for each host (or
+        `source_id`), how many attempts were made, how many succeeded/failed, and
+        the breakdown by outcome.  Pair with `since` for a single day's view.
+
+        Parameters
+        ----------
+        group_by
+            `"host"` or `"source_id"` — the dimension to roll up on.
+
+        since
+            Only include attempts recorded at or after this time.
+
+        Returns
+        -------
+        :
+            One summary per group, ordered by most attempts first.
+
+        Raises
+        ------
+        ValueError
+            If `group_by` is neither `"host"` nor `"source_id"`.
+        """
+        if group_by not in ("host", "source_id"):
+            msg = "group_by must be 'host' or 'source_id'"
+            raise ValueError(msg)
+        statement = select(HeaderReadAttempt)
+        if since is not None:
+            statement = statement.where(HeaderReadAttempt.created_at >= since)
+        with Session(self._engine) as session:
+            rows = session.exec(statement).all()
+
+        buckets: dict[str, dict[str, int]] = {}
+        for row in rows:
+            key = (row.host if group_by == "host" else row.source_id) or "(none)"
+            outcomes = buckets.setdefault(key, {})
+            outcomes[row.outcome] = outcomes.get(row.outcome, 0) + 1
+        summaries = [
+            AttemptSummary(
+                key=key,
+                attempts=sum(outcomes.values()),
+                successes=outcomes.get("success", 0),
+                failures=sum(outcomes.values()) - outcomes.get("success", 0),
+                outcomes=dict(outcomes),
+            )
+            for key, outcomes in buckets.items()
+        ]
+        return sorted(summaries, key=lambda s: (-s.attempts, s.key))
+
     def get_dataset_records(self, use_case: str) -> list[DatasetRecord]:
         """
         Return the datasets from the latest cached run of a use case
@@ -566,8 +756,11 @@ def _node_health_columns(stat: NodeStat) -> dict[str, Any]:
         "timeouts": stat.timeouts,
         "crashes": stat.crashes,
         "errors": stat.errors,
+        "blocks": stat.blocks,
         "total_success_seconds": stat.total_success_seconds,
         "max_success_seconds": stat.max_success_seconds,
+        "max_safe_concurrency": stat.max_safe_concurrency,
+        "last_concurrency": stat.last_concurrency,
         "updated_at": datetime.now(timezone.utc),
     }
 
@@ -581,8 +774,11 @@ def _stat_from_row(row: NodeHealthStat) -> NodeStat:
         timeouts=row.timeouts,
         crashes=row.crashes,
         errors=row.errors,
+        blocks=row.blocks,
         total_success_seconds=row.total_success_seconds,
         max_success_seconds=row.max_success_seconds,
+        max_safe_concurrency=row.max_safe_concurrency,
+        last_concurrency=row.last_concurrency,
     )
 
 
