@@ -25,8 +25,13 @@ is:
 5. verify each parent — its header must be readable and its own identity attributes
    must not contradict what the child declared.
 
-It is deliberately **one hop** (abrupt-* -> piControl).  Multi-hop chains reuse
-the same building blocks and are left for later.
+`enrich_with_parents` is deliberately **one hop** (abrupt-* -> piControl).
+`enrich_parent_chains` builds on the same pieces to walk an arbitrary chain up the
+parent tree **without assuming** its experiments: starting from a set of children
+(e.g. `G6solar`), it reads a header, follows whatever parent that header declares,
+reads *that* parent's header, and repeats until a header declares no parent (the
+true top of the tree, e.g. `piControl`).  A shared ancestor is read once and a
+metadata cycle is bounded by a hop cap.
 """
 
 from __future__ import annotations
@@ -60,6 +65,25 @@ DEFAULT_PARENT_EXPERIMENT = "piControl"
 
 DEFAULT_REQUIRED_VARS: tuple[str, ...] = ("tas", "rsdt", "rsut", "rlut")
 """Variables the forcing (Gregory) calculation needs; used when re-fetching a parent."""
+
+NO_PARENT_SENTINELS: frozenset[str] = frozenset({"no parent"})
+"""
+CMIP6 marker(s) for "this run branches from nothing"
+
+A run at the top of the tree (typically a `piControl-spinup`) sets its `parent_*`
+attributes to the controlled-vocabulary string `"no parent"` rather than leaving
+them blank.  Treating that as a real parent named `"no parent"` would send a walk
+chasing a simulation that cannot exist; recognising the sentinel lets the walk stop
+where the metadata says the tree ends.
+"""
+
+
+def _is_no_parent(value: str | None) -> bool:
+    """Whether a `parent_*` attribute means "no parent" (blank or a CMIP6 sentinel)."""
+    if value is None or not value.strip():
+        return True
+    return value.strip().casefold() in NO_PARENT_SENTINELS
+
 
 LinkStatus = Literal[
     "verified", "parent_not_found", "parent_unread", "no_parent_metadata"
@@ -128,6 +152,76 @@ class ParentHopResult:
         return [link for link in self.links if link.verified]
 
 
+ChainTerminal = Literal[
+    "no_parent_metadata", "parent_not_found", "parent_unread", "max_hops"
+]
+"""
+Why a chain stopped walking up the parent tree
+
+- `no_parent_metadata` — the last node reached declared no parent, i.e. the true
+  top of the tree (e.g. `piControl`); the only reason a chain is `complete`;
+- `parent_not_found` — a node's declared parent could not be located (nor
+  re-fetched), so the walk could go no further;
+- `parent_unread` — a node's declared parent was located but its header could not
+  be read (or its identity contradicts the declaration);
+- `max_hops` — the hop cap was hit (a safety net against a metadata cycle).
+"""
+
+
+@dataclass(frozen=True)
+class ParentChain:
+    """One child's resolved path up the parent tree, hop by hop."""
+
+    root: SimulationKey
+    """The starting child simulation `(source_id, experiment_id, variant_label)`."""
+
+    edges: list[ParentLink] = field(default_factory=list)
+    """The verified hops, in order from `root` upward (empty if none verified)."""
+
+    terminal: SimulationKey | None = None
+    """The last simulation reached (the node whose onward edge stopped the walk)."""
+
+    terminal_reason: ChainTerminal = "no_parent_metadata"
+    """Why the walk stopped at `terminal` (see `ChainTerminal`)."""
+
+    @property
+    def complete(self) -> bool:
+        """Whether the walk made at least one hop and reached the top of the tree."""
+        return bool(self.edges) and self.terminal_reason == "no_parent_metadata"
+
+    @property
+    def simulations(self) -> list[SimulationKey]:
+        """The simulations on the chain, from `root` to `terminal` inclusive."""
+        return [self.root, *(edge.parent for edge in self.edges if edge.parent)]
+
+
+@dataclass(frozen=True)
+class ParentChainResult:
+    """The outcome of a multi-hop parent walk."""
+
+    chains: list[ParentChain] = field(default_factory=list)
+    """One entry per starting child simulation, sorted by child key."""
+
+    enrichment: list[EnrichResult] = field(default_factory=list)
+    """Header enrichment of each hop's frontier, in walk order."""
+
+    refetched: list[DatasetRecord] = field(default_factory=list)
+    """Datasets pulled in by targeted re-fetches of ancestors absent from the run."""
+
+    hops: int = 0
+    """How many frontier hops the walk performed."""
+
+    @property
+    def reads(self) -> int:
+        """Total headers read across every hop (each simulation read at most once)."""
+        return sum(result.read for result in self.enrichment)
+
+    @property
+    def complete(self) -> list[ParentChain]:
+        """The chains that walked all the way to the top of the tree."""
+        return [chain for chain in self.chains if chain.complete]
+
+
 @dataclass(frozen=True)
 class _Declared:
     """A child's projected parent declaration (before it is located/verified)."""
@@ -151,14 +245,14 @@ def _records_by_simulation(
 def declared_parent(
     header: HeaderMetadata | None,
     child: SimulationKey,
-    parent_experiment: str,
+    parent_experiment: str | None = None,
 ) -> _Declared:
     """
     Project a child's declared parent from its header's `parent_*` attributes
 
     The parent's `source_id` defaults to the child's when the header omits
     `parent_source_id` (a CMIP6 run's parent is the same model).  A parent is only
-    returned when the header names the expected `parent_experiment` *and* a
+    returned when the header names a `parent_experiment_id` *and* a
     `parent_variant_label` — the variant is never assumed to match the child's.
 
     Parameters
@@ -170,7 +264,10 @@ def declared_parent(
         The child simulation key `(source_id, experiment_id, variant_label)`.
 
     parent_experiment
-        The experiment the parent must be (e.g. `"piControl"`).
+        The experiment the parent must be (e.g. `"piControl"`).  Pass `None` (the
+        default) to accept **whatever** experiment the header declares — the mode a
+        multi-hop walk uses, where the chain of experiments is not assumed and each
+        parent's experiment is discovered from the header itself.
 
     Returns
     -------
@@ -195,11 +292,15 @@ def declared_parent(
     branch = header.get("branch_time_in_parent")
     experiment = header.get("parent_experiment_id")
     variant = header.get("parent_variant_label")
-    if experiment != parent_experiment or not variant:
+    if experiment is None or variant is None:
+        return _Declared(parent=None, branch_time_in_parent=branch)
+    # A blank or the CMIP6 `"no parent"` sentinel also means "no parent".
+    if _is_no_parent(experiment) or _is_no_parent(variant):
+        return _Declared(parent=None, branch_time_in_parent=branch)
+    if parent_experiment is not None and experiment != parent_experiment:
         return _Declared(parent=None, branch_time_in_parent=branch)
     source = header.get("parent_source_id") or child[0]
-    # `experiment == parent_experiment` here (guarded above); use the known-str form.
-    parent = (source, parent_experiment, variant)
+    parent = (source, experiment, variant)
     return _Declared(parent=parent, branch_time_in_parent=branch)
 
 
@@ -433,3 +534,195 @@ def _verify(
         same_variant=same_variant,
         refetched=refetched,
     )
+
+
+def enrich_parent_chains(  # noqa: PLR0913 - a DI seam; every parameter has a default
+    records: Sequence[DatasetRecord],
+    *,
+    client: ESGFSearchClient,
+    repository: Repository,
+    child_experiments: Sequence[str] = ("G6solar",),
+    required_vars: Sequence[str] = ("tas",),
+    frequency: Sequence[str] = ("mon",),
+    project: str = "CMIP6",
+    refetch_missing: bool = True,
+    max_hops: int = 8,
+    health: NodeHealth | None = None,
+    **enrich_options: Any,
+) -> ParentChainResult:
+    """
+    Walk each child's parent chain up the tree, making no assumptions
+
+    A breadth-first walk that starts from the children in `child_experiments`,
+    reads a header per simulation, follows whatever parent that header declares
+    (its experiment is **not** assumed — see `declared_parent`), reads that
+    parent's header, and repeats until a header declares no parent.  Every hop goes
+    through `enrich_headers`, so its health-aware reads, per-read timeout/retry,
+    attempt logging, per-variable rows and `skip_cached` all apply.
+
+    A shared ancestor is read only once: a global visited set collapses the tree
+    (many children fold into one scenario run, many scenario runs into one
+    `historical`, and so on), and a metadata cycle is bounded by `max_hops`.
+
+    Because the child search may not include the ancestors, each newly-discovered
+    parent is located among `records` or, failing that (when `refetch_missing`),
+    pulled in with a targeted re-fetch before the next hop reads it.
+
+    Parameters
+    ----------
+    records
+        The starting datasets (typically only the children and their variables).
+
+    client
+        Search client, used to re-fetch ancestors absent from `records`.
+
+    repository
+        Cache to enrich into and to read stored `parent_*`/identity attributes from.
+
+    child_experiments
+        Experiments whose simulations start a chain (e.g. `("G6solar",)`).
+
+    required_vars, frequency, project
+        Scope of a targeted ancestor re-fetch.
+
+    refetch_missing
+        When `True`, re-fetch a declared ancestor not present in `records`.
+
+    max_hops
+        Safety cap on the number of frontier hops (guards against a metadata cycle).
+
+    health
+        Node-health registry shared across every hop; defaults to the one persisted
+        in `repository`.  Do **not** also pass `health` in `enrich_options`.
+
+    enrich_options
+        Extra keyword arguments forwarded verbatim to every `enrich_headers` call.
+
+    Returns
+    -------
+    :
+        One `ParentChain` per starting child, the per-hop enrichment summaries, and
+        any datasets pulled in by re-fetches.
+    """
+    health = repository.load_node_health() if health is None else health
+
+    by_sim = _records_by_simulation(records)
+    present_initially = set(by_sim)
+
+    child_set = set(child_experiments)
+    roots = sorted(
+        {
+            sim
+            for r in records
+            if r.experiment_id in child_set and (sim := simulation_key(r)) is not None
+        }
+    )
+
+    visited: set[SimulationKey] = set()
+    declared: dict[SimulationKey, _Declared] = {}
+    enrichment: list[EnrichResult] = []
+    refetched: list[DatasetRecord] = []
+
+    frontier = list(roots)
+    hops = 0
+    while frontier and hops < max_hops:
+        hops += 1
+        frontier_records = _distinct_records(
+            record for sim in frontier for record in by_sim.get(sim, ())
+        )
+        enrichment.append(
+            enrich_headers(
+                frontier_records,
+                client=client,
+                repository=repository,
+                health=health,
+                **enrich_options,
+            )
+        )
+        for sim in frontier:
+            visited.add(sim)
+            declared[sim] = declared_parent(_first_header(repository, sim), sim)
+
+        wanted = {
+            d.parent for sim in frontier if (d := declared[sim]).parent is not None
+        }
+        next_frontier = sorted(parent for parent in wanted if parent not in visited)
+        refetched.extend(
+            _locate_missing(
+                client,
+                by_sim,
+                [parent for parent in next_frontier if parent not in by_sim],
+                required_vars=required_vars,
+                frequency=frequency,
+                project=project,
+                refetch_missing=refetch_missing,
+            )
+        )
+        frontier = [parent for parent in next_frontier if parent in by_sim]
+
+    edge_of = {
+        sim: _verify(repository, sim, declaration, by_sim, present_initially)
+        for sim, declaration in declared.items()
+    }
+    chains = [_assemble_chain(root, edge_of, max_hops) for root in roots]
+    return ParentChainResult(
+        chains=chains, enrichment=enrichment, refetched=refetched, hops=hops
+    )
+
+
+def _locate_missing(  # noqa: PLR0913 - internal helper; call site passes them all
+    client: ESGFSearchClient,
+    by_sim: dict[SimulationKey, list[DatasetRecord]],
+    missing: Sequence[SimulationKey],
+    *,
+    required_vars: Sequence[str],
+    frequency: Sequence[str],
+    project: str,
+    refetch_missing: bool,
+) -> list[DatasetRecord]:
+    """Re-fetch declared ancestors absent from the pool, adding them to `by_sim`."""
+    if not (refetch_missing and missing):
+        return []
+    queries = [
+        _refetch_query(
+            parent, required_vars=required_vars, frequency=frequency, project=project
+        )
+        for parent in missing
+    ]
+    refetched: list[DatasetRecord] = []
+    for result in client.search_many(queries):
+        for record in result:
+            refetched.append(record)
+            sim = simulation_key(record)
+            if sim is not None:
+                by_sim[sim].append(record)
+    return refetched
+
+
+def _assemble_chain(
+    root: SimulationKey,
+    edge_of: dict[SimulationKey, ParentLink],
+    max_hops: int,
+) -> ParentChain:
+    """Follow the per-simulation parent edges from `root` up to a terminal."""
+    edges: list[ParentLink] = []
+    seen = {root}
+    sim = root
+    while True:
+        link = edge_of.get(sim)
+        if link is None:
+            # Located but not enriched (the walk hit its hop cap first).
+            return ParentChain(root, edges, terminal=sim, terminal_reason="max_hops")
+        if link.status != "verified" or link.parent is None:
+            # A verified link always has a parent, so the else is unreachable; it
+            # only keeps `reason` a `ChainTerminal` (never the "verified" literal).
+            reason: ChainTerminal = (
+                link.status if link.status != "verified" else "parent_unread"
+            )
+            return ParentChain(root, edges, terminal=sim, terminal_reason=reason)
+        edges.append(link)
+        parent = link.parent
+        if parent in seen or len(edges) >= max_hops:
+            return ParentChain(root, edges, terminal=parent, terminal_reason="max_hops")
+        seen.add(parent)
+        sim = parent

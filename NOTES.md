@@ -434,3 +434,20 @@ The fix — rate-based eviction: a node is evicted only once it has ≥ evict_af
 
 failure cause for most of the models!! http vs https -> see https_twin in header.py
 - This should fire regardless of if warm/cold run
+
+### Thursday 16th July
+A few zoom meetings
+Gregory + G6solar parent/child hops
+Monday (likely) implementing and starting to think about ESGF querying and integrating across multiple projects, and ESGF1/ESGFNG (likely will go back to recording and make notes from there about plan)
+
+Before working on that, however...
+fx, like areacella:
+- Some models have a single areacella for piControl (assumed same for all other experiments), while other models have areacella for all experiments
+- Speed vs safety -> Either we say for a model go and find where the areacella (or other) is for any experiment and call that truth, or we say go find the areacella for specific experiment (and identify fall-back options if not available). Is it an assumption that they are all the same for a single model across all experiments? Maybe go test this...
+
+Parent/child branch failures
+- We want the user to be able to specify the stop point. Enter a str or None and this tells the code how far to walk. If they include a typo then the program will walk as far up the chain until no_parent then will abort.
+- Ultimately we want to create a plain text file of fixes (where e.g. there are errors in that historical points to a parent variant, but there is only one piControl run for that model that has a different variant, so we should just assume that is the variant). We will want to create a table of known fixes (to maybe one day publish on git) in plain text format to be input as plain text format, or specifically so a user can make a fix (or override) themselves, e.g. for this model, experiment, variant, THIS is the parent experiment/variant_id
+
+Paralellise dataset bundle:
+- Rather than searching for ~30 datasets at once (and having to back off for large files like piControl), we want to parallelise and do a single dataset at a time. Allows for more specificity, we should never hit limit, so won't have this issue, although it might be slower.

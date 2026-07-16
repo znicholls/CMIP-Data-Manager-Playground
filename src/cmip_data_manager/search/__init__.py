@@ -19,9 +19,12 @@ from cmip_data_manager.search.aggregate import (
 )
 from cmip_data_manager.search.headers import EnrichResult, enrich_headers
 from cmip_data_manager.search.parent_hop import (
+    ParentChain,
+    ParentChainResult,
     ParentHopResult,
     ParentLink,
     declared_parent,
+    enrich_parent_chains,
     enrich_with_parents,
 )
 from cmip_data_manager.search.parentage import (
@@ -44,6 +47,8 @@ __all__ = [
     "EnrichResult",
     "ModelVariant",
     "PairMatch",
+    "ParentChain",
+    "ParentChainResult",
     "ParentConflict",
     "ParentHopResult",
     "ParentLink",
@@ -55,6 +60,7 @@ __all__ = [
     "declared_parent",
     "discover_experiments",
     "enrich_headers",
+    "enrich_parent_chains",
     "enrich_with_parents",
     "fetch_records",
     "pairs_all_experiments",
