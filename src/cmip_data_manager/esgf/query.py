@@ -55,6 +55,46 @@ SOLR_JSON_FORMAT = "application/solr+json"
 # we can confirm this.
 # If not, we'll just have to wait until there is actually data
 # on west to identify differences in behaviour.
+#
+# Some notes on testing this:
+#
+# Use cases:
+# - different MIP eras and hitting different APIs
+#     - using both the 'specific' query class and any general class we introduce
+# - translating results back into our local search results database
+#     - storing both 'raw' and 'translated' results (or we just translate in memory?)
+#
+# Testing:
+# - offline unit/integration tests: runnable without an internet connection,
+#   all responses are mocked
+# - live tests, options:
+#     a) record responses then make sure the API is stable
+#        against those recorded responses
+#        (defensive test of API because we don't trust it)
+#        - very straightforward
+#        - some responses should change over time (e.g. new data is added)
+#        - ordering here can be tricky (need to avoid false failures)
+#     b) online integration tests i.e. hit the API
+#        and make sure we can handle the response
+#        - hard to know what the 'correct' result is
+#          normally you just say stuff like,
+#          "I should end up with more than 1 and less than 1000 datasets,
+#          the code shouldn't break"
+# - no tests: just use this live and we'll figure it out as we go
+#
+# Other note
+# If you want to use CMIP7 style names,
+# then have a look at https://wcrp-cmip.github.io/cmip7-guidance/docs/CMIP7/Global_Attributes/
+# to get them.
+#
+# Data access use case (which follows from this)
+# - walking up the parent tree
+#     - I don't know if this can be automated for CMIP5
+#       i.e. the user might have to specify the tree
+#     - for CMIP6, we want this to work with both ESGF1 and ESGF-NG.
+#       This means solving the 'get the file header' issue
+#     - for CMIP7, we might get this information in the initial response
+#       i.e. not need to get file headers
 class FacetQuery(BaseModel):
     """
     A single ESGF search request
