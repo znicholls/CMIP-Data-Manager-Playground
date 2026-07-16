@@ -26,6 +26,35 @@ SOLR_JSON_FORMAT = "application/solr+json"
 """Value of the `format` parameter that makes the proxy return Solr JSON."""
 
 
+# TODO: complicated question.
+# This data model works for ESGF1 and CMIP6 data.
+# For other MIPs, it will vary.
+# E.g. CMIP5 doesn't have the concept of source_id,
+# I believe it is just simply called 'model'.
+# It may also vary for other ESGF versions,
+# e.g. ESGF-NG.
+# How should we handle this?
+# My suggestion would be to have multiple models,
+# one for each MIP era - ESGF API combination
+# (or just MIP era if all ESGF versions use the same query parameters).
+# Then we have some high level class
+# which uses a common vocabulary,
+# then just translates out into the specific vocabulary
+# expected by MIP era - ESGF API combination as required.
+#
+# To check ESGF-NG's API, please start with https://search.east.esgf.io/.
+# There should already be CMIP6 data available via that API
+# (specifically https://search.east.esgf.io/search).
+# There will also be a 'west' equivalent, at
+# https://search.west.esgf.io/search,
+# but there is no data there yet.
+# We suspect that east and west will have similar,
+# but not identical behaviour so will each need their own, specific
+# query and data access models/support.
+# If you can read the docs and see differences already,
+# we can confirm this.
+# If not, we'll just have to wait until there is actually data
+# on west to identify differences in behaviour.
 class FacetQuery(BaseModel):
     """
     A single ESGF search request
@@ -76,12 +105,22 @@ class FacetQuery(BaseModel):
     variant_label: tuple[str, ...] = ()
     """`variant_label` values to OR together."""
 
+    # TODO: remove reference to parent in docstring here.
+    # We can use this, but this ID isn't coupled to parents
+    # (you could also just search for a dataset ID).
+    # TODO: Is this only usable when type="File", or can it be used more generally?
+    # If it is coupled to type, can we make that coupling clear
+    # (e.g. by introducing a new facet query class or a validator or something else)?
     dataset_id: tuple[str, ...] = ()
     """Parent `dataset_id` values, used when searching for `type="File"`."""
 
+    # TODO: can we get rid of this and just capture the full list of available fields?
+    # Is there a reason not to do this?
     extra_facets: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     """Any additional facets, keyed by facet name."""
 
+    # TODO: do we actually want to support this?
+    # It feels like it probably doesn't work and just confuses the data model.
     query: str | None = None
     """
     Free-text query in Apache Lucene syntax.
@@ -134,6 +173,10 @@ class FacetQuery(BaseModel):
             Mapping of parameter name to value, ready to be URL-encoded.
         """
         params: dict[str, str] = {
+            # TODO: we're in our 'bottom-layer' here, this isn't a convenience.
+            # Please, in general, avoid hard-coding and constants in the bottom-layer.
+            # For example, here make format an input argument and just set the default
+            # to SOLR_JSON_FORMAT, rather than using the global variable.
             "format": SOLR_JSON_FORMAT,
             "type": self.type,
             "project": self.project,
