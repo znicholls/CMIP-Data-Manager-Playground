@@ -101,6 +101,8 @@ class HeaderAttempt:
     table_id: str | None = None
     seconds: float = 0.0
     attempt_no: int = 1
+    detail: str | None = None
+    """The error/exception text (or a note for a synthetic row); `None` on success."""
 
 
 @dataclass(frozen=True)
@@ -483,6 +485,7 @@ class Repository:
                         outcome=attempt.outcome,
                         seconds=attempt.seconds,
                         attempt_no=attempt.attempt_no,
+                        detail=attempt.detail,
                     )
                 )
             session.commit()

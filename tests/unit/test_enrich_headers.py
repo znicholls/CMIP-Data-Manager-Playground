@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from cmip_data_manager.esgf.client import DeepPaginationError
 from cmip_data_manager.esgf.headers import HeaderMetadata, header_key
 from cmip_data_manager.esgf.health import AttemptLog, NodeHealth, NodeStat, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.routing import SimulationCandidates
 from cmip_data_manager.search.headers import (
     _attempt_rows,
+    _search_files_for_ids,
     _seed_concurrency,
     enrich_headers,
 )
@@ -59,6 +61,54 @@ def _file(fid: str, dsid: str, url: str) -> FileRecord:
     return FileRecord(
         id=fid, dataset_id=dsid, urls=(f"{url}|application/netcdf|HTTPServer",), raw={}
     )
+
+
+class _DeepFakeClient:
+    """A client that raises `DeepPaginationError` when a chunk's files exceed a cap."""
+
+    def __init__(self, files_by_dataset: dict[str, list[FileRecord]], cap: int) -> None:
+        self.files_by_dataset = files_by_dataset
+        self.cap = cap
+
+    def search_files(self, query) -> list[FileRecord]:
+        out: list[FileRecord] = []
+        for dsid in query.dataset_id:
+            files = self.files_by_dataset.get(dsid, [])
+            if query.replica is False:  # primary-only: a smaller subset
+                files = files[: (len(files) // 2) or 1]
+            out.extend(files)
+        if len(out) > self.cap:
+            raise DeepPaginationError(len(out), self.cap)
+        return out
+
+
+def _files(dsid: str, n: int) -> list[FileRecord]:
+    return [_file(f"{dsid}.{i}", dsid, f"https://h/{dsid}.{i}.nc") for i in range(n)]
+
+
+def test_search_files_bisects_a_too_deep_chunk():
+    client = _DeepFakeClient({"d1": _files("d1", 6), "d2": _files("d2", 6)}, cap=10)
+
+    # Together 12 > cap, so the chunk is split into two single-dataset queries.
+    files = _search_files_for_ids(client, ["d1", "d2"])
+
+    assert len(files) == 12
+
+
+def test_search_files_falls_back_to_primary_for_a_lone_overflow():
+    client = _DeepFakeClient({"big": _files("big", 20)}, cap=10)
+
+    # A single dataset over the cap: retried for primary (non-replica) files only.
+    files = _search_files_for_ids(client, ["big"])
+
+    assert len(files) == 10  # the primary subset fits
+
+
+def test_search_files_skips_a_dataset_too_deep_even_as_primary():
+    client = _DeepFakeClient({"huge": _files("huge", 30)}, cap=10)
+
+    # Even the primary subset (15) overflows, so the dataset is skipped.
+    assert _search_files_for_ids(client, ["huge"]) == []
 
 
 def _kw(**overrides):
@@ -324,6 +374,23 @@ def test_enrich_logs_no_candidate_marker_for_unservable_sim(repository):
     assert len(attempts) == 1
     assert attempts[0].outcome == "no_candidate"
     assert attempts[0].host is None and attempts[0].url is None
+    assert attempts[0].detail == "no HTTPServer mirror was indexed for this simulation"
+
+
+def test_enrich_records_the_error_detail_of_a_failed_read(repository):
+    ds = _ds("d0")
+    client = FakeClient({"d0": [_file("f0", "d0", "https://dead/tas.nc")]})
+
+    enrich_headers(
+        [ds],
+        client=client,
+        repository=repository,
+        **_kw(reader=_reader(frozenset({"dead"})), max_attempts=1),
+    )
+
+    (attempt,) = repository.get_header_attempts()
+    assert attempt.outcome == "error"
+    assert attempt.detail == "dead refused"  # the reader's OSError text is preserved
 
 
 def test_enrich_can_disable_attempt_logging(repository):

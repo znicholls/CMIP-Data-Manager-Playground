@@ -282,6 +282,12 @@ class HeaderReadAttempt(SQLModel, table=True):
     was indexed), or `stranded` (a mirror existed but was evicted before this
     simulation was tried)."""
 
+    detail: str | None = None
+    """The underlying error/exception message for a failed read (e.g. the netCDF or
+    connection error text), or a short note for a synthetic `no_candidate` /
+    `stranded` row; `None` on success.  Carried alongside `outcome` so a failure can
+    be diagnosed without re-running it."""
+
     seconds: float = 0.0
     """Wall-clock duration of the attempt (`0` for a `no_candidate` record)."""
 

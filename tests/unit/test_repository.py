@@ -251,6 +251,14 @@ def test_record_header_attempts_is_append_only(repository):
     assert len(repository.get_header_attempts()) == 3
 
 
+def test_record_header_attempts_persists_the_error_detail(repository):
+    repository.record_header_attempts(
+        [_attempt(outcome="error", detail="Connection refused by data node")]
+    )
+    (stored,) = repository.get_header_attempts()
+    assert stored.detail == "Connection refused by data node"
+
+
 def test_get_header_attempts_filters(repository):
     repository.record_header_attempts(
         [

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from cmip_data_manager.db.repository import HeaderAttempt, Repository
-from cmip_data_manager.esgf.client import ESGFSearchClient
+from cmip_data_manager.esgf.client import DeepPaginationError, ESGFSearchClient
 from cmip_data_manager.esgf.dispatch import (
     DEFAULT_CONCURRENCY_CEILING,
     DEFAULT_EVICT_AFTER_ATTEMPTS,
@@ -169,6 +169,36 @@ def _plan_reads(
     return plan
 
 
+def _search_files_for_ids(
+    client: ESGFSearchClient, ids: Sequence[str]
+) -> list[FileRecord]:
+    """
+    Search the files of a chunk of dataset ids, bisecting a too-deep result set
+
+    ESGF ORs a comma-separated `dataset_id` list, but a chunk whose files exceed the
+    index's single-query retrieval cap (10000) raises `DeepPaginationError` — file-
+    heavy simulations such as long, replicated `piControl` runs hit this.  The chunk
+    is then split in half and each half retried, down to a single dataset; a lone
+    dataset that still overflows is retried for its *primary* (non-replica) files
+    only, and skipped if even that is too deep.
+    """
+    query = FacetQuery(type="File", dataset_id=tuple(ids))
+    try:
+        return client.search_files(query)
+    except DeepPaginationError:
+        if len(ids) > 1:
+            mid = len(ids) // 2
+            return _search_files_for_ids(client, ids[:mid]) + _search_files_for_ids(
+                client, ids[mid:]
+            )
+        try:  # a single dataset with too many replicas: primary files are enough
+            return client.search_files(
+                FacetQuery(type="File", dataset_id=tuple(ids), replica=False)
+            )
+        except DeepPaginationError:
+            return []
+
+
 def _lookup_files(
     plan: _Plan,
     *,
@@ -182,7 +212,8 @@ def _lookup_files(
     Files are looked up in a few batched queries rather than one request per
     simulation: ESGF ORs a comma-separated `dataset_id` list, so a chunk of ids
     returns all their files in a single round trip, which are then bucketed back to
-    their simulation by `dataset_id`.  Ranking the resulting mirrors is left to
+    their simulation by `dataset_id`.  A chunk whose files exceed the retrieval cap
+    is bisected by `_search_files_for_ids`.  Ranking the resulting mirrors is left to
     `build_candidates`.
     """
     sim_by_dataset_id: dict[str, SimulationKey] = {
@@ -191,9 +222,7 @@ def _lookup_files(
     files_by_sim: dict[SimulationKey, list[FileRecord]] = defaultdict(list)
     all_ids = list(sim_by_dataset_id)
     for chunk in _chunk_ids(all_ids, max_count=batch, max_chars=max_chars):
-        for file in client.search_files(
-            FacetQuery(type="File", dataset_id=tuple(chunk))
-        ):
+        for file in _search_files_for_ids(client, chunk):
             owner = sim_by_dataset_id.get(file.dataset_id)
             if owner is not None:
                 files_by_sim[owner].append(file)
@@ -278,6 +307,7 @@ def _attempt_rows(
                 table_id=table_id,
                 seconds=record.seconds,
                 attempt_no=seen[record.url],
+                detail=record.message,
             )
         )
 
@@ -299,6 +329,7 @@ def _attempt_rows(
                     experiment_id=experiment_id,
                     variant_label=variant_label,
                     outcome="no_candidate",
+                    detail="no HTTPServer mirror was indexed for this simulation",
                 )
             )
             continue
@@ -320,6 +351,7 @@ def _attempt_rows(
                     url=best_url,
                     variable_id=variable_id,
                     table_id=table_id,
+                    detail="all candidate mirrors were evicted before it was tried",
                 )
             )
     return rows

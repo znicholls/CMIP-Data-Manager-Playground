@@ -1,0 +1,253 @@
+"""
+Live header enrichment for use case 2 (the Gregory / forcing case).
+
+This is use case 1's header workflow taken one hop up the parent tree.  Starting
+from use case 2's cached datasets (the abrupt-forcing experiments `abrupt-4xCO2`,
+`abrupt-2xCO2`, `abrupt-0p5xCO2` and `piControl`, for `tas`, `rsdt`, `rsut`,
+`rlut`), it:
+
+1. reads and stores one header per *abrupt* simulation (single variable read; every
+   variable's dataset row still saved) — the same health-aware, timeout/retry
+   pipeline use case 1 uses;
+2. follows each abrupt run's declared `parent_*` metadata up to its `piControl`
+   parent, **without** assuming the parent shares the child's `variant_label`;
+3. de-duplicates piControl parents shared across a model's abrupt variants (read
+   once), and re-fetches a declared parent that is not in the cached datasets;
+4. reads and stores each distinct piControl header and verifies it;
+5. reports the verified child -> parent pairs, anything unverified, and node health.
+
+Header rows land in `DatasetHeader` (with populated `parent_*` columns) and node
+statistics in `NodeHealthStat`, both in `esgf_cache.sqlite`.
+
+Run with: `uv run python scripts/enrich_uc2_headers.py`
+"""
+
+from __future__ import annotations
+
+import os
+import time
+
+from cmip_data_manager import Settings, build_client, open_repository
+from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
+from cmip_data_manager.search import enrich_with_parents, per_variable_experiment
+from cmip_data_manager.search.parent_hop import (
+    DEFAULT_CHILD_EXPERIMENTS,
+    DEFAULT_PARENT_EXPERIMENT,
+    DEFAULT_REQUIRED_VARS,
+)
+
+# --- Configuration (edit me) -------------------------------------------------
+DB_PATH = os.environ.get("UC2_DB_PATH", "esgf_cache.sqlite")
+"""Cache to use.  Defaults to `esgf_cache.sqlite`; override with `UC2_DB_PATH`
+(e.g. point it at a fresh file for a cold, from-scratch run)."""
+
+USE_CASE = "uc2_forcing"
+"""The cached use case whose datasets to enrich (and record a fresh run under)."""
+
+SEARCH_SOURCE = "api"
+"""`"api"` to run the use case 2 index search live from scratch (and cache it), or
+`"db"` to reuse the datasets from the latest cached run (`scripts/esgf_search.py`)."""
+
+PROJECT = "CMIP6"
+"""Project to search when `SEARCH_SOURCE == "api"`."""
+
+CHILD_EXPERIMENTS = DEFAULT_CHILD_EXPERIMENTS
+"""Abrupt-forcing experiments to resolve piControl parents for."""
+
+PARENT_EXPERIMENT = DEFAULT_PARENT_EXPERIMENT
+"""The experiment the children branch from."""
+
+REQUIRED_VARS = DEFAULT_REQUIRED_VARS
+"""Variables the forcing calculation needs (used to scope a parent re-fetch)."""
+
+SEARCH_EXPERIMENTS: tuple[str, ...] = (*CHILD_EXPERIMENTS, PARENT_EXPERIMENT)
+"""Experiments the from-scratch index search covers (children plus piControl)."""
+
+FREQUENCY = ("mon",)
+"""Frequency to search for and to scope a parent re-fetch to."""
+
+REFETCH_MISSING = True
+"""Re-fetch a declared piControl parent that is not among the cached datasets."""
+
+PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
+"""Data nodes to try first when reading headers (empty tuple = no preference)."""
+
+IGNORE_HOSTS: frozenset[str] = frozenset(
+    {
+        # http-only nodes observed to stall byte-range reads (~75s each to fail);
+        # the same files are served over https elsewhere.
+        "esgf-data02.diasjp.net",
+        "esgf-data03.diasjp.net",
+        "esgf-data04.diasjp.net",
+        "esg.iap.ac.cn",
+    }
+)
+"""Data nodes to never read headers from (unioned with what NodeHealth has learned)."""
+
+SKIP_CACHED = True
+"""Skip simulations whose header is already cached (don't re-read a known header)."""
+
+MAX_WORKERS = 12
+"""Cap on header reads in flight across all nodes (the shared local budget)."""
+
+NODE_CONCURRENCY = 2
+"""Default cap on simultaneous reads to a single data node (conservative)."""
+
+NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
+"""Per-node caps overriding `NODE_CONCURRENCY` (NCI tolerates more, and is fast)."""
+
+READ_TIMEOUT_FALLBACK = 90.0
+"""Stall timeout used on a cold DB with no learned health yet."""
+
+SETTINGS = Settings()
+"""Endpoint/paging settings for the live file lookups and parent re-fetches."""
+# -----------------------------------------------------------------------------
+
+
+def _search_uc2(client, repository):
+    """Run the use case 2 index search live from scratch and cache the datasets."""
+    queries = per_variable_experiment(
+        PROJECT, REQUIRED_VARS, SEARCH_EXPERIMENTS, frequency=FREQUENCY
+    )
+    by_id = {r.id: r for result in client.search_many(queries) for r in result}
+    records = list(by_id.values())
+    run = repository.record_run(
+        USE_CASE,
+        records,
+        endpoint_url=client.base_url,
+        spec={"queries": [q.as_spec() for q in queries]},
+    )
+    print(
+        f"index search (live): {len(records)} datasets; "
+        f"changes +{len(run.added)} / -{len(run.removed)} / ~{len(run.modified)}"
+    )
+    return records
+
+
+def _print_node_health(repository) -> None:
+    """Print the reliability and speed rankings from the persisted node health."""
+    reliability = repository.rank_nodes_by_reliability()
+    if not reliability:
+        print("  (no node health recorded)")
+        return
+    print("  by reliability (failed % of header requests, best first):")
+    for stat in reliability:
+        failed = stat.attempts - stat.successes
+        pct = 100.0 * failed / stat.attempts if stat.attempts else 0.0
+        print(
+            f"    {stat.host:<40} {pct:5.1f}% failed "
+            f"({stat.successes}/{stat.attempts} ok)"
+        )
+    print("  by speed (mean successful read, fastest first):")
+    for stat in repository.rank_nodes_by_speed():
+        mean = stat.total_success_seconds / stat.successes
+        print(
+            f"    {stat.host:<40} {mean:6.2f}s mean, "
+            f"{stat.max_success_seconds:6.2f}s max"
+        )
+
+
+def main() -> None:
+    """Enrich use case 2's headers, resolve piControl parents, and report."""
+    repository = open_repository(DB_PATH)
+    client = build_client(
+        SETTINGS,
+        retry=exponential_backoff(retries=4),
+        map_fn=thread_pool_map(max_workers=8),
+    )
+    print(f"=== {USE_CASE} (Gregory / forcing; one hop to {PARENT_EXPERIMENT}) ===")
+    print(f"search source: {SEARCH_SOURCE}")
+
+    search_started = time.perf_counter()
+    if SEARCH_SOURCE == "api":
+        records = _search_uc2(client, repository)
+    else:
+        records = repository.get_dataset_records(USE_CASE)
+    search_seconds = time.perf_counter() - search_started
+    print(
+        f"search stage ({SEARCH_SOURCE}): {len(records)} datasets "
+        f"in {search_seconds:.2f}s"
+    )
+    if not records:
+        print(
+            f"No datasets for {USE_CASE!r}. "
+            "Set SEARCH_SOURCE='api', or run scripts/esgf_search.py first."
+        )
+        return
+    children = sum(1 for r in records if r.experiment_id in set(CHILD_EXPERIMENTS))
+    print(f"loaded {len(records)} datasets ({children} in {list(CHILD_EXPERIMENTS)})")
+
+    health = repository.load_node_health()
+    read_timeout = health.suggested_timeout(default=READ_TIMEOUT_FALLBACK)
+    print(f"  read timeout for this run: {read_timeout:.1f}s")
+
+    started = time.perf_counter()
+    result = enrich_with_parents(
+        records,
+        client=client,
+        repository=repository,
+        child_experiments=CHILD_EXPERIMENTS,
+        parent_experiment=PARENT_EXPERIMENT,
+        required_vars=REQUIRED_VARS,
+        frequency=FREQUENCY,
+        refetch_missing=REFETCH_MISSING,
+        health=health,
+        timeout=read_timeout,
+        preferred_hosts=PREFERRED_HOSTS,
+        ignore_hosts=IGNORE_HOSTS,
+        max_workers=MAX_WORKERS,
+        node_concurrency=NODE_CONCURRENCY,
+        node_concurrency_overrides=NODE_CONCURRENCY_OVERRIDES,
+        skip_cached=SKIP_CACHED,
+    )
+    elapsed = time.perf_counter() - started
+
+    child = result.child_enrichment
+    parent = result.parent_enrichment
+    print(
+        f"child headers:  read={child.read} reused={child.reused} "
+        f"stored={child.stored} skipped_cached={child.skipped_cached} "
+        f"failed={len(child.failed)}"
+    )
+    print(
+        f"parent headers: read={parent.read} reused={parent.reused} "
+        f"stored={parent.stored} skipped_cached={parent.skipped_cached} "
+        f"failed={len(parent.failed)}"
+    )
+    if result.refetched:
+        print(f"re-fetched {len(result.refetched)} datasets for absent parents")
+    print(f"resolved {len(result.links)} child simulations in {elapsed:.2f}s")
+
+    # Verified child -> parent pairs.
+    verified = result.verified
+    print(f"verified parents ({len(verified)}):")
+    for link in verified:
+        if link.parent is None:  # unreachable: verified implies a parent
+            continue
+        flags = []
+        if not link.same_variant:
+            flags.append("different-variant")
+        if link.refetched:
+            flags.append("re-fetched")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        c_src, c_exp, c_var = link.child
+        p_var = link.parent[2]
+        print(
+            f"  {c_src} {c_exp}/{c_var} -> {PARENT_EXPERIMENT}/{p_var} "
+            f"(branch_time={link.branch_time_in_parent}){suffix}"
+        )
+
+    # Anything that did not verify, grouped by why.
+    unresolved = [link for link in result.links if not link.verified]
+    if unresolved:
+        print(f"unverified ({len(unresolved)}):")
+        for link in sorted(unresolved, key=lambda link: link.status):
+            c_src, c_exp, c_var = link.child
+            print(f"  [{link.status:<18}] {c_src} {c_exp}/{c_var}")
+
+    print("node health:")
+    _print_node_health(repository)
+
+
+if __name__ == "__main__":
+    main()

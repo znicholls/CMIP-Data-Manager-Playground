@@ -115,6 +115,8 @@ class AttemptRecord:
     url: str
     outcome: ReadOutcome
     seconds: float
+    message: str | None = None
+    """The error/exception text for a failed attempt; `None` on success."""
 
 
 class AttemptLog:
@@ -139,10 +141,16 @@ class AttemptLog:
         self._records: list[AttemptRecord] = []
         self._lock = threading.Lock()
 
-    def add(self, url: str, outcome: ReadOutcome, seconds: float) -> None:
+    def add(
+        self,
+        url: str,
+        outcome: ReadOutcome,
+        seconds: float,
+        message: str | None = None,
+    ) -> None:
         """Append one attempt record (thread-safe)."""
         with self._lock:
-            self._records.append(AttemptRecord(url, outcome, seconds))
+            self._records.append(AttemptRecord(url, outcome, seconds, message))
 
     def records(self) -> list[AttemptRecord]:
         """Return the attempts recorded so far, in append order (a copy)."""
@@ -456,26 +464,28 @@ def recording(
         A reader with the same contract that records before returning/raising.
     """
 
-    def emit(url: str, outcome: ReadOutcome, seconds: float) -> None:
+    def emit(
+        url: str, outcome: ReadOutcome, seconds: float, message: str | None = None
+    ) -> None:
         health.record(url, outcome, seconds)
         if attempts is not None:
-            attempts.add(url, outcome, seconds)
+            attempts.add(url, outcome, seconds, message)
 
     def read(url: str) -> T:
         started = time.monotonic()
         try:
             result = reader(url)
-        except HeaderReadTimeout:
-            emit(url, ReadOutcome.TIMEOUT, time.monotonic() - started)
+        except HeaderReadTimeout as exc:
+            emit(url, ReadOutcome.TIMEOUT, time.monotonic() - started, str(exc))
             raise
-        except HeaderReadCrashed:
-            emit(url, ReadOutcome.CRASH, time.monotonic() - started)
+        except HeaderReadCrashed as exc:
+            emit(url, ReadOutcome.CRASH, time.monotonic() - started, str(exc))
             raise
-        except HeaderReadBlocked:
-            emit(url, ReadOutcome.BLOCKED, time.monotonic() - started)
+        except HeaderReadBlocked as exc:
+            emit(url, ReadOutcome.BLOCKED, time.monotonic() - started, str(exc))
             raise
-        except OSError:
-            emit(url, ReadOutcome.ERROR, time.monotonic() - started)
+        except OSError as exc:
+            emit(url, ReadOutcome.ERROR, time.monotonic() - started, str(exc))
             raise
         emit(url, ReadOutcome.SUCCESS, time.monotonic() - started)
         return result

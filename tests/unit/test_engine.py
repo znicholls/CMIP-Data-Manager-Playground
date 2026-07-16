@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sqlalchemy import inspect, text
 from sqlmodel import Session, select
 
 from cmip_data_manager.db.engine import create_db_engine, init_db
@@ -29,3 +30,27 @@ def test_sqlite_foreign_keys_are_enforced(tmp_path):
     with engine.connect() as connection:
         result = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
     assert result == 1
+
+
+def test_init_db_adds_a_missing_column_to_an_existing_table(tmp_path):
+    engine = create_db_engine(tmp_path / "old.sqlite")
+    # Simulate an older database: a headerreadattempt table lacking the newer
+    # `detail` column (a minimal stand-in with the not-null key columns).
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE headerreadattempt ("
+                "id INTEGER PRIMARY KEY, created_at DATETIME, "
+                "source_id VARCHAR, experiment_id VARCHAR, variant_label VARCHAR, "
+                "outcome VARCHAR)"
+            )
+        )
+    assert "detail" not in {
+        c["name"] for c in inspect(engine).get_columns("headerreadattempt")
+    }
+
+    init_db(engine)  # additive migration should add the missing column
+
+    columns = {c["name"] for c in inspect(engine).get_columns("headerreadattempt")}
+    assert "detail" in columns
+    init_db(engine)  # idempotent: a second run does not error

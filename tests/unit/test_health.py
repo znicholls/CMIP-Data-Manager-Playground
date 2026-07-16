@@ -226,6 +226,9 @@ def test_attempt_log_captures_url_outcome_and_duration_via_recording():
     assert [r.outcome for r in records] == [ReadOutcome.SUCCESS, ReadOutcome.ERROR]
     assert [urlparse(r.url).hostname for r in records] == ["good", "dead"]
     assert all(r.seconds >= 0.0 for r in records)
+    # The failing attempt carries the error text; the success carries none.
+    assert records[0].message is None
+    assert records[1].message == "refused"
     # The aggregate health is still recorded alongside the per-attempt log.
     assert health.stat("good").successes == 1
     assert health.stat("dead").errors == 1
