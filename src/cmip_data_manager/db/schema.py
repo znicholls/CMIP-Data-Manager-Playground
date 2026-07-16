@@ -34,6 +34,12 @@ class QueryRun(SQLModel, table=True):
     """One execution of a use case's queries against the search API."""
 
     id: int | None = Field(default=None, primary_key=True)
+    # TODO: remove.
+    # Let's just record queries as queries
+    # with information about number found etc.
+    # Let's store links betwen use cases
+    # and queries somewhere else
+    # (if at all).
     use_case: str = Field(index=True)
     """Name of the use case this run belongs to."""
 
@@ -41,6 +47,10 @@ class QueryRun(SQLModel, table=True):
     endpoint_url: str
     """Search endpoint that was queried."""
 
+    # TODO: in docstring, please add a link back to the object
+    # from which this JSON was created.
+    # If there is a more robust way to make this link,
+    # please add it.
     spec_json: str
     """JSON description of the queries that were run."""
 
@@ -50,6 +60,14 @@ class QueryRun(SQLModel, table=True):
     num_stored: int
     """Number of datasets written/updated in the database by the run."""
 
+    # TODO: clarify docstring.
+    # What does it mean by terminal status?
+    # Where does status get defined?
+    # Is it essentially just whether the search worked or not?
+    # Can we turn this into an enum to have better visibility
+    # of the possible outcomes
+    # (and maybe have a status_string column to store full error
+    # output if needed).
     status: str = "ok"
     """Terminal status of the run (`"ok"` or an error marker)."""
 
@@ -58,19 +76,43 @@ class Dataset(SQLModel, table=True):
     """A cached ESGF dataset, uniquely identified by its versioned `id`."""
 
     id: str = Field(primary_key=True)
+    # TODO: check whether this is a thing for all ESGF responses.
+    # It might only exist in ESGF1 and/or CMIP6.
     master_id: str | None = Field(default=None, index=True)
+    # As above
     instance_id: str | None = Field(default=None, index=True)
     project: str | None = None
+    # TODO: this is where things are going to get messy.
+    # Do we have a dataset model for CMIP6, CMIP5 etc.
+    # and then a high-level model?
+    # Do just have one dataset model, that uses our 'harmonised' vocab
+    # and then links (or stores) of the raw JSON
+    # in the 'original' vocab (we always want to be able to retrieve the raw terms,
+    # the question is just how)?
     source_id: str | None = Field(default=None, index=True)
+    # As above
     institution_id: str | None = None
+    # As above
     experiment_id: str | None = Field(default=None, index=True)
+    # As above
     variant_label: str | None = Field(default=None, index=True)
+    # As above (although this might actually be stable)
     variable_id: str | None = Field(default=None, index=True)
+    # As above (although this might actually be stable)
     frequency: str | None = None
+    # As above (doesn't exist in CMIP7)
     table_id: str | None = None
+    # This has been changed to grid_id in CMIP7
+    # (and the meaning is actually different, hopefully uniform grids
+    # aren't important for us).
     grid_label: str | None = None
+    # As above (although this might actually be stable)
     nominal_resolution: str | None = None
+    # As above (not sure if in CMIP5)
     version: str | None = None
+    # This should be on the files, it shouldn't exist at all on the dataset
+    # (if it is part of the API response, drop it and either don't store it
+    # or only have it in the full raw JSON response that we store)
     data_node: str | None = None
     replica: bool | None = None
     latest: bool | None = None
@@ -98,15 +140,28 @@ class File(SQLModel, table=True):
     dataset_key: str = Field(foreign_key="dataset.id", index=True)
     """Foreign key to the owning `Dataset.id`."""
 
+    # TODO: Why are we storing this, can't we just get it by looking up the dataset's ID
+    # using the link back to dataset?
     dataset_id: str
     """`dataset_id` as reported by ESGF (equals the parent dataset `id`)."""
 
+    # TODO: drop this
     title: str | None = None
     size: int | None = None
     checksum: str | None = None
     checksum_type: str | None = None
     tracking_id: str | None = None
+    # TODO: Why are we storing this, can't we just get it by looking up the dataset
+    # using the link back to dataset?
     variable_id: str | None = None
+    # TODO: please break this out into a separate table.
+    # I want that table to store 'access options' or some other name.
+    # Each entry should link to a file.
+    # Each file can have one or more access options,
+    # via different ways e.g. url or service
+    # and on different nodes.
+    # Please include an fsspec column in this file,
+    # which stores how to access the file in an fsspec-compliant way.
     urls_json: str | None = None
     """JSON list of the raw `url` entries (`url|mime-type|service`)."""
 

@@ -119,6 +119,7 @@ class AttemptSummary:
     """Count of each raw `outcome` value in this group."""
 
 
+# TODO: should we rename this to database or similar?
 class Repository:
     """Read/write access to the local cache of ESGF search results."""
 
