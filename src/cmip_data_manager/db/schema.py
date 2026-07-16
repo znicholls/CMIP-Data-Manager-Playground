@@ -132,6 +132,17 @@ class Dataset(SQLModel, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
+    # TODO: add link to parent dataset
+    # (each dataset can only have one parent
+    # but a parent can have more than one child,
+    # or a dataset can have no parents
+    # (and a dataset can also have no children))
+    #
+    # TODO: add link to auxilliary datasets (e.g. areacella, 1:many
+    # i.e. a single dataset can have multiple auxilliary datasets
+    # e.g. cell area and land fraction).
+    # Retrieiving this information will also require reading the header I believe.
+
 
 class File(SQLModel, table=True):
     """A cached ESGF file belonging to a `Dataset`."""
