@@ -459,10 +459,10 @@ End of week notes:
 - Next week the goal will be to start looking into how to integrate the current workflow across multiple MIP eras and ESGF portals.
 
 Search index node and header learnings from the week
-- Index node search step really fast, within seconds creates dataset of all search results
+- Index node search step really fast, within seconds retrieves records (results) of datasets of all search results
     - Need to maybe refine columns here
-    - CRITICAL: remove data_node from this dataset to avoid multiple entries for same simulation
-    - Current workflow works around this, but want to be very explicit with this. Take data node information into separate table.
+    - CRITICAL: remove data_node from the dataset model to avoid multiple entries for same simulation
+    - Current workflow works around this, but want to be very explicit with this. Take data node information into separate table (see notes in `anna-setup-zn` branch).
 - Metadata - global attrs -> get header information
     - The headache for a lot of the week
     - Paralellising workers on local machine and setting multiple workers on individual nodes
@@ -471,6 +471,7 @@ Search index node and header learnings from the week
 - Problem-solving throughout the week:
     - http vs https for some nodes (for failed nodes swapping these worked)
     - byte-reader vs OPEnDAP. byte-reader better, build in something for OPEnDAP too, or those nodes just assume dead?
+        - just assume dead for now, I think it's fine
     - Cold run vs warm run
         - Cold run does not learn as it goes, does not preference node health, but still has a number of potential choices for user (e.g. max_stall_length = 90s, which then shortens on a warm run)
         - We will want to be very explicit about potential preferences for a user on both cold and warm run (especially ranked node preferences to use/not use)
@@ -481,15 +482,21 @@ Search index node and header learnings from the week
         - A user knows what data they want explicitly (e.g. gregory method abrupt-nxCO2 and piControl). In this case all abrupt and piControl could be identified in an initial search index node step. However, note that sometimes multiple abrupt experiments point to a single piControl. In this case, we don't want to be duplicating header searchers where there is a many-to-one case. Right now the code (I think) is set up to search for both experiments in initial index node step, but maybe want to simplify this into workflow where a user can choose a parent (as below, so that it is less 'use-case specific').
         - A user knows the starting point but not the path to get to parent. i.e. SSPs, G6solar (use case). Multiple hops. Critical here with not duplicating header reads. For this use-case, where we don't assume path to parent (parent is either specified by user or we just walk all the way up the tree), we need to make multiple steps in search/header steps (as spoken about on zoom today). Files vs datasets, don't want to be searching for multiple files at once. Want to be able to track things, reduce potential bugs.
         - Question: if user specifies parent, do we still search header information for that parent (i.e. piControl)? Or do we just stop header search at one hop before parent (e.g. historical)
-        - Fixes/overrides: Some experiments do not have correct parent information. For example, an experiment might point to a piControl variant that doesn't exist. We want to build up a file of known fixes that a user can optionally suggest as overrides for the data
+            - no don't search header information to find out the parent if the user already specified it. However, we may have to get the header anyway for other reasons, so we'll have to think about the right workflow.
+        - Fixes/overrides: Some experiments do not have correct parent information. For example, an experiment might point to a piControl variant that doesn't exist. We want to build up a file (or file(s) effectively a plain text database) of known fixes that a user can optionally suggest as overrides for the data
             - Is this something we could use our current search/header workflow to start building up?
+                - think of this the other way around. We build it up ourselves, but we can use it in our search/header workflow
             - At what level can we say "this is not an assumption anymore"? For example, if we find a model that has a single piControl variant, and we test all the experiments for that model, and we find that not all parent_varaint_id point to that single piControl, could we just say that that is a fix and we can list that in our fixes? Isn't that still an assumption?
+                - we can only say, "This is not an assumption" if we a) confirm with the modelling centre directly or b) make some plots to show e.g. "This file lines up exactly with this other file, so it's fair to assume this is the parent, even though the metadata says otherwise". The existence of only one option isn't enough to guarantee that it is the parent (maybe the actual parent was just never published on ESGF)
 
 Question of curiosity:
 - Getting headers and learning about node health, super useful for download step, or not that useful? If node connects quickly to access headers, will that mean it connects quickly, works more quickly for download?
+    - very likely super useful, but not guaranteed. For downloads, download speed is key and header access doesn't really test that because we download so little data. Obviously very helpful for identifying dead nodes (which also can't be used for download)
 
 For next week:
 - fx (e.g. areacella) stuff -> add into search (all experimentss or just single experiment for model?)
 - (discussed above, i.e. smarter data_node table with column removed from core dataset, parent/child search-file workflow breakdown, user parent-data fixes, where to stop 'hopping' up parent tree?)
 - Integrate across MIPs and ESGF portals! Re-watch zoom? Chat to Claude, talk through Claude's suggestions for how to do this. Esp. raw data vs renaming to common naming conventions.
 - Continue with naming thinking? honestly esmporiun is still my favourite :/
+    - I can live with esmporium, it's subtle enough
+- create a schematic of the workflow: both for ourselves and future docs. We should be near enough to stable to be able to do this. Talk to Claude about options (raw ascii, a tool like mermaid, some other diagram making tool)
