@@ -1,7 +1,9 @@
 # Search / dataset / file / header workflow (CMIP6)
 
-Status: **design, under review** (2026-07-20). Scope: CMIP6 only, before any
-MIP-generation or ESGF1/ESGF-NG integration.
+Status: **living document** — decisions D1-D5 confirmed 2026-07-20. Scope: CMIP6
+only, before any MIP-generation or ESGF1/ESGF-NG integration. **Keep this file and
+its diagrams updated as the build proceeds** (any schema, step, or parallelism
+change lands here in the same commit).
 
 This document maps the end-to-end workflow shared by two use cases and the data
 model behind it. The Mermaid sources below are plain text (diff-able in git);
@@ -143,14 +145,16 @@ flowchart TD
         C1["pick ONE file per dataset; rank its FileAccess mirrors"]
         C2["PARALLEL reads: shared worker pool + per-node concurrency caps<br/>(timeout via subprocess, retry, health-aware)"]
         C3["save header_attrs_json on that File<br/>promote parent_* onto Dataset (header_from_file_key)"]
+        CH["persist NodeHealthStat + HeaderReadAttempt<br/>(load at start, record per read, save at end)"]
         C0 -- no --> C1 --> C2 --> C3
+        C2 --> CH
         C0 -- yes --> C3reuse["reuse sibling's promoted metadata"]
     end
 
     subgraph S4["Step 4 - discover parent, one search per parent (UC-chain ONLY)"]
         D1["project declared parent from Dataset.parent_* metadata"]
         D2["dedupe parents (many children -> one parent) via DB check"]
-        D3{"parent experiment ==<br/>stopping experiment?"}
+        D3{"STOP? parent experiment == stopping experiment<br/>OR header declared 'no_parent' (sentinel fallback)<br/>OR user set parent=None"}
         D4["PARALLEL over parents: ONE simple search per parent<br/>(no fancy AND/OR)"]
         D5["save parent dataset + set child.parent_dataset_key"]
         D1 --> D2 --> D3
@@ -173,6 +177,14 @@ whose experiment is the **stopping** experiment is the end of chain: it gets Ste
 (it was just searched) + Step 2 (files, so the data is reachable) but **no Step 3
 header read** and **no Step 4** — we never need the final parent's own parent. A
 global visited/DB check means a parent shared by many children is searched once.
+
+**Stop condition (three ways, robust to user error):** the walk stops when
+(a) a discovered parent's `experiment_id` equals the user-declared **stopping
+experiment**; or (b) as a **fallback**, a header declares the CMIP6 `"no parent"`
+sentinel — so a typo in the stopping experiment, or `parent=None`, still terminates
+cleanly at the true top of the tree instead of chasing a non-existent parent; or
+(c) the user explicitly passed `parent=None` (walk to whatever the headers say is
+the top). The sentinel fallback (b) is always active regardless of (a).
 
 ## Per-step function-call map (current -> target)
 
@@ -205,18 +217,50 @@ global visited/DB check means a parent shared by many children is searched once.
    promoted **"header-only metadata"** (a.k.a. header-only dataset metadata) with a
    pointer to the file it came from.
 
-## Open decisions (to confirm before building)
+## Decisions (confirmed 2026-07-20)
 
-- **D1** Keep `DatasetLocation` as the home for raw per-node dataset docs (recommended),
-  vs. deriving node availability only from `FileAccess` and storing raw docs elsewhere.
-- **D2** `File` node-independent identity: surrogate key with a natural unique index on
-  `(dataset_key, filename)` (recommended) vs. `tracking_id` (not always reliable).
-- **D3** Retire `DatasetHeader` in favour of `File.header_attrs_json` + promoted
-  `Dataset` columns (recommended), preserving the cross-variable reuse optimisation by
-  copying a sibling dataset's promoted metadata.
-- **D4** End-of-chain parent: Step 1 + Step 2 (files) but no header — confirm files are
-  wanted for the final parent (so its data is reachable), or dataset entry only.
-- **D5** Stop condition for UC-chain: stop when a discovered parent's `experiment_id`
-  equals the known **stopping experiment** (this doc's assumption), rather than the
-  CMIP6 "no parent" header sentinel.
-```
+- **D1 ✅** `DatasetLocation` is the home for raw per-node dataset docs and per-node
+  dataset facts (written at Step 1).
+- **D2 ✅** `File` uses a surrogate key with a natural unique index on
+  `(dataset_key, filename)`; `tracking_id` is stored but not the identity.
+- **D3 ✅** `DatasetHeader` (simulation-grain) is retired in favour of
+  `File.header_attrs_json` + promoted `Dataset` columns, preserving the
+  cross-variable reuse optimisation by copying a sibling dataset's promoted metadata.
+- **D4 ✅** End-of-chain parent gets Step 1 **+ Step 2 (files)** so its data is
+  reachable, but **no header read** and no further hop.
+- **D5 ✅** Stop condition = user-declared stopping experiment, **with** the
+  `"no parent"` header sentinel always active as a fallback (robust to a typo or
+  `parent=None`). See "Stop condition" above.
+
+## Node health & attempt logging (must persist — do not lose)
+
+The per-node health learning and the append-only attempt log are **first-class and
+must keep persisting** across the restructure. They live in Step 3 (the only step
+that contacts data nodes):
+
+- `Repository.load_node_health()` at the start of a read pass, `recording(...)` onto
+  the in-memory `NodeHealth` per read, `save_node_health()` at the end
+  (`persist_health=True`).
+- Every attempt (including retries and fully-failed simulations) is written to
+  `HeaderReadAttempt` via `record_header_attempts()`.
+- `NodeHealthStat` and `HeaderReadAttempt` tables are **unchanged** by this work.
+
+Steps 1, 2 and 4 hit the *search index*, not data nodes, so they do not produce node
+health — health is a Step 3 concept only.
+
+## Testing & observability (visual, per step)
+
+Requirement: at each step it must be possible to see **exactly which functions run,
+with their inputs and outputs, and where parallelism happens**. Plan:
+
+- Each step is exercised by a focused test that asserts the *call sequence* (via a
+  recording double / spy over the injected seams: `Fetch`, `MapFn`, `HeaderReader`,
+  `Repository`), so the test doubles as living documentation of the step's contract.
+- Inputs/outputs are the small dataclasses already in play (`FacetQuery`,
+  `DatasetRecord`, `FileRecord`, `EnrichResult`, …) — each step's test shows the
+  concrete in → out for a tiny fixture.
+- Parallelism is an *injected* `MapFn`, so a test can pass a recording `serial_map`
+  to capture "these N queries were mapped here" and prove one-search-per-dataset
+  (Steps 2 & 4) without real threads.
+- A short `__main__`-guarded script per step (under `scripts/`) prints the same call
+  trace on a tiny live fixture, for a runnable visual of the flow.
