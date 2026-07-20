@@ -500,3 +500,64 @@ For next week:
 - Continue with naming thinking? honestly esmporiun is still my favourite :/
     - I can live with esmporium, it's subtle enough
 - create a schematic of the workflow: both for ourselves and future docs. We should be near enough to stable to be able to do this. Talk to Claude about options (raw ascii, a tool like mermaid, some other diagram making tool)
+
+
+#### START WEEK 2 (20 July) #####
+
+Claude prompt:
+
+We have a successful workflow for a range of test cases which can search ESGF index nodes for potentially available data, then connect to data nodes to access and save header information which includes global attributes (such as parent information). This works for a range of use cases, ranging from a simple use case to access a single experiment and variable across models (ssp245 tas) through to more complicated where we start with an experiment (e.g. G6solar) and want to walk up the parent chain to an end point where we may not know what the intermediate 'hops' are. We are in a good place with this, but we need some refinement.
+
+I will describe some of the refinements, but you may also look in schema.py and query.py under 'TODO'. Note that in query.py especially there are a lot of notes for integrating between cmip5/6/7 and between esgf1 and esgf-ng. Working on that will be my next step, but for right now please don't address this. I want to get the current workflow right for just cmip6, then we can start with integrating across mip generations and esgf portals.
+
+First of all, I want to remove the data_node column from dataset. We do not want to have multiple rows for the same simulation in dataset, that only differ by data_node. See note from schema.py "    # This should be on the files, it shouldn't exist at all on the dataset
+    # (if it is part of the API response, drop it and either don't store it
+    # or only have it in the full raw JSON response that we store)"
+Currently, our workflow has workarounds for a single simulation having multiple rows that only differ by data node. Please suggest how you would implement changes so that each simulation has a single row in dataset, and how/where that information may link to another table that could ahve multiple rows for a single simulation if the simualtion is available from multiple data nodes.
+
+Second of all, I would like to go through the workflow for parent/child test cases. Specifically, in the search index node / header stages. I would like you to describe the differences between datasets and files for esgf, and exactly what the current workflow is doing. My understanding is that once we obtain parent information via child headers, we then need to search the index node for the parent experiments (files or datasets?), and these queeries are sent off in batches. We do not want this workflow in batches. We want to have a single search for each parent simulation. While this may be slighlty slower, we want to parallelise efficiently here, and also be able to track exactly what is being searched for to minimise bugs. I may have some more thigns to say about this set-up, so please tell me (visually, if possible) what the workflow is currenlty doing, and what you suggest based on my initial preferences.
+
+Thirdly, an additional 'variable' that users may want to search for are the frequency (fx), such as areacella. This will depend on the model. Some models will ahve a specific areacella (fx) variable for every single other variable (e.g. tas, pressure, precip), but sometimes it will just be for a single one per experiment, or some models will just have a single areacella for a single model, perhaps for piControl (e.g. UKESM, i beleive). As such, this will need to be relatively flexible with how we implement this, as it will be very model specific.
+
+Let's start with these fixes. Perhaps doing these separately? Let me know what you think.
+
+Claude prompt - data workflow
+
+Don't care about header for files, care about header for dataset, but to get header for dataset we need to go into one of the files of the dataset to get global attributes for specific dataset.
+get header, save it to the file URL we obtained it from, and save that to the dataset for the file.
+
+I want to talk through two use-cases so that we can be on the same page about searching index node + dataset + dataset file + header information. First of all, we can consider a simple case, such as ssp245 'tas', where we search the index node, then get the headers for each dataset. Secondly, we can think of the use cases where we know the child experiment, and the 'stopping' parent expeiment, but not the parent chain in between. Recall that in this parent/child use-case we initially only search the index node for the initial child experiment dataset, then use the header information obtained from the child datasets to search for the parent data and files. I want to talk through exactly what we want this workflow to look like for both use cases (you can suggest where they overlap, or diverge), I will want you to create a visual representation of this workflow (in a diagram whose source can be trackable in plain git, but which might link to somethign to truly visualise it), then in testing I will want to see exactly what function calls are happening at each step, what the inputs and outputs are, and where parallelisation is happening.
+
+Step 1 - search for datasets on index node:
+- This step will be common to our single use and parent/child use case. The only difference is that with the parent/child use case it is only the 'starting point' child that is being searched for.
+- We understand at this step that certain AND/OR combinations aren't supported, and that this step will be (already is?) paralellised on the client side (our side). Hitting search API can use threads?
+- Saving the information to the database. We note here that in the updated workflow that I have already provided, we are changing the primary key from id to instance_id. By doing this, we are saying now that resulsts that differ by data node are not actually different datasets. This is already a difference with the ESGF data model (as we will soon be investigating when we come to differenes in MIP and ESGF1/ESGF-NG). Where would you recommend saving the raw JSON results for each dataset in this case so that we can still obtain the raw dataset that the search result obtained?
+Step 2 - Adding files to the datasets:
+- Again, this step is shared between the two use-cases.
+- We want to conduct a single search for files per dataset (no more combining across datasets to search for lists of files). This reduces changes of bugs, and avoids overflow (the 10000 file limit). We will have to make this paralell on our side (already is? or will have to be explicit because we are no longer lumping datasets into one search).
+- From here, we want to immediately save informateion in a database. This immediately links datasets to files in access URL using fsspec links.
+- We can consider this a caching step, to identify if we already ahve this information for a given dataset. We are breaking file results into file and access places.
+Step 3 - get header information for datasets:
+- For every dataset, we only want a single file retreival to obtain the header (this will be in parallel on our side - although want to maintain the potential paralel connections to nodes at once)
+- one retrieval per dataset but using a common pool and config for workers
+  (have to make parallel on our i.e. client side)
+- real world: get header information for a single file
+- also not really a header, because files have headers, datasets don't.
+  Probably need to tweak language here, maybe
+  'header-only metadata' or 'header-only dataset metadata'
+- save header information to the file it applies to.
+  extract the dataset applicable metadata and add that to the dataset too, making sure we also know exactly which file the metadata comes from
+Step 4 - use dataset header information to drvie search for aprent dataset:
+- Here our use cases differ. This is only relevant to the 'hopping' parent/child chain.
+- We then need to start again in the search-index-node step 1, HOWEVER, we only do a single search per dataset (making sure only one search per parent - noting that multiple child datasets might point to a single parent, although perhaps we solve this by doing a database 'check' to avoid duplicates)
+- one search per dataset (makes it simple to process results),
+(have to make parallel on our i.e. client side, hitting search API so can use threads?)
+- don't use fancy AND/OR to mean we only have to make one search
+- save parent information to dataset (i.e. make child <-> parent links)
+
+
+After this, we should end up with a dataset which includes file links, parent dataset link, and head-only metadata (eventually will also want auxilliary file link, such as areacella, but that is for future.)
+We will also want a file entries dataset, which includes access links i.e. node availability (in separate table i.e. file - access info)
+Entry for end of chain parent data. end of chain parent only needs to be based on search API, not headers, because don't need headers for final parent, only children and intermediate parents.
+
+Let's map out a plan for all this, and how similar/different his is to the step 1 you were about to implement. please let me know if you have questions. REmember, i want first a plan including a diagram of how this workflow will go.
