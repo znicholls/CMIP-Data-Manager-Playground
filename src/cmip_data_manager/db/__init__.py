@@ -13,19 +13,23 @@ from cmip_data_manager.db.repository import Repository, RunResult
 from cmip_data_manager.db.schema import (
     Dataset,
     DatasetChange,
+    DatasetLocation,
     File,
-    QueryRun,
+    FileAccess,
     RunMembership,
+    SearchRun,
 )
 
 __all__ = [
     "Dataset",
     "DatasetChange",
+    "DatasetLocation",
     "File",
-    "QueryRun",
+    "FileAccess",
     "Repository",
     "RunMembership",
     "RunResult",
+    "SearchRun",
     "create_db_engine",
     "init_db",
 ]

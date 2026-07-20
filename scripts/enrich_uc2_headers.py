@@ -112,10 +112,10 @@ def _search_uc2(client, repository):
     by_id = {r.id: r for result in client.search_many(queries) for r in result}
     records = list(by_id.values())
     run = repository.record_run(
-        USE_CASE,
         records,
         endpoint_url=client.base_url,
         spec={"queries": [q.as_spec() for q in queries]},
+        tag=USE_CASE,
     )
     print(
         f"index search (live): {len(records)} datasets; "

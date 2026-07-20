@@ -116,10 +116,10 @@ def _search_uc1(client, repository):
     """Run the use case 1 index search live and cache the datasets."""
     records = client.search(UC1_QUERY)
     repository.record_run(
-        USE_CASE,
         records,
         endpoint_url=client.base_url,
         spec={"note": "from-scratch uc1 index search"},
+        tag=USE_CASE,
     )
     return records
 

@@ -14,9 +14,9 @@ def test_sqlite_path_creates_working_db(tmp_path):
     assert engine.dialect.name == "sqlite"
     init_db(engine)
     with Session(engine) as session:
-        session.add(Dataset(id="d1", raw_json="{}"))
+        session.add(Dataset(instance_id="d1"))
         session.commit()
-        assert session.exec(select(Dataset)).one().id == "d1"
+        assert session.exec(select(Dataset)).one().instance_id == "d1"
 
 
 def test_full_url_is_passed_through(tmp_path):

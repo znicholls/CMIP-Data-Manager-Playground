@@ -259,10 +259,10 @@ def run_use_case(  # noqa: PLR0913 - deliberately configurable DI seam
         queries = use_case.build_queries(client)
         records = _dedupe(client.search_many(queries))
         run: RunResult | None = repository.record_run(
-            use_case.name,
             records,
             endpoint_url=client.base_url,
             spec={"queries": [q.as_spec() for q in queries]},
+            tag=use_case.name,
         )
         if use_case.parent_spec is not None:
             links = resolve_parent_links(

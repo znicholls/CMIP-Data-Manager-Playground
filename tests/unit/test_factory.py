@@ -20,5 +20,5 @@ def test_open_repository_is_usable(tmp_path):
     repo = open_repository(tmp_path / "db.sqlite")
     assert isinstance(repo, Repository)
     # Tables exist: recording a run does not raise.
-    result = repo.record_run("uc", [], endpoint_url="u", spec={})
+    result = repo.record_run([], endpoint_url="u", spec={}, tag="uc")
     assert result.num_found == 0

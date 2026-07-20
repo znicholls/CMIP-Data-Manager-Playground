@@ -130,6 +130,31 @@ class DatasetRecord(BaseModel):
     raw: dict[str, Any]
     """The full raw search document."""
 
+    @property
+    def instance_key(self) -> str:
+        """
+        The node-independent dataset identity used as the storage primary key
+
+        `instance_id` when the search provided it, otherwise the `id` with any
+        trailing `|data_node` stripped (the ESGF `id` is `instance_id|data_node`).
+        """
+        if self.instance_id:
+            return self.instance_id
+        return self.id.split("|", 1)[0]
+
+    @property
+    def node_key(self) -> str:
+        """
+        The data node this record came from, for the per-node location row
+
+        `data_node` when provided, otherwise the part of `id` after `|`, falling
+        back to `"unknown"` when the id carries no node (e.g. in tests).
+        """
+        if self.data_node:
+            return self.data_node
+        _, _, node = self.id.partition("|")
+        return node or "unknown"
+
     @classmethod
     def from_solr(cls, doc: dict[str, Any]) -> DatasetRecord:
         """

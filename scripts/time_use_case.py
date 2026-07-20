@@ -83,10 +83,10 @@ def main() -> None:
 
     with timed("record_run", timings):
         repository.record_run(
-            USE_CASE.name,
             records,
             endpoint_url=client.base_url,
             spec={"queries": [q.as_spec() for q in queries]},
+            tag=USE_CASE.name,
         )
 
     conflicts: list[ParentConflict] = []

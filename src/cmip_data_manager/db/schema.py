@@ -1,28 +1,57 @@
 """
-Database schema for cached datasets, files and query history
+Database schema for cached datasets, files, access options and query history
+
+The full workflow and the reasoning behind these grains live in
+`design/search-workflow.md` (repo root); this module is its concrete realisation.
 
 Design notes:
 
-- One persisted model per concept.  A `Dataset` owns many `File` rows through a
-  standard one-to-many relationship (`Dataset.files` / `File.dataset`).  We model
-  files from the start because downloads and completeness checks need them.
-- We deliberately do **not** split into separate "database" and "API" classes.
-  For these flat records that split buys nothing; the SQLModel classes are used
-  directly as the Python API.  The one guard-rail is that relationship attributes
-  (`Dataset.files`) are only safe to read inside an open session, so the
-  repository eagerly loads them when returning detached objects.
-- Query history is captured by `QueryRun` (one row per API call for a use case),
-  `RunMembership` (exactly which datasets a run returned, enabling clean diffs)
-  and `DatasetChange` (the computed added/removed/modified log).
+- **A dataset is node-independent.**  Its primary key is `instance_id` (version-
+  specific but data-node-independent), so two replicas of the same dataset on
+  different nodes are the *same* `Dataset` row, not two.  Everything node-specific
+  moves to child tables.  A new *version* is a new `instance_id` (a separate row);
+  `master_id` ties versions of the same dataset together.
+- **`DatasetLocation`** captures dataset-search provenance: one row per data node
+  that served the dataset, holding the raw per-node search document and per-node
+  facts (`_timestamp`, `replica`).  This is where the raw JSON lives.
+- **`File`** is node-independent (one row per logical file).  **`FileAccess`** is the
+  per-node "where can I actually download this" table (fsspec-openable URLs).  A
+  data node therefore appears at two grains — dataset (`DatasetLocation`, written
+  when datasets are searched) and file (`FileAccess`, written when files are
+  searched) — which are populated at different steps; neither is derived from the
+  other.
+- **Header-only metadata lives on the file that carries it.**  A netCDF header
+  belongs to a *file*, so the full header is stored on `File.header_attrs_json`;
+  the dataset-applicable subset (the `parent_*` link metadata) is *promoted* onto
+  `Dataset`, with `header_from_file_key` recording exactly which file it came from.
+- **Two soft (non-enforced) pointers.**  `Dataset.header_from_file_key` (-> `File`)
+  and `File.header_from_access_key` (-> `FileAccess`) are indexed provenance columns
+  but **not** foreign keys.  Making them real FKs would create insert-time cycles
+  (`Dataset` <-> `File`, `File` <-> `FileAccess`) needing `post_update` machinery.
+  They record "where this metadata was read from"; correctness never depends on
+  them, and all writes go through the `Repository`, which keeps them consistent.
+  The promoted metadata can legitimately point at a *sibling* dataset's file (the
+  cross-variable header-reuse optimisation), which a per-dataset FK could not model
+  anyway.  `parent_dataset_key` stays a real self-referential FK (a clean adjacency
+  list, no cycle).
+- Query history is captured by `SearchRun` (one row per search execution),
+  `RunMembership` (which datasets a run returned, enabling clean diffs) and
+  `DatasetChange` (the computed added/removed/modified log).  The diff *series* is
+  keyed on the normalised query spec, not on any use-case name.
+
+All parent/header columns are nullable: a use case that never touches parents (e.g.
+`ssp245 tas`) produces datasets, locations, files and accesses with the parent and
+header columns left `NULL`, and never runs the parent step.
 """
 
 from datetime import datetime, timezone
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 # NOTE: this module intentionally does not use ``from __future__ import
 # annotations``.  SQLModel resolves relationship targets from the annotations at
-# runtime, and stringised annotations break the ``Dataset``/``File`` relationship.
+# runtime, and stringised annotations break the relationships below.
 
 
 def _utcnow() -> datetime:
@@ -30,173 +59,250 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class QueryRun(SQLModel, table=True):
-    """One execution of a use case's queries against the search API."""
+class SearchRun(SQLModel, table=True):
+    """
+    One execution of a search against the index node
+
+    A generic query-execution record.  It carries no use-case name: the diff
+    *series* (added/removed/modified) is computed against previous runs with the
+    same normalised query `spec_json`, so change tracking is a general-user feature
+    rather than a testing artefact.
+    """
 
     id: int | None = Field(default=None, primary_key=True)
-    # TODO: remove.
-    # Let's just record queries as queries
-    # with information about number found etc.
-    # Let's store links betwen use cases
-    # and queries somewhere else
-    # (if at all).
-    use_case: str = Field(index=True)
-    """Name of the use case this run belongs to."""
-
     created_at: datetime = Field(default_factory=_utcnow)
+
     endpoint_url: str
     """Search endpoint that was queried."""
 
-    # TODO: in docstring, please add a link back to the object
-    # from which this JSON was created.
-    # If there is a more robust way to make this link,
-    # please add it.
     spec_json: str
-    """JSON description of the queries that were run."""
+    """
+    Normalised JSON description of the query that was run.
+
+    Two runs sharing this value form a diff series, so an added/removed/modified log
+    can be computed for "the same search over time".
+    """
 
     num_found: int
-    """Total number of datasets returned by the run."""
+    """Total number of datasets the run returned."""
 
     num_stored: int
     """Number of datasets written/updated in the database by the run."""
 
-    # TODO: clarify docstring.
-    # What does it mean by terminal status?
-    # Where does status get defined?
-    # Is it essentially just whether the search worked or not?
-    # Can we turn this into an enum to have better visibility
-    # of the possible outcomes
-    # (and maybe have a status_string column to store full error
-    # output if needed).
     status: str = "ok"
     """Terminal status of the run (`"ok"` or an error marker)."""
 
+    tag: str | None = Field(default=None, index=True)
+    """
+    Optional freeform label for a run (e.g. a caller's use-case name).
+
+    Never required and never used for diffing; it only exists so a caller can
+    annotate a run for its own convenience.
+    """
+
 
 class Dataset(SQLModel, table=True):
-    """A cached ESGF dataset, uniquely identified by its versioned `id`."""
+    """
+    A cached, node-independent ESGF dataset, keyed by its `instance_id`
 
-    id: str = Field(primary_key=True)
-    # TODO: check whether this is a thing for all ESGF responses.
-    # It might only exist in ESGF1 and/or CMIP6.
+    `instance_id` is version-specific but data-node-independent, so replicas
+    collapse to one row and a new version becomes a new row.  Node-specific facts
+    live on `DatasetLocation`; the dataset's files live on `File`.
+    """
+
+    instance_id: str = Field(primary_key=True)
+    """Version-specific, node-independent identifier (the primary key)."""
+
     master_id: str | None = Field(default=None, index=True)
-    # As above
-    instance_id: str | None = Field(default=None, index=True)
+    """Version- and node-independent identifier; ties versions of a dataset together."""
+
     project: str | None = None
-    # TODO: this is where things are going to get messy.
-    # Do we have a dataset model for CMIP6, CMIP5 etc.
-    # and then a high-level model?
-    # Do just have one dataset model, that uses our 'harmonised' vocab
-    # and then links (or stores) of the raw JSON
-    # in the 'original' vocab (we always want to be able to retrieve the raw terms,
-    # the question is just how)?
     source_id: str | None = Field(default=None, index=True)
-    # As above
     institution_id: str | None = None
-    # As above
     experiment_id: str | None = Field(default=None, index=True)
-    # As above
     variant_label: str | None = Field(default=None, index=True)
-    # As above (although this might actually be stable)
     variable_id: str | None = Field(default=None, index=True)
-    # As above (although this might actually be stable)
     frequency: str | None = None
-    # As above (doesn't exist in CMIP7)
     table_id: str | None = None
-    # This has been changed to grid_id in CMIP7
-    # (and the meaning is actually different, hopefully uniform grids
-    # aren't important for us).
     grid_label: str | None = None
-    # As above (although this might actually be stable)
     nominal_resolution: str | None = None
-    # As above (not sure if in CMIP5)
     version: str | None = None
-    # This should be on the files, it shouldn't exist at all on the dataset
-    # (if it is part of the API response, drop it and either don't store it
-    # or only have it in the full raw JSON response that we store)
-    data_node: str | None = None
-    replica: bool | None = None
     latest: bool | None = None
-    number_of_files: int | None = None
-    size: int | None = None
-    esgf_timestamp: str | None = None
-    """Raw `_timestamp`; a change here marks the dataset as modified."""
 
-    raw_json: str
-    """The full raw search document, as JSON."""
+    # --- promoted header-only metadata (nullable; filled in the header step) ------
+    parent_source_id: str | None = Field(default=None, index=True)
+    parent_experiment_id: str | None = Field(default=None, index=True)
+    parent_variant_label: str | None = Field(default=None, index=True)
+    parent_activity_id: str | None = None
+    branch_time_in_parent: str | None = None
+    """Kept as text: attribute values are read as strings (e.g. `"60225.0"`)."""
 
-    first_seen_run_id: int | None = Field(default=None, foreign_key="queryrun.id")
-    last_seen_run_id: int | None = Field(default=None, foreign_key="queryrun.id")
+    header_from_file_key: int | None = Field(default=None, index=True)
+    """
+    Soft pointer (indexed, **not** a foreign key) to the `File.id` whose header this
+    dataset's promoted metadata was read from — which may be a *sibling* dataset's
+    file (header reuse).  Provenance only; see the module docstring.
+    """
 
+    # --- parent link (a real self-referential FK; populated in the parent step) ---
+    parent_dataset_key: str | None = Field(
+        default=None, foreign_key="dataset.instance_id", index=True
+    )
+    """
+    The `instance_id` of this dataset's parent, or `None`.
+
+    Each dataset has at most one parent; a parent may have many children.  A use
+    case that never resolves parents leaves this `NULL`.
+    """
+
+    first_seen_run_id: int | None = Field(default=None, foreign_key="searchrun.id")
+    last_seen_run_id: int | None = Field(default=None, foreign_key="searchrun.id")
+
+    locations: list["DatasetLocation"] = Relationship(
+        back_populates="dataset",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     files: list["File"] = Relationship(
         back_populates="dataset",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
-    # TODO: add link to parent dataset
-    # (each dataset can only have one parent
-    # but a parent can have more than one child,
-    # or a dataset can have no parents
-    # (and a dataset can also have no children))
-    #
-    # TODO: add link to auxilliary datasets (e.g. areacella, 1:many
-    # i.e. a single dataset can have multiple auxilliary datasets
-    # e.g. cell area and land fraction).
-    # Retrieiving this information will also require reading the header I believe.
+
+class DatasetLocation(SQLModel, table=True):
+    """
+    One data node that serves a `Dataset` — dataset-search provenance
+
+    Written when datasets are searched (Step 1): one row per `(dataset, data_node)`,
+    preserving the raw per-node search document and the per-node dataset facts that
+    the node-independent `Dataset` row cannot hold.
+    """
+
+    dataset_key: str = Field(foreign_key="dataset.instance_id", primary_key=True)
+    """Foreign key to the owning `Dataset.instance_id`."""
+
+    data_node: str = Field(primary_key=True)
+    """Hostname of the data node serving this copy."""
+
+    esgf_dataset_id: str | None = None
+    """The node-specific ESGF dataset id (`instance_id|data_node`)."""
+
+    replica: bool | None = None
+    latest: bool | None = None
+    esgf_timestamp: str | None = None
+    """Raw per-node `_timestamp`; a change here marks this copy as modified."""
+
+    size: int | None = None
+    number_of_files: int | None = None
+
+    raw_json: str
+    """The full raw per-node dataset search document, as JSON."""
+
+    first_seen_run_id: int | None = Field(default=None, foreign_key="searchrun.id")
+    last_seen_run_id: int | None = Field(default=None, foreign_key="searchrun.id")
+
+    dataset: Dataset | None = Relationship(back_populates="locations")
 
 
 class File(SQLModel, table=True):
-    """A cached ESGF file belonging to a `Dataset`."""
+    """
+    A cached, node-independent file belonging to a `Dataset`
 
-    id: str = Field(primary_key=True)
-    dataset_key: str = Field(foreign_key="dataset.id", index=True)
-    """Foreign key to the owning `Dataset.id`."""
+    One row per logical file (identity is `(dataset_key, filename)`, which is stable
+    across replicas); the per-node ways to download it live on `FileAccess`.  The
+    file's netCDF header, once read, is stored here as `header_attrs_json`.
+    """
 
-    # TODO: Why are we storing this, can't we just get it by looking up the dataset's ID
-    # using the link back to dataset?
-    dataset_id: str
-    """`dataset_id` as reported by ESGF (equals the parent dataset `id`)."""
+    __table_args__ = (
+        UniqueConstraint("dataset_key", "filename", name="uq_file_dataset_filename"),
+    )
 
-    # TODO: drop this
-    title: str | None = None
+    id: int | None = Field(default=None, primary_key=True)
+    """Surrogate primary key; the natural key is `(dataset_key, filename)`."""
+
+    dataset_key: str = Field(foreign_key="dataset.instance_id", index=True)
+    """Foreign key to the owning `Dataset.instance_id`."""
+
+    filename: str
+    """The file's name/title (identical across replicas)."""
+
+    variable_id: str | None = None
+    table_id: str | None = None
     size: int | None = None
     checksum: str | None = None
     checksum_type: str | None = None
     tracking_id: str | None = None
-    # TODO: Why are we storing this, can't we just get it by looking up the dataset
-    # using the link back to dataset?
-    variable_id: str | None = None
-    # TODO: please break this out into a separate table.
-    # I want that table to store 'access options' or some other name.
-    # Each entry should link to a file.
-    # Each file can have one or more access options,
-    # via different ways e.g. url or service
-    # and on different nodes.
-    # Please include an fsspec column in this file,
-    # which stores how to access the file in an fsspec-compliant way.
-    urls_json: str | None = None
-    """JSON list of the raw `url` entries (`url|mime-type|service`)."""
+    """The file's PID/tracking id if published; stored, but not the row identity."""
 
-    esgf_timestamp: str | None = None
-    raw_json: str
+    # --- header-only metadata (nullable until the header step reads this file) ----
+    header_attrs_json: str | None = None
+    """Every global attribute read from this file's netCDF header, as JSON."""
+
+    header_from_access_key: int | None = Field(default=None, index=True)
+    """
+    Soft pointer (indexed, **not** a foreign key) to the `FileAccess.id` the header
+    was actually read from — file-level provenance.  See the module docstring.
+    """
+
+    header_read_at: datetime | None = None
 
     dataset: Dataset | None = Relationship(back_populates="files")
+    accesses: list["FileAccess"] = Relationship(
+        back_populates="file",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class FileAccess(SQLModel, table=True):
+    """
+    One place a `File` can be accessed from — a per-node access option
+
+    Written when files are searched (Step 2): one row per way to reach a file (a
+    given data node and service), carrying the concrete URL and an fsspec-openable
+    form.  This is the node-availability view at file grain.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    file_id: int = Field(foreign_key="file.id", index=True)
+    """Foreign key to the owning `File.id`."""
+
+    data_node: str = Field(index=True)
+    """Hostname of the node this access reaches."""
+
+    service: str | None = None
+    """Access service, e.g. `"HTTPServer"`, `"OPENDAP"`, `"Globus"`."""
+
+    url: str | None = None
+    """The raw access URL."""
+
+    fsspec_url: str | None = None
+    """An fsspec-openable form of `url` (how to open the file with fsspec)."""
+
+    replica: bool | None = None
+    esgf_file_id: str | None = None
+    """The node-specific ESGF file id."""
+
+    raw_json: str | None = None
+    """The raw per-node file search document, as JSON."""
+
+    file: File | None = Relationship(back_populates="accesses")
 
 
 class RunMembership(SQLModel, table=True):
-    """Records that a given `QueryRun` returned a given dataset."""
+    """Records that a given `SearchRun` returned a given dataset."""
 
-    query_run_id: int = Field(foreign_key="queryrun.id", primary_key=True)
-    dataset_id: str = Field(foreign_key="dataset.id", primary_key=True)
+    query_run_id: int = Field(foreign_key="searchrun.id", primary_key=True)
+    dataset_key: str = Field(foreign_key="dataset.instance_id", primary_key=True)
     esgf_timestamp: str | None = None
-    """Dataset `_timestamp` at the time of this run (for modified detection)."""
+    """Representative dataset `_timestamp` at run time (for modified detection)."""
 
 
 class DatasetChange(SQLModel, table=True):
-    """A single added/removed/modified event computed for a `QueryRun`."""
+    """A single added/removed/modified event computed for a `SearchRun`."""
 
     id: int | None = Field(default=None, primary_key=True)
-    query_run_id: int = Field(foreign_key="queryrun.id", index=True)
-    dataset_id: str = Field(index=True)
+    query_run_id: int = Field(foreign_key="searchrun.id", index=True)
+    dataset_key: str = Field(index=True)
     change_type: str
     """One of `"added"`, `"removed"` or `"modified"`."""
 
@@ -208,21 +314,14 @@ class DatasetChange(SQLModel, table=True):
 
 class DatasetHeader(SQLModel, table=True):
     """
-    A netCDF file's cached global-attribute header
+    A netCDF file's cached global-attribute header — **transitional**
 
-    Keyed at the `(source_id, experiment_id, variant_label, variable_id,
-    table_id)` grain: one row per dataset.  `table_id` is part of the key because
-    the same variable can be published at several frequencies (`Amon` vs `day`).
-    The header describes the *simulation* and is assumed identical across a
-    simulation's variables, so a later "smart reader" can reuse a sibling
-    variable's row for the same `(source_id, experiment_id, variant_label)` rather
-    than re-reading — but each read is still filed under the exact dataset it came
-    from.
-
-    Storage is hybrid: the frequently-queried CMIP6 `parent_*`/`tracking_id`
-    attributes are promoted to indexed columns, while `attrs_json` retains the
-    complete header so nothing read is ever lost and new attributes can be promoted
-    later without a re-read.
+    Keyed at the `(source_id, experiment_id, variant_label, variable_id, table_id)`
+    grain: one row per dataset.  This is the *old* simulation-grain header store; it
+    is retained only so the not-yet-migrated header pipeline keeps working, and is
+    **retired** once headers move onto `File.header_attrs_json` with the
+    dataset-applicable subset promoted onto `Dataset` (Increment D).  Do not build
+    new behaviour on it.
     """
 
     source_id: str = Field(primary_key=True)
@@ -256,8 +355,8 @@ class HeaderReadAttempt(SQLModel, table=True):
     """
     One header-read attempt against a data node — an append-only log
 
-    Where `DatasetHeader` keeps only the *winning* read and `NodeHealthStat` keeps
-    per-host *aggregates*, this is the raw, timestamped per-attempt fact table:
+    Where the promoted metadata keeps only the *winning* read and `NodeHealthStat`
+    keeps per-host *aggregates*, this is the raw, timestamped per-attempt fact table:
     every URL tried for every simulation, in order, with its outcome and duration —
     including `with_retry` sub-attempts and simulations that fully failed.  It is
     append-only (never upserted), so it accumulates a history.

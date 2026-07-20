@@ -561,3 +561,17 @@ We will also want a file entries dataset, which includes access links i.e. node 
 Entry for end of chain parent data. end of chain parent only needs to be based on search API, not headers, because don't need headers for final parent, only children and intermediate parents.
 
 Let's map out a plan for all this, and how similar/different his is to the step 1 you were about to implement. please let me know if you have questions. REmember, i want first a plan including a diagram of how this workflow will go.
+
+Claude prompt:
+
+Parent/child stopping and hops. The three use cases (1. parent specified by user, 2. None specified, 3. typo/error). Your workflow for 3. currently has (3) User specifies the wrong stopping parent (typo, or an experiment the chain never passes through). Condition (1) never fires because nothing matches, but the "no parent" sentinel is always active as a fallback, so the walk still terminates cleanly at the true top instead of running forever. Then a post-walk validation checks: "did the chain actually pass through the experiment you asked to stop at?" If not, we surface it — I'd make this a warning by default with an opt-in strict mode that raises ("you asked to stop at 'picontrole' but the chain terminated at 'piControl' without ever reaching it"). That's your "stop and/or throw an error."
+- An update to this is that we don't want to have warnings. We would prefer to throw an error. Two potential things to consider are that if a user has specified a parent (i.e. not None), we do a quick search on ESGF index node to see if the experiment exists. That is one confirmation for any not None use case that the experiment actually exists. If it doesnt, throw error. If the experiment exists, we walk up the chain. Now, either the chain will arrive correctly at the parent experiment and stop, or the parent experiment supplied by the user is not in the parent chain (e.g. user specifies starting point as g6solar, and parent as ssp119 - both experiments exist in esgf search, but incorrect parent). In this case we can walk all the way up the chain, once we hit no_parent, we suggest error.
+
+
+Versions. I want to be very specific about having different tables for versions. You are correct that we should alter the workflow so that PK is now master_id (instead of instance_id). We should then create a new table such as
+class DatasetVersion:
+    dataset: Dataset  # link to version-invariant dataset definition
+    version: str  # done as dates, so has to be a string. We should add validation that these can be passed to date time so we can sort them properly later
+    parent_dataset: DatasetVersion  # link to parent dataset (including version)
+    version_specific_attribute: float  # can't think of any other good examples right now, but you get the idea I hope
+Note that we will need to shift any version-specific columns from dataset to datasetversion. Such as: parent information, version information, auxiliary (e.g. areacella) links (although we will think about this later). Then we will also have to have this table link to the Dataset Location. Please explain how these will all be linked. You will need to update the serach-worlfow.md please so that I can see the diagram and that I have provided clear isntructions. Thank you

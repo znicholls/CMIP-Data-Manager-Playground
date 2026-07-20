@@ -1,6 +1,6 @@
 # Search / dataset / file / header workflow (CMIP6)
 
-Status: **living document** — decisions D1-D5 confirmed 2026-07-20. Scope: CMIP6
+Status: **living document** — decisions D1-D6 confirmed 2026-07-20. Scope: CMIP6
 only, before any MIP-generation or ESGF1/ESGF-NG integration. **Keep this file and
 its diagrams updated as the build proceeds** (any schema, step, or parallelism
 change lands here in the same commit).
@@ -22,20 +22,25 @@ They share Steps 1-3 exactly. They diverge at Step 4 (only UC-chain hops).
 
 ## Data model (reconciled)
 
-Key change (agreed): the primary key becomes `instance_id`, so **datasets that
-differ only by data node are the same dataset**. Everything node-specific moves to
-child tables. This already diverges from ESGF's own model (where the dataset `id`
-embeds the node) — a divergence we accept and will revisit for CMIP5/7 + ESGF-NG.
+Key change (agreed): the version-invariant primary key is `master_id`, so a
+**dataset** is one logical thing and its **versions** live in a child table
+`DatasetVersion`. Everything that varies by version — files, node availability,
+header-only metadata and the parent link — hangs off the *version*, not the dataset.
+This is the same "collapse the duplicated dimension into a child table" move we made
+for data nodes, now applied to versions. It diverges from ESGF's own model (where a
+dataset `id` embeds *both* version and node) — a divergence we accept and will
+revisit for CMIP5/7 + ESGF-NG.
 
 ```mermaid
 erDiagram
     SearchRun ||--o{ RunMembership : records
     SearchRun ||--o{ DatasetChange : computes
-    Dataset ||--o{ DatasetLocation : "served on nodes"
-    Dataset ||--o{ File : "has files"
-    Dataset ||--o| Dataset : "parent_dataset_key"
+    Dataset ||--o{ DatasetVersion : "has versions"
+    DatasetVersion ||--o{ DatasetLocation : "served on nodes"
+    DatasetVersion ||--o{ File : "has files"
+    DatasetVersion ||--o| DatasetVersion : "parent_version_key"
     File ||--o{ FileAccess : "downloadable from"
-    File ||--o| Dataset : "header promoted to"
+    File ||--o| DatasetVersion : "header promoted to"
 
     SearchRun {
         int id PK
@@ -45,13 +50,12 @@ erDiagram
         int num_stored
         string status
         datetime created_at
-        string tag "optional human label (never required)"
+        string tag "optional caller label (never required)"
     }
     Dataset {
-        string instance_id PK "version-specific, node-INdependent"
-        string master_id "version-INdependent; ties versions"
-        string version
-        bool   latest
+        string master_id PK "version- AND node-INdependent"
+        string project
+        string institution_id
         string source_id
         string experiment_id
         string variant_label
@@ -59,39 +63,45 @@ erDiagram
         string table_id
         string grid_label
         string frequency
-        string parent_dataset_key FK "-> Dataset.instance_id (Step 4)"
-        string parent_experiment_id "promoted header-only metadata"
+        string nominal_resolution
+    }
+    DatasetVersion {
+        string instance_id PK "= master_id + version"
+        string dataset_key FK "-> Dataset.master_id"
+        string version "date string; validated parseable to a date, for sorting"
+        bool   is_latest
+        int    size
+        int    number_of_files
+        string parent_version_key FK "-> DatasetVersion.instance_id (Step 4; incl. version)"
+        string parent_experiment_id "declared header-only metadata (from THIS version's file)"
         string parent_variant_label
         string parent_source_id
+        string parent_activity_id
         string branch_time_in_parent
-        string header_from_file_key FK "-> File; provenance of promoted metadata"
+        string header_from_file_key "soft -> File.id; provenance of promoted metadata"
     }
     DatasetLocation {
-        string dataset_key PK "FK -> Dataset.instance_id"
+        string version_key PK "FK -> DatasetVersion.instance_id"
         string data_node PK
         string esgf_dataset_id "the node-specific id (instance_id|node)"
         bool   replica
         string esgf_timestamp "per-node _timestamp"
-        int    size
-        int    number_of_files
-        string raw_json "RAW per-node dataset search doc (answers 'keep the raw result')"
+        string raw_json "RAW per-node dataset search doc (keeps the exact result)"
     }
     File {
-        string file_key PK "surrogate; node-INdependent identity"
-        string dataset_key FK "-> Dataset.instance_id"
-        string filename "title; identical across replicas"
-        string variable_id
-        string table_id
+        int    id PK "surrogate; natural key (version_key, filename)"
+        string version_key FK "-> DatasetVersion.instance_id"
+        string filename "identical across replicas"
         int    size
         string checksum
         string tracking_id
         string header_attrs_json "the file's global attributes ('header-only metadata')"
-        string header_from_access_key FK "-> FileAccess actually read"
+        string header_from_access_key "soft -> FileAccess.id actually read"
         datetime header_read_at
     }
     FileAccess {
-        string access_key PK "surrogate"
-        string file_key FK "-> File"
+        int    id PK "surrogate"
+        int    file_key FK "-> File.id"
         string data_node
         string service "HTTPServer | OPeNDAP | Globus"
         string url
@@ -104,21 +114,58 @@ erDiagram
 
 Notes on identity / grains:
 
-- **`instance_id` = the dataset, minus the node.** A new *version* is a new
-  `instance_id` (a separate dataset row); `master_id` threads versions together.
-- **`DatasetLocation`** is *dataset-search provenance*: it holds the raw per-node
-  dataset doc and per-node dataset facts (`_timestamp`, `replica`), written at
-  Step 1 from the `distrib` search. This is where the raw JSON lives.
-- **`File`** is node-independent (one row per logical file). **`FileAccess`** is the
-  per-node "where can I actually download it" table (fsspec links) — written at
-  Step 2. Node availability therefore exists at two grains that are populated at
-  two different steps (dataset-grain at Step 1, file-grain at Step 2); both are
-  real and neither is derived from the other.
-- The old `DatasetHeader` (simulation-grain) is **retired**: a header physically
-  belongs to a *file*, so it is stored on `File`; the dataset-applicable subset
-  (parent metadata, etc.) is *promoted* onto `Dataset` with a `header_from_file_key`
-  pointer so we always know which file it came from.
+- **`Dataset` (`master_id`) is the version-invariant anchor.** It holds only facets
+  that never change between versions (source, experiment, variant, variable, table,
+  grid, …). `master_id` already encodes all of these — it is the ESGF `instance_id`
+  *minus* the trailing version — so nothing on `Dataset` is duplicated across
+  versions.
+- **`DatasetVersion` (`instance_id`) is one row per published version.** Everything
+  version-specific lives here: the `version` string, `is_latest`, size/file counts,
+  the **parent link** (`parent_version_key`, pointing at the parent's *specific
+  version*), and the **promoted header-only metadata** — because a header is read
+  from a *version's* file, its declared `parent_*` is a property of the version, not
+  of the version-invariant dataset. `version` is validated as parseable to a date
+  (CMIP6 versions are `vYYYYMMDD`) so versions sort chronologically; the current one
+  is flagged `is_latest`.
+- **`DatasetLocation`** now hangs off the *version* (`version_key`): a data node
+  serves a specific version. It holds the raw per-node dataset doc and per-node facts
+  (`_timestamp`, `replica`), written at Step 1. This is where the raw JSON lives.
+- **`File`** (node-independent) and **`FileAccess`** (per-node fsspec URLs) hang off
+  the version too, since files and checksums are version-specific. Node availability
+  exists at two grains — version (`DatasetLocation`, Step 1) and file (`FileAccess`,
+  Step 2) — populated at different steps; both real, neither derived from the other.
+- The old `DatasetHeader` (simulation-grain) is being **retired**: the header goes on
+  `File.header_attrs_json`, and the dataset-applicable subset is *promoted* onto the
+  `DatasetVersion` with a `header_from_file_key` pointer so we always know which file
+  it came from. **Transitional:** `DatasetHeader` is still present and backs the
+  not-yet-migrated header pipeline; it is deleted at the end of Increment D. This
+  keeps every increment green (no test skips, no coverage cliff).
 - `HeaderReadAttempt` and `NodeHealthStat` are unchanged (diagnostics + health).
+- `RunMembership`/`DatasetChange` record which **versions** (`instance_id`) a run
+  returned, so a new version appears as an `added` (and the superseded one as
+  `removed`) — surfacing version changes between two searches of the same spec.
+
+### Soft (non-enforced) pointers — why two links are not FKs
+
+Two provenance links are stored as **indexed plain columns, not foreign keys**:
+`DatasetVersion.header_from_file_key` (-> `File.id`) and `File.header_from_access_key`
+(-> `FileAccess.id`).
+
+- **Why not enforce them?** They would form insert-time cycles — `DatasetVersion`
+  needs a `File` that needs its `DatasetVersion`; `File` needs a `FileAccess` that
+  needs its `File`. A real FK either deadlocks the insert or needs SQLAlchemy
+  `post_update` (insert-then-patch) machinery and awkward cascade ordering.
+- **Why it is safe.** They are provenance ("where this metadata was read from"), not
+  load-bearing for correctness; every write goes through the `Repository`, which
+  keeps them consistent. The promoted metadata can legitimately point at a **sibling
+  version's** file (the cross-variable header-reuse optimisation), which a
+  per-version FK could not model anyway.
+- **Future risk / mitigation.** The only downside is a possible dangling pointer if a
+  `File`/`FileAccess` is deleted; because writes are centralised we re-point or clear
+  it in the same operation. On PostgreSQL these could later become *deferrable* real
+  FKs if we ever want the database-level guarantee. `parent_version_key` (child
+  version -> parent version) stays a real self-referential FK on `DatasetVersion`
+  (adjacency list, no cycle).
 
 ## Workflow
 
@@ -127,8 +174,8 @@ flowchart TD
     subgraph S1["Step 1 - search index node for datasets (SEARCH API - threads)"]
         A1["build queries<br/>UC-simple: all (var,exp)<br/>UC-chain: child experiment only"]
         A2["PARALLEL over queries: client.search (thread pool)"]
-        A3["group results by instance_id"]
-        A4["save: Dataset + DatasetLocation(per node, raw_json)<br/>+ SearchRun/RunMembership"]
+        A3["group results by master_id, then version"]
+        A4["save: Dataset(master) + DatasetVersion(per version)<br/>+ DatasetLocation(per node, raw_json) + SearchRun/RunMembership"]
         A1 --> A2 --> A3 --> A4
     end
 
@@ -141,10 +188,10 @@ flowchart TD
     end
 
     subgraph S3["Step 3 - header-only metadata (DATA NODE byte-range - process pool)"]
-        C0{"cache check:<br/>header already on a<br/>file of this simulation?"}
-        C1["pick ONE file per dataset; rank its FileAccess mirrors"]
+        C0{"cache check:<br/>header already on a file<br/>of this version's simulation?"}
+        C1["pick ONE file per version; rank its FileAccess mirrors"]
         C2["PARALLEL reads: shared worker pool + per-node concurrency caps<br/>(timeout via subprocess, retry, health-aware)"]
-        C3["save header_attrs_json on that File<br/>promote parent_* onto Dataset (header_from_file_key)"]
+        C3["save header_attrs_json on that File<br/>promote parent_* onto DatasetVersion (header_from_file_key)"]
         CH["persist NodeHealthStat + HeaderReadAttempt<br/>(load at start, record per read, save at end)"]
         C0 -- no --> C1 --> C2 --> C3
         C2 --> CH
@@ -152,56 +199,81 @@ flowchart TD
     end
 
     subgraph S4["Step 4 - discover parent, one search per parent (UC-chain ONLY)"]
-        D1["project declared parent from Dataset.parent_* metadata"]
+        P0{"parent specified<br/>(not None)?"}
+        P1["existence gate: one quick search -<br/>does the stopping experiment exist?"]
+        P1E["RAISE: specified parent<br/>experiment does not exist"]
+        D1["project declared parent from DatasetVersion.parent_* metadata"]
         D2["dedupe parents (many children -> one parent) via DB check"]
-        D3{"STOP? parent experiment == stopping experiment<br/>OR header declared 'no_parent' (sentinel fallback)<br/>OR user set parent=None"}
-        D4["PARALLEL over parents: ONE simple search per parent<br/>(no fancy AND/OR)"]
-        D5["save parent dataset + set child.parent_dataset_key"]
-        D1 --> D2 --> D3
-        D3 -- "no (intermediate)" --> D4 --> D5
-        D3 -- "yes (end of chain)" --> D6["end parent: Step 1+2 only<br/>(search API, NO header, NO further hop)"]
+        D4["PARALLEL over parents: ONE simple search per parent (no AND/OR)"]
+        D5["save parent version + set child.parent_version_key"]
+        DS{"reached target?<br/>parent experiment ==<br/>stopping experiment"}
+        DN{"header declares<br/>'no_parent'?"}
+        DE["RAISE: chain reached the top ('no_parent')<br/>without passing through the specified parent"]
+        OK["end of chain: Step 1+2 for this parent<br/>(dataset + files, NO header, NO further hop)"]
+        P0 -- "yes" --> P1
+        P1 -- "missing" --> P1E
+        P1 -- "exists" --> D1
+        P0 -- "no (None)" --> D1
+        D1 --> D2 --> D4 --> D5 --> DS
+        DS -- "yes" --> OK
+        DS -- "no" --> DN
+        DN -- "yes & parent specified" --> DE
+        DN -- "yes & parent None" --> OK
+        DN -- "no (keep walking)" --> D1
     end
 
     S1 --> S2 --> S3
-    S3 -->|UC-simple| DONE["done: Dataset + files + header-only metadata"]
+    S3 -->|UC-simple| DONE["done: Dataset + versions + files + header-only metadata"]
     S3 -->|UC-chain| S4
-    D5 -->|"parent re-enters pipeline"| S2
-    D6 --> DONE2["done: full chain with linked parents"]
+    OK -->|"intermediate parent re-enters pipeline"| S2
+    OK --> DONE2["done: full chain with linked parent versions"]
 ```
 
 ### The parent loop (UC-chain)
 
 A discovered *intermediate* parent re-enters at **Step 2** (add its files) → Step 3
-(read its header, to find *its* parent) → Step 4 (hop again). A discovered parent
-whose experiment is the **stopping** experiment is the end of chain: it gets Step 1
-(it was just searched) + Step 2 (files, so the data is reachable) but **no Step 3
-header read** and **no Step 4** — we never need the final parent's own parent. A
-global visited/DB check means a parent shared by many children is searched once.
+(read its header, to find *its* parent) → Step 4 (hop again). The chain's final
+parent gets Step 1 (it was just searched) + Step 2 (files, so its data is reachable)
+but **no Step 3 header read** and **no Step 4** — we never need the final parent's
+own parent. A global visited/DB check means a parent shared by many children is
+searched once.
 
-**Stop condition (three ways, robust to user error):** the walk stops when
-(a) a discovered parent's `experiment_id` equals the user-declared **stopping
-experiment**; or (b) as a **fallback**, a header declares the CMIP6 `"no parent"`
-sentinel — so a typo in the stopping experiment, or `parent=None`, still terminates
-cleanly at the true top of the tree instead of chasing a non-existent parent; or
-(c) the user explicitly passed `parent=None` (walk to whatever the headers say is
-the top). The sentinel fallback (b) is always active regardless of (a).
+**Stop condition — errors, not warnings.** There are two validation gates and no
+soft warnings:
+
+1. **Existence gate (only when the user specified a parent, i.e. not `None`).**
+   Before walking, do one quick index-node search to confirm the specified stopping
+   experiment *exists at all*. If it does not (e.g. a typo like `picontrole`),
+   **raise immediately** — no walk.
+2. **The walk.**
+   - **`parent=None`** — walk up, following each header's declared parent, and stop
+     when a header declares the CMIP6 `"no parent"` sentinel (the true top). No
+     error; this is the deliberate "go all the way up" case.
+   - **parent specified** — walk up until a discovered parent's `experiment_id`
+     equals the specified stopping experiment → **stop (success)**. If instead the
+     walk reaches `"no parent"` *without ever passing through* the specified
+     experiment (e.g. start `G6solar`, specified parent `ssp119`: both exist in ESGF,
+     but `ssp119` is not on `G6solar`'s chain), **raise** — the specified parent is
+     real but is not an ancestor of the child.
+
+`max_hops` remains a safety net against a metadata cycle (also raising if hit).
 
 ## Per-step function-call map (current -> target)
 
 | Step | Today | Target change | Parallelism |
 |---|---|---|---|
-| 1 search | `client.search_many`, `runner.fetch_records/_dedupe`, `repository.record_run/_upsert_dataset` | group by `instance_id`; write `DatasetLocation` (raw per-node); `SearchRun` keyed on spec, `use_case` gone | thread pool over queries (exists via `map_fn`; scripts must pass `thread_pool_map` — default is `serial_map`) |
+| 1 search | `client.search_many`, `runner.fetch_records/_dedupe`, `repository.record_run/_upsert_dataset` | **Increment B done at `instance_id` grain; being REVISED to `master_id`+`DatasetVersion`:** group by `master_id` then version; write `Dataset` + `DatasetVersion` + `DatasetLocation`; `SearchRun` keyed on spec, `use_case` gone (optional `tag`); membership/diff at version grain | thread pool over queries (exists via `map_fn`; scripts must pass `thread_pool_map` — default is `serial_map`) |
 | 2 files | `enrich_headers._lookup_files` **ORs many `dataset_id`s per request**, `_chunk_ids`, `_search_files_for_ids` bisect | **one `search_files` per dataset**, run through an explicit parallel `MapFn`; save `File` + `FileAccess` immediately; drop the char-budget/bisect machinery | thread pool over datasets (NEW explicit; today it is batched, not per-dataset) |
 | 3 header | `enrich_headers` → `dispatch_reads` → `read_header`; stored in `DatasetHeader` | store on `File`; promote subset to `Dataset`; rename concept to "header-only metadata" | thread pool of workers, per-read subprocess for timeout, per-node concurrency caps (EXISTS — keep) |
-| 4 parent | `parent_hop.declared_parent`, `_locate_missing` **`search_many([...])` batch** | **one simple search per parent**, DB dedupe check, set `parent_dataset_key`; end-of-chain skips header | thread pool over parents (NEW explicit; today batched) |
+| 4 parent | `parent_hop.declared_parent`, `_locate_missing` **`search_many([...])` batch** | **one simple search per parent**, DB dedupe check, set `parent_version_key`; existence gate + "not an ancestor" both **raise**; end-of-chain skips header | thread pool over parents (NEW explicit; today batched) |
 
 ## Answers to the specific questions raised
 
 1. **Where does the raw dataset JSON go?** On `DatasetLocation.raw_json`, one row per
-   `(instance_id, data_node)`. Because `instance_id` collapses nodes but each node
-   returned a *distinct* raw doc, the raw docs are inherently per-node; keeping them
-   here means the exact search result is never lost even though the `Dataset` row is
-   node-independent.
+   `(version, data_node)` (the location hangs off `DatasetVersion`). Each node
+   returned a *distinct* raw doc, so the raw docs are inherently per-node; keeping
+   them here means the exact search result is never lost even though `Dataset`
+   (`master_id`) and `DatasetVersion` are node-independent.
 2. **Can the search API be hit with threads?** Yes — search is HTTP I/O, so a thread
    pool is correct and already the mechanism (`httpx_fetch` + `thread_pool_map`).
    Header reads are the exception: netCDF is not thread-safe and a stalled read must
@@ -224,13 +296,22 @@ the top). The sentinel fallback (b) is always active regardless of (a).
 - **D2 ✅** `File` uses a surrogate key with a natural unique index on
   `(dataset_key, filename)`; `tracking_id` is stored but not the identity.
 - **D3 ✅** `DatasetHeader` (simulation-grain) is retired in favour of
-  `File.header_attrs_json` + promoted `Dataset` columns, preserving the
-  cross-variable reuse optimisation by copying a sibling dataset's promoted metadata.
+  `File.header_attrs_json` + promoted **`DatasetVersion`** columns, preserving the
+  cross-variable reuse optimisation by copying a sibling version's promoted metadata.
 - **D4 ✅** End-of-chain parent gets Step 1 **+ Step 2 (files)** so its data is
   reachable, but **no header read** and no further hop.
-- **D5 ✅** Stop condition = user-declared stopping experiment, **with** the
-  `"no parent"` header sentinel always active as a fallback (robust to a typo or
-  `parent=None`). See "Stop condition" above.
+- **D5 ✅** Stop condition raises **errors, not warnings**: an *existence gate*
+  (raise if a user-specified stopping experiment does not exist on the index node)
+  and a *not-an-ancestor* check (raise if the walk hits `"no parent"` without passing
+  through the specified experiment). `parent=None` walks to the `"no parent"` sentinel
+  with no error. See "Stop condition" above.
+- **D6 ✅** Versions get their own grain: `Dataset` is keyed on **`master_id`** (one
+  row per logical dataset, version-invariant facets only); a new **`DatasetVersion`**
+  child (`instance_id`) holds the `version` (validated date-parseable, for sorting),
+  `is_latest`, counts, the **parent link** (`parent_version_key` -> another
+  `DatasetVersion`) and the promoted header-only metadata. `DatasetLocation`, `File`
+  and `FileAccess` all hang off the **version**. This revises the Increment A/B PK
+  (`instance_id` -> `master_id`).
 
 ## Node health & attempt logging (must persist — do not lose)
 

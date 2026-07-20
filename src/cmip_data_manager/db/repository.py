@@ -4,15 +4,22 @@ Persistence and change-tracking for cached search results
 The `Repository` is the single entry point for writing runs and reading cached
 data.  Recording a run does four things atomically:
 
-1. upsert every returned dataset (`first_seen`/`last_seen` bookkeeping);
+1. group the returned records by their node-independent `instance_key` and upsert
+   one `Dataset` per group, plus one `DatasetLocation` per data node the dataset was
+   served from (`first_seen`/`last_seen` bookkeeping on both);
 2. record exactly which datasets the run returned (`RunMembership`);
-3. diff against the previous run of the same use case (set difference on ids,
-   plus a `_timestamp` comparison for modifications);
+3. diff against the previous run **with the same query spec** (set difference on
+   instance ids, plus a representative `_timestamp` comparison for modifications);
 4. write the resulting `DatasetChange` rows.
 
-Offline search reuses cached entries: `get_dataset_records` returns the datasets
-from the latest run of a use case, which can then be fed to the same aggregation
-code that the online path uses.
+The diff *series* is keyed on the normalised query `spec`, not on any use-case name:
+two runs of the same search form a series.  An optional `tag` labels a run for a
+caller's convenience (e.g. a use-case name) and is what `get_dataset_records` reads
+for the offline path, which reconstructs one `DatasetRecord` per stored location so
+the downstream header pipeline still sees node-specific records.
+
+Header storage still uses the transitional `DatasetHeader` table; it is retired once
+the header-on-file model lands (Increment D).
 """
 
 from __future__ import annotations
@@ -31,19 +38,18 @@ from cmip_data_manager.db.schema import (
     Dataset,
     DatasetChange,
     DatasetHeader,
-    File,
+    DatasetLocation,
     HeaderReadAttempt,
     NodeHealthStat,
-    QueryRun,
     RunMembership,
+    SearchRun,
 )
 from cmip_data_manager.esgf.headers import PROMOTED_ATTRS, HeaderKey, HeaderMetadata
 from cmip_data_manager.esgf.health import NodeHealth, NodeStat
-from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
+from cmip_data_manager.esgf.models import DatasetRecord
 
-_DATASET_SCALARS = (
+_DATASET_FACETS = (
     "master_id",
-    "instance_id",
     "project",
     "source_id",
     "institution_id",
@@ -55,13 +61,17 @@ _DATASET_SCALARS = (
     "grid_label",
     "nominal_resolution",
     "version",
-    "data_node",
+    "latest",
+)
+"""Node-independent columns stored on `Dataset`."""
+
+_LOCATION_SCALARS = (
     "replica",
     "latest",
-    "number_of_files",
     "size",
-    "esgf_timestamp",
+    "number_of_files",
 )
+"""Per-node scalars copied from a record onto its `DatasetLocation`."""
 
 
 @dataclass(frozen=True)
@@ -69,11 +79,16 @@ class RunResult:
     """Summary of a recorded query run and the changes it produced."""
 
     run_id: int
-    use_case: str
     num_found: int
+    """Number of distinct (node-independent) datasets the run returned."""
+
+    tag: str | None = None
+    """The optional caller label recorded on the run."""
+
     added: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     modified: list[str] = field(default_factory=list)
+    """Instance ids added/removed/modified relative to the previous same-spec run."""
 
     @property
     def has_changes(self) -> bool:
@@ -121,7 +136,6 @@ class AttemptSummary:
     """Count of each raw `outcome` value in this group."""
 
 
-# TODO: should we rename this to database or similar?
 class Repository:
     """Read/write access to the local cache of ESGF search results."""
 
@@ -138,42 +152,49 @@ class Repository:
 
     def record_run(
         self,
-        use_case: str,
         records: list[DatasetRecord],
         *,
         endpoint_url: str,
         spec: dict[str, Any],
+        tag: str | None = None,
     ) -> RunResult:
         """
         Store a set of search results as a new run and compute the diff
 
         Parameters
         ----------
-        use_case
-            Name of the use case; diffs are computed against the previous run
-            with the same name.
-
         records
-            Datasets returned by this run.
+            Datasets returned by this run (node-specific; grouped internally by
+            `instance_key`).
 
         endpoint_url
             Endpoint that was queried (recorded for provenance).
 
         spec
-            JSON-serialisable description of the queries (recorded for provenance).
+            JSON-serialisable description of the queries.  Diffs are computed against
+            the previous run with the same normalised `spec`.
+
+        tag
+            Optional label for the run (e.g. a use-case name); read by
+            `get_dataset_records`.  Never used for diffing.
 
         Returns
         -------
         :
-            Summary of the run, including added/removed/modified dataset ids.
+            Summary of the run, including added/removed/modified instance ids.
         """
+        spec_json = json.dumps(spec, sort_keys=True)
+        groups: dict[str, list[DatasetRecord]] = {}
+        for record in records:
+            groups.setdefault(record.instance_key, []).append(record)
+
         with Session(self._engine) as session:
-            run = QueryRun(
-                use_case=use_case,
+            run = SearchRun(
                 endpoint_url=endpoint_url,
-                spec_json=json.dumps(spec, sort_keys=True),
+                spec_json=spec_json,
                 num_found=len(records),
-                num_stored=0,
+                num_stored=len(groups),
+                tag=tag,
             )
             session.add(run)
             session.commit()
@@ -181,89 +202,57 @@ class Repository:
             run_id = run.id
             assert run_id is not None  # noqa: S101 - set by the database
 
-            previous = self._previous_membership(session, use_case, run_id)
-            current = {r.id: r.esgf_timestamp for r in records}
+            previous = self._previous_membership(session, spec_json, run_id)
+            current = {
+                instance: _representative_timestamp(recs)
+                for instance, recs in groups.items()
+            }
 
             added = sorted(set(current) - set(previous))
             removed = sorted(set(previous) - set(current))
             modified = sorted(
-                dsid
-                for dsid in set(current) & set(previous)
-                if current[dsid] != previous[dsid]
+                instance
+                for instance in set(current) & set(previous)
+                if current[instance] != previous[instance]
             )
 
-            for record in records:
-                self._upsert_dataset(session, record, run_id)
+            for instance, recs in groups.items():
+                self._upsert_dataset_and_locations(session, instance, recs, run_id)
             session.flush()
 
-            for record in records:
+            for instance, recs in groups.items():
                 session.add(
                     RunMembership(
                         query_run_id=run_id,
-                        dataset_id=record.id,
-                        esgf_timestamp=record.esgf_timestamp,
+                        dataset_key=instance,
+                        esgf_timestamp=current[instance],
                     )
                 )
-            for dsid in added:
-                session.add(_change(run_id, dsid, "added"))
-            for dsid in removed:
-                session.add(_change(run_id, dsid, "removed"))
-            for dsid in modified:
+            for instance in added:
+                session.add(_change(run_id, instance, "added"))
+            for instance in removed:
+                session.add(_change(run_id, instance, "removed"))
+            for instance in modified:
                 session.add(
                     _change(
                         run_id,
-                        dsid,
+                        instance,
                         "modified",
-                        detail={"old": previous[dsid], "new": current[dsid]},
+                        detail={"old": previous[instance], "new": current[instance]},
                     )
                 )
 
-            run.num_stored = len(records)
             session.add(run)
             session.commit()
 
             return RunResult(
                 run_id=run_id,
-                use_case=use_case,
-                num_found=len(records),
+                num_found=len(groups),
+                tag=tag,
                 added=added,
                 removed=removed,
                 modified=modified,
             )
-
-    def store_files(self, files: list[FileRecord]) -> int:
-        """
-        Upsert files, linking them to their parent datasets
-
-        Files whose parent dataset is not cached are skipped (the foreign key
-        could not be satisfied); store the datasets first.
-
-        Parameters
-        ----------
-        files
-            Files to store.
-
-        Returns
-        -------
-        :
-            Number of files written or updated.
-        """
-        stored = 0
-        with Session(self._engine) as session:
-            for record in files:
-                if session.get(Dataset, record.dataset_id) is None:
-                    continue
-                existing = session.get(File, record.id)
-                data = _file_columns(record)
-                if existing is None:
-                    session.add(File(**data))
-                else:
-                    for key, value in data.items():
-                        setattr(existing, key, value)
-                    session.add(existing)
-                stored += 1
-            session.commit()
-        return stored
 
     def store_headers(self, headers: Mapping[HeaderKey, HeaderMetadata]) -> int:
         """
@@ -272,6 +261,9 @@ class Repository:
         Keys are `(source_id, experiment_id, variant_label, variable_id,
         table_id)`; the promoted `parent_*`/`tracking_id` columns are projected out
         of each header and the full attribute set is kept as JSON.
+
+        Transitional: this writes the `DatasetHeader` table, which is retired once
+        the header-on-file model lands.
 
         Parameters
         ----------
@@ -332,10 +324,9 @@ class Repository:
         """
         Return every cached header for a simulation, across its variables/tables
 
-        This is the seam for a future cross-variable "smart reader": a caller that
-        wants `rsut` but has only ever read `tas` for the same `(source_id,
-        experiment_id, variant_label)` can find the existing header here instead of
-        re-reading.
+        This is the seam for a cross-variable "smart reader": a caller that wants
+        `rsut` but has only ever read `tas` for the same `(source_id, experiment_id,
+        variant_label)` can find the existing header here instead of re-reading.
 
         Parameters
         ----------
@@ -603,26 +594,28 @@ class Repository:
         ]
         return sorted(summaries, key=lambda s: (-s.attempts, s.key))
 
-    def get_dataset_records(self, use_case: str) -> list[DatasetRecord]:
+    def get_dataset_records(self, tag: str) -> list[DatasetRecord]:
         """
-        Return the datasets from the latest cached run of a use case
+        Return the datasets from the latest run with a given tag
 
         This is the offline search path: results are read straight from the
-        database with no network access.
+        database with no network access.  Each stored dataset is expanded back into
+        one `DatasetRecord` per `DatasetLocation`, so the caller sees the same
+        node-specific records the online search produced.
 
         Parameters
         ----------
-        use_case
-            Use case whose latest run should be read.
+        tag
+            Run label to look up (e.g. a use-case name).
 
         Returns
         -------
         :
-            The datasets that run returned, as `DatasetRecord`s.  Empty if the
-            use case has never been run.
+            The datasets that run returned, as `DatasetRecord`s (one per location).
+            Empty if no run carries that tag.
         """
         with Session(self._engine) as session:
-            run = self._latest_run(session, use_case)
+            run = self._latest_run(session, tag)
             if run is None:
                 return []
             memberships = session.exec(
@@ -630,9 +623,16 @@ class Repository:
             ).all()
             records: list[DatasetRecord] = []
             for membership in memberships:
-                dataset = session.get(Dataset, membership.dataset_id)
-                if dataset is not None:
-                    records.append(_record_from_dataset(dataset))
+                dataset = session.get(Dataset, membership.dataset_key)
+                if dataset is None:
+                    continue
+                locations = session.exec(
+                    select(DatasetLocation).where(
+                        DatasetLocation.dataset_key == membership.dataset_key
+                    )
+                ).all()
+                for location in locations:
+                    records.append(_record_from_location(dataset, location))
             return records
 
     def get_changes(self, run_id: int) -> list[DatasetChange]:
@@ -659,39 +659,72 @@ class Repository:
             )
 
     def _previous_membership(
-        self, session: Session, use_case: str, run_id: int
+        self, session: Session, spec_json: str, run_id: int
     ) -> dict[str, str | None]:
-        """Return `{dataset_id: timestamp}` for the previous run of a use case."""
+        """Return `{instance_id: timestamp}` for the previous run of the same spec."""
         previous_run = session.exec(
-            select(QueryRun)
-            .where(QueryRun.use_case == use_case, QueryRun.id != run_id)
-            .order_by(col(QueryRun.id).desc())
+            select(SearchRun)
+            .where(SearchRun.spec_json == spec_json, SearchRun.id != run_id)
+            .order_by(col(SearchRun.id).desc())
         ).first()
         if previous_run is None:
             return {}
         memberships = session.exec(
             select(RunMembership).where(RunMembership.query_run_id == previous_run.id)
         ).all()
-        return {m.dataset_id: m.esgf_timestamp for m in memberships}
+        return {m.dataset_key: m.esgf_timestamp for m in memberships}
 
-    def _latest_run(self, session: Session, use_case: str) -> QueryRun | None:
-        """Return the most recent run for a use case, if any."""
+    def _latest_run(self, session: Session, tag: str) -> SearchRun | None:
+        """Return the most recent run carrying a tag, if any."""
         return session.exec(
-            select(QueryRun)
-            .where(QueryRun.use_case == use_case)
-            .order_by(col(QueryRun.id).desc())
+            select(SearchRun)
+            .where(SearchRun.tag == tag)
+            .order_by(col(SearchRun.id).desc())
         ).first()
 
-    def _upsert_dataset(
-        self, session: Session, record: DatasetRecord, run_id: int
+    def _upsert_dataset_and_locations(
+        self,
+        session: Session,
+        instance: str,
+        records: Sequence[DatasetRecord],
+        run_id: int,
     ) -> None:
-        """Insert or update a dataset, maintaining first/last-seen bookkeeping."""
-        columns = _dataset_columns(record)
-        existing = session.get(Dataset, record.id)
+        """Upsert one dataset and each data node it was served from."""
+        facets = _dataset_columns(records[0])
+        existing = session.get(Dataset, instance)
         if existing is None:
             session.add(
                 Dataset(
-                    id=record.id,
+                    instance_id=instance,
+                    first_seen_run_id=run_id,
+                    last_seen_run_id=run_id,
+                    **facets,
+                )
+            )
+        else:
+            for key, value in facets.items():
+                setattr(existing, key, value)
+            existing.last_seen_run_id = run_id
+            session.add(existing)
+
+        for record in records:
+            self._upsert_location(session, instance, record, run_id)
+
+    def _upsert_location(
+        self,
+        session: Session,
+        instance: str,
+        record: DatasetRecord,
+        run_id: int,
+    ) -> None:
+        """Upsert the per-node location row for one record."""
+        columns = _location_columns(record)
+        existing = session.get(DatasetLocation, (instance, record.node_key))
+        if existing is None:
+            session.add(
+                DatasetLocation(
+                    dataset_key=instance,
+                    data_node=record.node_key,
                     first_seen_run_id=run_id,
                     last_seen_run_id=run_id,
                     **columns,
@@ -704,33 +737,62 @@ class Repository:
         session.add(existing)
 
 
+def _representative_timestamp(records: Sequence[DatasetRecord]) -> str | None:
+    """Pick a dataset's representative `_timestamp` (the latest across its nodes)."""
+    stamps = [r.esgf_timestamp for r in records if r.esgf_timestamp is not None]
+    return max(stamps) if stamps else None
+
+
 def _change(
     run_id: int,
-    dataset_id: str,
+    dataset_key: str,
     change_type: str,
     detail: dict[str, Any] | None = None,
 ) -> DatasetChange:
     """Build a `DatasetChange` row (serialising `detail` to JSON if given)."""
     return DatasetChange(
         query_run_id=run_id,
-        dataset_id=dataset_id,
+        dataset_key=dataset_key,
         change_type=change_type,
         detail_json=None if detail is None else json.dumps(detail),
     )
 
 
 def _dataset_columns(record: DatasetRecord) -> dict[str, Any]:
-    """Return the storable columns of a dataset record (excluding the id)."""
-    columns: dict[str, Any] = {name: getattr(record, name) for name in _DATASET_SCALARS}
+    """Return the node-independent columns of a dataset record."""
+    return {name: getattr(record, name) for name in _DATASET_FACETS}
+
+
+def _location_columns(record: DatasetRecord) -> dict[str, Any]:
+    """Return the per-node columns for a record's location row."""
+    columns: dict[str, Any] = {
+        name: getattr(record, name) for name in _LOCATION_SCALARS
+    }
+    columns["esgf_dataset_id"] = record.id
+    columns["esgf_timestamp"] = record.esgf_timestamp
     columns["raw_json"] = json.dumps(record.raw, sort_keys=True)
     return columns
 
 
-def _record_from_dataset(dataset: Dataset) -> DatasetRecord:
-    """Rebuild a `DatasetRecord` from a stored dataset row."""
-    raw = json.loads(dataset.raw_json) if dataset.raw_json else {}
-    scalars = {name: getattr(dataset, name) for name in _DATASET_SCALARS}
-    return DatasetRecord(id=dataset.id, raw=raw, **scalars)
+def _record_from_location(dataset: Dataset, location: DatasetLocation) -> DatasetRecord:
+    """Rebuild a node-specific `DatasetRecord` from a stored dataset + location."""
+    raw = json.loads(location.raw_json) if location.raw_json else {}
+    facets = {name: getattr(dataset, name) for name in _DATASET_FACETS}
+    dataset_id = (
+        location.esgf_dataset_id or f"{dataset.instance_id}|{location.data_node}"
+    )
+    return DatasetRecord(
+        id=dataset_id,
+        instance_id=dataset.instance_id,
+        data_node=location.data_node,
+        replica=location.replica,
+        size=location.size,
+        number_of_files=location.number_of_files,
+        esgf_timestamp=location.esgf_timestamp,
+        raw=raw,
+        **{k: v for k, v in facets.items() if k != "latest"},
+        latest=location.latest if location.latest is not None else dataset.latest,
+    )
 
 
 def _header_columns(metadata: HeaderMetadata) -> dict[str, Any]:
@@ -784,21 +846,3 @@ def _stat_from_row(row: NodeHealthStat) -> NodeStat:
         max_safe_concurrency=row.max_safe_concurrency,
         last_concurrency=row.last_concurrency,
     )
-
-
-def _file_columns(record: FileRecord) -> dict[str, Any]:
-    """Return the storable columns of a file record (including the id)."""
-    return {
-        "id": record.id,
-        "dataset_key": record.dataset_id,
-        "dataset_id": record.dataset_id,
-        "title": record.title,
-        "size": record.size,
-        "checksum": record.checksum,
-        "checksum_type": record.checksum_type,
-        "tracking_id": record.tracking_id,
-        "variable_id": record.variable_id,
-        "urls_json": json.dumps(list(record.urls)),
-        "esgf_timestamp": record.esgf_timestamp,
-        "raw_json": json.dumps(record.raw, sort_keys=True),
-    }
