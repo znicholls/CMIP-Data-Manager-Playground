@@ -33,9 +33,10 @@ from cmip_data_manager.search import (
     ParentResolver,
     ParentSpec,
     UseCase,
+    add_files,
     build_cells,
     discover_experiments,
-    enrich_headers,
+    enrich_version_headers,
     pairs_all_experiments,
     pairs_any_experiment,
     per_variable_experiment,
@@ -70,8 +71,8 @@ HEADER_MAX_WORKERS = 12
 HEADER_NODE_CONCURRENCY = 2
 """Default cap on simultaneous reads to a single data node (conservative)."""
 
-HEADER_NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
-"""Per-node caps overriding the default (NCI tolerates more, and is fast)."""
+FILE_SEARCH_WORKERS = 8
+"""Parallel per-version file searches in the Step-2 `add_files` pass (HTTP I/O)."""
 
 IGNORE_HOSTS: frozenset[str] = frozenset(
     {
@@ -366,21 +367,31 @@ def main() -> None:
                 f"parent-metadata conflicts (skipped): {len(result.parent_conflicts)}"
             )
         if ENRICH_HEADERS and SOURCE == "api" and use_case.name == "uc1_tas_ssp245":
-            outcome = enrich_headers(
+            # Step 2: store each version's files, then Step 3: read + promote headers.
+            files = add_files(
                 result.records,
                 client=client,
+                repository=repository,
+                map_fn=thread_pool_map(max_workers=FILE_SEARCH_WORKERS),
+            )
+            print(
+                "file search: "
+                f"searched={files.searched} skipped_cached={files.skipped_cached} "
+                f"files_stored={files.files_stored} overflowed={len(files.overflowed)}"
+            )
+            outcome = enrich_version_headers(
+                result.records,
                 repository=repository,
                 preferred_hosts=PREFERRED_HOSTS,
                 ignore_hosts=IGNORE_HOSTS,
                 max_workers=HEADER_MAX_WORKERS,
                 node_concurrency=HEADER_NODE_CONCURRENCY,
-                node_concurrency_overrides=HEADER_NODE_CONCURRENCY_OVERRIDES,
             )
             print(
                 "header enrichment: "
                 f"read={outcome.read} reused={outcome.reused} "
-                f"stored={outcome.stored} skipped_cached={outcome.skipped_cached} "
-                f"failed={len(outcome.failed)}"
+                f"promoted={outcome.promoted} skipped_cached={outcome.skipped_cached} "
+                f"failed={len(outcome.failed)} no_files={len(outcome.no_files)}"
             )
 
         if result.matches is None:

@@ -4,12 +4,12 @@ Persistence and change-tracking for cached search results
 The `Repository` is the single entry point for writing runs and reading cached
 data.  Recording a run does four things atomically:
 
-1. group the returned records by their node-independent `instance_key` and upsert
-   one `Dataset` per group, plus one `DatasetLocation` per data node the dataset was
-   served from (`first_seen`/`last_seen` bookkeeping on both);
-2. record exactly which datasets the run returned (`RunMembership`);
+1. group the returned records `master_id -> version (instance_id) -> data node`, and
+   upsert one `Dataset` per master, one `DatasetVersion` per version, and one
+   `DatasetNodeSpecificInfo` per data node (`first_seen`/`last_seen` bookkeeping);
+2. record exactly which *versions* the run returned (`RunMembership`);
 3. diff against the previous run **with the same query spec** (set difference on
-   instance ids, plus a representative `_timestamp` comparison for modifications);
+   version ids, plus a representative `_timestamp` comparison for modifications);
 4. write the resulting `DatasetChange` rows.
 
 The diff *series* is keyed on the normalised query `spec`, not on any use-case name:
@@ -18,8 +18,8 @@ caller's convenience (e.g. a use-case name) and is what `get_dataset_records` re
 for the offline path, which reconstructs one `DatasetRecord` per stored location so
 the downstream header pipeline still sees node-specific records.
 
-Header storage still uses the transitional `DatasetHeader` table; it is retired once
-the header-on-file model lands (Increment D).
+Header-only metadata is stored on `File.header_attrs_json` and the dataset-applicable
+subset promoted onto each `DatasetVersion` (see `store_files`/`promote_header`).
 """
 
 from __future__ import annotations
@@ -37,19 +37,27 @@ from sqlmodel import Session, col, select
 from cmip_data_manager.db.schema import (
     Dataset,
     DatasetChange,
-    DatasetHeader,
-    DatasetLocation,
+    DatasetNodeSpecificInfo,
+    DatasetVersion,
+    File,
+    FileAccess,
     HeaderReadAttempt,
     NodeHealthStat,
     RunMembership,
     SearchRun,
+    parse_version_date,
 )
-from cmip_data_manager.esgf.headers import PROMOTED_ATTRS, HeaderKey, HeaderMetadata
+from cmip_data_manager.esgf.headers import (
+    HTTP_SERVICE,
+    HeaderMetadata,
+    https_twin,
+)
 from cmip_data_manager.esgf.health import NodeHealth, NodeStat
-from cmip_data_manager.esgf.models import DatasetRecord
+from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
+# QUESTION: Is this an area that we may need to specify
+# shared/re-written facets for project/esgf integration?
 _DATASET_FACETS = (
-    "master_id",
     "project",
     "source_id",
     "institution_id",
@@ -60,18 +68,19 @@ _DATASET_FACETS = (
     "table_id",
     "grid_label",
     "nominal_resolution",
-    "version",
-    "latest",
 )
-"""Node-independent columns stored on `Dataset`."""
+"""Version-invariant columns stored on `Dataset` (keyed on `master_id`)."""
 
-_LOCATION_SCALARS = (
-    "replica",
-    "latest",
-    "size",
-    "number_of_files",
+# QUESTION: see above - called the same? Not version promoted for
+# CMIP7 (part of index node search not header data)
+_VERSION_PROMOTED = (
+    "parent_source_id",
+    "parent_experiment_id",
+    "parent_variant_label",
+    "parent_activity_id",
+    "branch_time_in_parent",
 )
-"""Per-node scalars copied from a record onto its `DatasetLocation`."""
+"""Header-only attributes promoted from a file's header onto its `DatasetVersion`."""
 
 
 @dataclass(frozen=True)
@@ -80,7 +89,7 @@ class RunResult:
 
     run_id: int
     num_found: int
-    """Number of distinct (node-independent) datasets the run returned."""
+    """Number of distinct (version- and node-independent) datasets the run returned."""
 
     tag: str | None = None
     """The optional caller label recorded on the run."""
@@ -88,7 +97,7 @@ class RunResult:
     added: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     modified: list[str] = field(default_factory=list)
-    """Instance ids added/removed/modified relative to the previous same-spec run."""
+    """Version ids added/removed/modified relative to the previous same-spec run."""
 
     @property
     def has_changes(self) -> bool:
@@ -101,8 +110,8 @@ class HeaderAttempt:
     """
     One header-read attempt to persist to the `HeaderReadAttempt` log
 
-    The write-side counterpart of the schema row: `enrich_headers` builds these
-    from the `AttemptLog` (joining each URL back to its simulation, host and
+    The write-side counterpart of the schema row: `enrich_version_headers` builds
+    these from the `AttemptLog` (joining each URL back to its simulation, host and
     variable) and hands them to `record_header_attempts`.
     """
 
@@ -164,12 +173,13 @@ class Repository:
         Parameters
         ----------
         records
-            Datasets returned by this run (node-specific; grouped internally by
-            `instance_key`).
+            Datasets returned by this run (node-specific; grouped internally into
+            `master_id -> version -> data node`).
 
         endpoint_url
             Endpoint that was queried (recorded for provenance).
 
+        # QUESTION : What is this doing? Where does the spec get written? By user?
         spec
             JSON-serialisable description of the queries.  Diffs are computed against
             the previous run with the same normalised `spec`.
@@ -181,19 +191,21 @@ class Repository:
         Returns
         -------
         :
-            Summary of the run, including added/removed/modified instance ids.
+            Summary of the run, including added/removed/modified version ids.
         """
         spec_json = json.dumps(spec, sort_keys=True)
-        groups: dict[str, list[DatasetRecord]] = {}
+        # master_id -> instance_id (version) -> the records on each data node
+        structure: dict[str, dict[str, list[DatasetRecord]]] = {}
         for record in records:
-            groups.setdefault(record.instance_key, []).append(record)
+            versions = structure.setdefault(record.master_key, {})
+            versions.setdefault(record.instance_key, []).append(record)
 
         with Session(self._engine) as session:
             run = SearchRun(
                 endpoint_url=endpoint_url,
                 spec_json=spec_json,
                 num_found=len(records),
-                num_stored=len(groups),
+                num_stored=len(structure),
                 tag=tag,
             )
             session.add(run)
@@ -203,42 +215,49 @@ class Repository:
             assert run_id is not None  # noqa: S101 - set by the database
 
             previous = self._previous_membership(session, spec_json, run_id)
-            current = {
-                instance: _representative_timestamp(recs)
-                for instance, recs in groups.items()
+            current: dict[str, str | None] = {
+                version: _representative_timestamp(recs)
+                for versions in structure.values()
+                for version, recs in versions.items()
             }
 
             added = sorted(set(current) - set(previous))
             removed = sorted(set(previous) - set(current))
             modified = sorted(
-                instance
-                for instance in set(current) & set(previous)
-                if current[instance] != previous[instance]
+                version
+                for version in set(current) & set(previous)
+                if current[version] != previous[version]
             )
 
-            for instance, recs in groups.items():
-                self._upsert_dataset_and_locations(session, instance, recs, run_id)
+            for master, versions in structure.items():
+                self._upsert_dataset(
+                    session, master, next(iter(versions.values()))[0], run_id
+                )
+                for version, vrecs in versions.items():
+                    self._upsert_version(session, master, version, vrecs, run_id)
+                    for record in vrecs:
+                        self._upsert_location(session, version, record, run_id)
             session.flush()
 
-            for instance, recs in groups.items():
+            for version, timestamp in current.items():
                 session.add(
                     RunMembership(
                         query_run_id=run_id,
-                        dataset_key=instance,
-                        esgf_timestamp=current[instance],
+                        version_key=version,
+                        esgf_timestamp=timestamp,
                     )
                 )
-            for instance in added:
-                session.add(_change(run_id, instance, "added"))
-            for instance in removed:
-                session.add(_change(run_id, instance, "removed"))
-            for instance in modified:
+            for version in added:
+                session.add(_change(run_id, version, "added"))
+            for version in removed:
+                session.add(_change(run_id, version, "removed"))
+            for version in modified:
                 session.add(
                     _change(
                         run_id,
-                        instance,
+                        version,
                         "modified",
-                        detail={"old": previous[instance], "new": current[instance]},
+                        detail={"old": previous[version], "new": current[version]},
                     )
                 )
 
@@ -247,107 +266,12 @@ class Repository:
 
             return RunResult(
                 run_id=run_id,
-                num_found=len(groups),
+                num_found=len(structure),
                 tag=tag,
                 added=added,
                 removed=removed,
                 modified=modified,
             )
-
-    def store_headers(self, headers: Mapping[HeaderKey, HeaderMetadata]) -> int:
-        """
-        Upsert cached header metadata, one row per dataset key
-
-        Keys are `(source_id, experiment_id, variant_label, variable_id,
-        table_id)`; the promoted `parent_*`/`tracking_id` columns are projected out
-        of each header and the full attribute set is kept as JSON.
-
-        Transitional: this writes the `DatasetHeader` table, which is retired once
-        the header-on-file model lands.
-
-        Parameters
-        ----------
-        headers
-            Mapping of dataset key to the header read for it.
-
-        Returns
-        -------
-        :
-            Number of header rows written or updated.
-        """
-        stored = 0
-        with Session(self._engine) as session:
-            for key, metadata in headers.items():
-                columns = _header_columns(metadata)
-                existing = session.get(DatasetHeader, key)
-                if existing is None:
-                    source_id, experiment_id, variant_label, variable_id, table_id = key
-                    session.add(
-                        DatasetHeader(
-                            source_id=source_id,
-                            experiment_id=experiment_id,
-                            variant_label=variant_label,
-                            variable_id=variable_id,
-                            table_id=table_id,
-                            **columns,
-                        )
-                    )
-                else:
-                    for column, value in columns.items():
-                        setattr(existing, column, value)
-                    session.add(existing)
-                stored += 1
-            session.commit()
-        return stored
-
-    def get_header(self, key: HeaderKey) -> HeaderMetadata | None:
-        """
-        Return the cached header for one dataset key, or `None` if absent
-
-        Parameters
-        ----------
-        key
-            `(source_id, experiment_id, variant_label, variable_id, table_id)`.
-
-        Returns
-        -------
-        :
-            The stored header, or `None`.
-        """
-        with Session(self._engine) as session:
-            row = session.get(DatasetHeader, key)
-            return None if row is None else _metadata_from_header(row)
-
-    def get_simulation_headers(
-        self, source_id: str, experiment_id: str, variant_label: str
-    ) -> list[HeaderMetadata]:
-        """
-        Return every cached header for a simulation, across its variables/tables
-
-        This is the seam for a cross-variable "smart reader": a caller that wants
-        `rsut` but has only ever read `tas` for the same `(source_id, experiment_id,
-        variant_label)` can find the existing header here instead of re-reading.
-
-        Parameters
-        ----------
-        source_id, experiment_id, variant_label
-            The simulation to look up.
-
-        Returns
-        -------
-        :
-            The stored headers for that simulation (any variable/table); empty if
-            none have been read.
-        """
-        with Session(self._engine) as session:
-            rows = session.exec(
-                select(DatasetHeader).where(
-                    DatasetHeader.source_id == source_id,
-                    DatasetHeader.experiment_id == experiment_id,
-                    DatasetHeader.variant_label == variant_label,
-                )
-            ).all()
-            return [_metadata_from_header(row) for row in rows]
 
     def save_node_health(self, health: NodeHealth) -> int:
         """
@@ -599,8 +523,8 @@ class Repository:
         Return the datasets from the latest run with a given tag
 
         This is the offline search path: results are read straight from the
-        database with no network access.  Each stored dataset is expanded back into
-        one `DatasetRecord` per `DatasetLocation`, so the caller sees the same
+        database with no network access.  Each stored version is expanded back into
+        one `DatasetRecord` per `DatasetNodeSpecificInfo`, so the caller sees the same
         node-specific records the online search produced.
 
         Parameters
@@ -623,16 +547,19 @@ class Repository:
             ).all()
             records: list[DatasetRecord] = []
             for membership in memberships:
-                dataset = session.get(Dataset, membership.dataset_key)
+                version = session.get(DatasetVersion, membership.version_key)
+                if version is None:
+                    continue
+                dataset = session.get(Dataset, version.dataset_key)
                 if dataset is None:
                     continue
                 locations = session.exec(
-                    select(DatasetLocation).where(
-                        DatasetLocation.dataset_key == membership.dataset_key
+                    select(DatasetNodeSpecificInfo).where(
+                        DatasetNodeSpecificInfo.version_key == membership.version_key
                     )
                 ).all()
                 for location in locations:
-                    records.append(_record_from_location(dataset, location))
+                    records.append(_record_from(dataset, version, location))
             return records
 
     def get_changes(self, run_id: int) -> list[DatasetChange]:
@@ -658,10 +585,306 @@ class Repository:
                 ).all()
             )
 
+    def version_has_files(self, version_key: str) -> bool:
+        """
+        Whether any files are already cached for a dataset version
+
+        The Step-2 cache check: a version whose files are already stored is skipped
+        rather than re-searched.
+
+        Parameters
+        ----------
+        version_key
+            The `DatasetVersion.instance_id` to check.
+
+        Returns
+        -------
+        :
+            `True` if at least one `File` row exists for the version.
+        """
+        with Session(self._engine) as session:
+            return (
+                session.exec(
+                    select(File.id).where(File.version_key == version_key)
+                ).first()
+                is not None
+            )
+
+    def get_version_files(self, version_key: str) -> list[File]:
+        """
+        Return the stored files (with their access options) for a dataset version
+
+        Parameters
+        ----------
+        version_key
+            The `DatasetVersion.instance_id` to look up.
+
+        Returns
+        -------
+        :
+            The `File` rows for the version, each with its `accesses` loaded; empty
+            if none are stored.
+        """
+        with Session(self._engine) as session:
+            files = session.exec(
+                select(File).where(File.version_key == version_key)
+            ).all()
+            for file in files:
+                _ = file.accesses  # load the relationship before the session closes
+            return list(files)
+
+    def latest_version_for(  # noqa: PLR0913 - a dataset is identified by its facets
+        self,
+        source_id: str,
+        experiment_id: str,
+        variant_label: str,
+        variable_id: str | None,
+        table_id: str | None = None,
+        grid_label: str | None = None,
+    ) -> str | None:
+        """
+        Return the latest stored version id for a dataset identified by its facets
+
+        Used to resolve a child version's parent *version* once the parent
+        simulation has been searched and stored: the parent dataset matching the
+        child's `variable_id` (and, when given, `table_id`/`grid_label`) is looked
+        up and its newest version returned.  "Newest" is the lexicographically
+        greatest `version` (CMIP6 `vYYYYMMDD` dates sort chronologically).
+
+        Parameters
+        ----------
+        source_id, experiment_id, variant_label, variable_id
+            The dataset facets to match.
+
+        table_id, grid_label
+            Optional further facets to disambiguate.
+
+        Returns
+        -------
+        :
+            The matching `DatasetVersion.instance_id`, or `None` if none is stored.
+        """
+        statement = select(DatasetVersion.instance_id).where(
+            DatasetVersion.dataset_key == Dataset.master_id,
+            Dataset.source_id == source_id,
+            Dataset.experiment_id == experiment_id,
+            Dataset.variant_label == variant_label,
+            Dataset.variable_id == variable_id,
+        )
+        if table_id is not None:
+            statement = statement.where(Dataset.table_id == table_id)
+        if grid_label is not None:
+            statement = statement.where(Dataset.grid_label == grid_label)
+        statement = statement.order_by(col(DatasetVersion.version).desc())
+        with Session(self._engine) as session:
+            return session.exec(statement).first()
+
+    def set_parent_version(
+        self, child_version_key: str, parent_version_key: str
+    ) -> None:
+        """
+        Link a child dataset version to its parent version
+
+        Sets `DatasetVersion.parent_version_key` (the real self-referential FK) on
+        the child, recording the resolved child -> parent-version edge.
+
+        Parameters
+        ----------
+        child_version_key
+            The child `DatasetVersion.instance_id`.
+
+        parent_version_key
+            The parent `DatasetVersion.instance_id` to link to.
+        """
+        with Session(self._engine) as session:
+            version = session.get(DatasetVersion, child_version_key)
+            if version is None:
+                return
+            version.parent_version_key = parent_version_key
+            session.add(version)
+            session.commit()
+
+    def version_has_header(self, version_key: str) -> bool:
+        """Whether a version already has header-only metadata promoted onto it."""
+        with Session(self._engine) as session:
+            version = session.get(DatasetVersion, version_key)
+            return version is not None and version.header_from_file_key is not None
+
+    def version_header_file_id(self, version_key: str) -> int | None:
+        """Return the `File.id` a version's promoted header was read from, if any."""
+        with Session(self._engine) as session:
+            version = session.get(DatasetVersion, version_key)
+            return None if version is None else version.header_from_file_key
+
+    def version_header(self, version_key: str) -> HeaderMetadata | None:
+        """
+        Return the header-only metadata promoted onto a dataset version, if any
+
+        Reconstructs a `HeaderMetadata` from the `File` the version's
+        `header_from_file_key` points at (its full `header_attrs_json`), with the
+        `source_url` recovered from that file's recorded access.  Header lookup is
+        keyed at the version grain.
+
+        Parameters
+        ----------
+        version_key
+            The `DatasetVersion.instance_id` to look up.
+
+        Returns
+        -------
+        :
+            The stored header, or `None` if none has been read for the version.
+        """
+        with Session(self._engine) as session:
+            version = session.get(DatasetVersion, version_key)
+            if version is None or version.header_from_file_key is None:
+                return None
+            file = session.get(File, version.header_from_file_key)
+            if file is None or file.header_attrs_json is None:
+                return None
+            attrs = json.loads(file.header_attrs_json)
+            source_url: str | None = None
+            if file.header_from_access_key is not None:
+                access = session.get(FileAccess, file.header_from_access_key)
+                source_url = access.url if access is not None else None
+            return HeaderMetadata(attrs=attrs, source_url=source_url)
+
+    def promote_header(
+        self,
+        *,
+        file_id: int,
+        source_url: str | None,
+        attrs: Mapping[str, str],
+        version_keys: Sequence[str],
+    ) -> int:
+        """
+        Store a header on the file it was read from and promote it onto versions
+
+        Writes the full header onto `File.header_attrs_json` (with the access it came
+        from and the read time), then, for each version in `version_keys`, sets
+        `header_from_file_key` to that file and copies the promoted `parent_*` subset
+        onto the version.  The file may belong to a *sibling* version of the
+        simulation (the cross-variable header-reuse case), which is why the pointer
+        is soft.
+
+        Parameters
+        ----------
+        file_id
+            The `File.id` the header was read from.
+
+        source_url
+            The exact URL read, used to record which access served the header.
+
+        attrs
+            The header's global attributes.
+
+        version_keys
+            The versions to promote the header-only metadata onto.
+
+        Returns
+        -------
+        :
+            Number of versions promoted.
+        """
+        with Session(self._engine) as session:
+            file = session.get(File, file_id)
+            if file is None:
+                return 0
+            file.header_attrs_json = json.dumps(dict(attrs), sort_keys=True)
+            file.header_read_at = datetime.now(timezone.utc)
+            file.header_from_access_key = _access_id_for_url(
+                session, file_id, source_url
+            )
+            session.add(file)
+            promoted = 0
+            for version_key in version_keys:
+                version = session.get(DatasetVersion, version_key)
+                if version is None:
+                    continue
+                version.header_from_file_key = file_id
+                for attr in _VERSION_PROMOTED:
+                    setattr(version, attr, attrs.get(attr))
+                session.add(version)
+                promoted += 1
+            session.commit()
+        return promoted
+
+    def store_files(self, files_by_version: Mapping[str, Sequence[FileRecord]]) -> int:
+        """
+        Upsert files and their per-node access options for dataset versions
+
+        One `File` row per logical file (keyed by `(version_key, filename)`, so a
+        file served from several nodes collapses to one row) and one `FileAccess`
+        row per distinct access URL (the per-node download options, with an
+        fsspec-openable form for `HTTPServer` URLs).  Files whose version is not
+        cached are skipped (the foreign key could not be satisfied); store the
+        datasets first.
+
+        Parameters
+        ----------
+        files_by_version
+            Mapping of `DatasetVersion.instance_id` to the file records found for it.
+
+        Returns
+        -------
+        :
+            Number of `File` rows written or updated.
+        """
+        stored = 0
+        with Session(self._engine) as session:
+            for version_key, records in files_by_version.items():
+                if session.get(DatasetVersion, version_key) is None:
+                    continue
+                by_filename: dict[str, list[FileRecord]] = {}
+                for record in records:
+                    by_filename.setdefault(record.title or record.id, []).append(record)
+                for filename, frecs in by_filename.items():
+                    self._upsert_file(session, version_key, filename, frecs)
+                    stored += 1
+            session.commit()
+        return stored
+
+    def _upsert_file(
+        self,
+        session: Session,
+        version_key: str,
+        filename: str,
+        records: Sequence[FileRecord],
+    ) -> None:
+        """Upsert one logical file and its access options across nodes."""
+        columns = _file_columns(records[0])
+        file = session.exec(
+            select(File).where(
+                File.version_key == version_key, File.filename == filename
+            )
+        ).first()
+        if file is None:
+            file = File(version_key=version_key, filename=filename, **columns)
+            session.add(file)
+            session.flush()
+        else:
+            for key, value in columns.items():
+                setattr(file, key, value)
+            session.add(file)
+        file_id = file.id
+        assert file_id is not None  # noqa: S101 - set by the flush/load above
+
+        existing = {access.url: access for access in file.accesses}
+        added: set[str | None] = set()
+        for record in records:
+            for access in _access_columns(record):
+                url = access["url"]
+                if url in existing:
+                    for key, value in access.items():
+                        setattr(existing[url], key, value)
+                elif url not in added:
+                    session.add(FileAccess(file_id=file_id, **access))
+                    added.add(url)
+
     def _previous_membership(
         self, session: Session, spec_json: str, run_id: int
     ) -> dict[str, str | None]:
-        """Return `{instance_id: timestamp}` for the previous run of the same spec."""
+        """Return `{version_id: timestamp}` for the previous run of the same spec."""
         previous_run = session.exec(
             select(SearchRun)
             .where(SearchRun.spec_json == spec_json, SearchRun.id != run_id)
@@ -672,7 +895,7 @@ class Repository:
         memberships = session.exec(
             select(RunMembership).where(RunMembership.query_run_id == previous_run.id)
         ).all()
-        return {m.dataset_key: m.esgf_timestamp for m in memberships}
+        return {m.version_key: m.esgf_timestamp for m in memberships}
 
     def _latest_run(self, session: Session, tag: str) -> SearchRun | None:
         """Return the most recent run carrying a tag, if any."""
@@ -682,48 +905,84 @@ class Repository:
             .order_by(col(SearchRun.id).desc())
         ).first()
 
-    def _upsert_dataset_and_locations(
+    def _upsert_dataset(
         self,
         session: Session,
-        instance: str,
-        records: Sequence[DatasetRecord],
+        master: str,
+        record: DatasetRecord,
         run_id: int,
     ) -> None:
-        """Upsert one dataset and each data node it was served from."""
-        facets = _dataset_columns(records[0])
-        existing = session.get(Dataset, instance)
+        """Upsert one version-invariant dataset (keyed on `master_id`)."""
+        facets = {name: getattr(record, name) for name in _DATASET_FACETS}
+        existing = session.get(Dataset, master)
         if existing is None:
             session.add(
                 Dataset(
-                    instance_id=instance,
+                    master_id=master,
                     first_seen_run_id=run_id,
                     last_seen_run_id=run_id,
                     **facets,
                 )
             )
-        else:
-            for key, value in facets.items():
-                setattr(existing, key, value)
-            existing.last_seen_run_id = run_id
-            session.add(existing)
+            return
+        for key, value in facets.items():
+            setattr(existing, key, value)
+        existing.last_seen_run_id = run_id
+        session.add(existing)
 
-        for record in records:
-            self._upsert_location(session, instance, record, run_id)
+    def _upsert_version(
+        self,
+        session: Session,
+        master: str,
+        version_id: str,
+        records: Sequence[DatasetRecord],
+        run_id: int,
+    ) -> None:
+        """Upsert one dataset version (validating its version string is a date)."""
+        version = _version_of(records[0])
+        parse_version_date(version)  # raises ValueError on a non-date version
+        columns = {
+            "version": version,
+            "is_latest": records[0].latest,
+            "size": records[0].size,
+            "number_of_files": records[0].number_of_files,
+        }
+        existing = session.get(DatasetVersion, version_id)
+        if existing is None:
+            session.add(
+                DatasetVersion(
+                    instance_id=version_id,
+                    dataset_key=master,
+                    first_seen_run_id=run_id,
+                    last_seen_run_id=run_id,
+                    **columns,
+                )
+            )
+            return
+        for key, value in columns.items():
+            setattr(existing, key, value)
+        existing.last_seen_run_id = run_id
+        session.add(existing)
 
     def _upsert_location(
         self,
         session: Session,
-        instance: str,
+        version_id: str,
         record: DatasetRecord,
         run_id: int,
     ) -> None:
         """Upsert the per-node location row for one record."""
-        columns = _location_columns(record)
-        existing = session.get(DatasetLocation, (instance, record.node_key))
+        columns = {
+            "esgf_dataset_id": record.id,
+            "replica": record.replica,
+            "esgf_timestamp": record.esgf_timestamp,
+            "raw_json": json.dumps(record.raw, sort_keys=True),
+        }
+        existing = session.get(DatasetNodeSpecificInfo, (version_id, record.node_key))
         if existing is None:
             session.add(
-                DatasetLocation(
-                    dataset_key=instance,
+                DatasetNodeSpecificInfo(
+                    version_key=version_id,
                     data_node=record.node_key,
                     first_seen_run_id=run_id,
                     last_seen_run_id=run_id,
@@ -737,81 +996,116 @@ class Repository:
         session.add(existing)
 
 
+def _version_of(record: DatasetRecord) -> str:
+    """Return a record's version string, deriving it from the ids if unset."""
+    if record.version:
+        return record.version
+    master, instance = record.master_key, record.instance_key
+    if instance.startswith(f"{master}."):
+        return instance[len(master) + 1 :]
+    return instance.rpartition(".")[2]
+
+
 def _representative_timestamp(records: Sequence[DatasetRecord]) -> str | None:
-    """Pick a dataset's representative `_timestamp` (the latest across its nodes)."""
+    """Pick a version's representative `_timestamp` (the latest across its nodes)."""
     stamps = [r.esgf_timestamp for r in records if r.esgf_timestamp is not None]
     return max(stamps) if stamps else None
 
 
 def _change(
     run_id: int,
-    dataset_key: str,
+    version_key: str,
     change_type: str,
     detail: dict[str, Any] | None = None,
 ) -> DatasetChange:
     """Build a `DatasetChange` row (serialising `detail` to JSON if given)."""
     return DatasetChange(
         query_run_id=run_id,
-        dataset_key=dataset_key,
+        version_key=version_key,
         change_type=change_type,
         detail_json=None if detail is None else json.dumps(detail),
     )
 
 
-def _dataset_columns(record: DatasetRecord) -> dict[str, Any]:
-    """Return the node-independent columns of a dataset record."""
-    return {name: getattr(record, name) for name in _DATASET_FACETS}
-
-
-def _location_columns(record: DatasetRecord) -> dict[str, Any]:
-    """Return the per-node columns for a record's location row."""
-    columns: dict[str, Any] = {
-        name: getattr(record, name) for name in _LOCATION_SCALARS
-    }
-    columns["esgf_dataset_id"] = record.id
-    columns["esgf_timestamp"] = record.esgf_timestamp
-    columns["raw_json"] = json.dumps(record.raw, sort_keys=True)
-    return columns
-
-
-def _record_from_location(dataset: Dataset, location: DatasetLocation) -> DatasetRecord:
-    """Rebuild a node-specific `DatasetRecord` from a stored dataset + location."""
+def _record_from(
+    dataset: Dataset, version: DatasetVersion, location: DatasetNodeSpecificInfo
+) -> DatasetRecord:
+    """Rebuild a node-specific `DatasetRecord` from stored dataset/version/location."""
     raw = json.loads(location.raw_json) if location.raw_json else {}
     facets = {name: getattr(dataset, name) for name in _DATASET_FACETS}
     dataset_id = (
-        location.esgf_dataset_id or f"{dataset.instance_id}|{location.data_node}"
+        location.esgf_dataset_id or f"{version.instance_id}|{location.data_node}"
     )
     return DatasetRecord(
         id=dataset_id,
-        instance_id=dataset.instance_id,
+        instance_id=version.instance_id,
+        master_id=dataset.master_id,
+        version=version.version,
+        latest=version.is_latest,
         data_node=location.data_node,
         replica=location.replica,
-        size=location.size,
-        number_of_files=location.number_of_files,
+        size=version.size,
+        number_of_files=version.number_of_files,
         esgf_timestamp=location.esgf_timestamp,
         raw=raw,
-        **{k: v for k, v in facets.items() if k != "latest"},
-        latest=location.latest if location.latest is not None else dataset.latest,
+        **facets,
     )
 
 
-def _header_columns(metadata: HeaderMetadata) -> dict[str, Any]:
-    """Return the storable columns of a header (excluding the key fields)."""
-    attrs = metadata.attrs
-    columns: dict[str, Any] = {name: attrs.get(name) for name in PROMOTED_ATTRS}
-    columns["attrs_json"] = json.dumps(attrs, sort_keys=True)
-    columns["source_url"] = metadata.source_url
-    columns["data_node"] = (
-        urlparse(metadata.source_url).hostname if metadata.source_url else None
-    )
-    columns["read_at"] = datetime.now(timezone.utc)
-    return columns
+def _access_id_for_url(
+    session: Session, file_id: int, source_url: str | None
+) -> int | None:
+    """Find the `FileAccess.id` for a file whose `url` or `fsspec_url` was read."""
+    if source_url is None:
+        return None
+    for column in (FileAccess.url, FileAccess.fsspec_url):
+        access = session.exec(
+            select(FileAccess).where(
+                FileAccess.file_id == file_id, column == source_url
+            )
+        ).first()
+        if access is not None:
+            return access.id
+    return None
 
 
-def _metadata_from_header(row: DatasetHeader) -> HeaderMetadata:
-    """Rebuild a `HeaderMetadata` from a stored header row."""
-    attrs = json.loads(row.attrs_json) if row.attrs_json else {}
-    return HeaderMetadata(attrs=attrs, source_url=row.source_url)
+def _file_columns(record: FileRecord) -> dict[str, Any]:
+    """Return the storable `File` columns of a file record (excluding the keys)."""
+    return {
+        "size": record.size,
+        "checksum": record.checksum,
+        "checksum_type": record.checksum_type,
+        "tracking_id": record.tracking_id,
+    }
+
+
+def _access_columns(record: FileRecord) -> list[dict[str, Any]]:
+    """
+    Turn a file record's `url|mime|service` entries into `FileAccess` column dicts
+
+    One dict per distinct URL: the data node is the URL host, and `fsspec_url` is an
+    fsspec-openable form of an `HTTPServer` URL (upgraded to `https://` when the index
+    only listed `http://`); other services (OPeNDAP, Globus) leave it `None` for now.
+    """
+    accesses: list[dict[str, Any]] = []
+    for entry in record.urls:
+        parts = entry.split("|")
+        if len(parts) != 3:  # noqa: PLR2004 - the fixed url|mime|service shape
+            continue
+        url, _mime, service = parts
+        fsspec_url: str | None = None
+        if service == HTTP_SERVICE:
+            fsspec_url = url if url.startswith("https://") else https_twin(url)
+        accesses.append(
+            {
+                "data_node": urlparse(url).hostname,
+                "service": service,
+                "url": url,
+                "fsspec_url": fsspec_url,
+                "esgf_file_id": record.id,
+            }
+        )
+    return accesses
 
 
 def _node_health_columns(stat: NodeStat) -> dict[str, Any]:

@@ -6,18 +6,21 @@ from use case 2's cached datasets (the abrupt-forcing experiments `abrupt-4xCO2`
 `abrupt-2xCO2`, `abrupt-0p5xCO2` and `piControl`, for `tas`, `rsdt`, `rsut`,
 `rlut`), it:
 
-1. reads and stores one header per *abrupt* simulation (single variable read; every
-   variable's dataset row still saved) — the same health-aware, timeout/retry
-   pipeline use case 1 uses;
+1. reads one header per *abrupt* simulation (single variable read; the header is
+   stored on the `File` and its `parent_*` subset promoted onto each
+   `DatasetVersion`) — the same health-aware, timeout/retry pipeline use case 1 uses;
 2. follows each abrupt run's declared `parent_*` metadata up to its `piControl`
-   parent, **without** assuming the parent shares the child's `variant_label`;
-3. de-duplicates piControl parents shared across a model's abrupt variants (read
-   once), and re-fetches a declared parent that is not in the cached datasets;
-4. reads and stores each distinct piControl header and verifies it;
-5. reports the verified child -> parent pairs, anything unverified, and node health.
+   parent via one index search per distinct parent, **without** assuming the parent
+   shares the child's `variant_label`;
+3. links each child *version* to the matching parent *version*
+   (`parent_version_key`), stopping at `piControl` (the `stopping_experiment`);
+4. reports the resolved version links, the terminals, and node health.
 
-Header rows land in `DatasetHeader` (with populated `parent_*` columns) and node
-statistics in `NodeHealthStat`, both in `esgf_cache.sqlite`.
+Any chain that cannot be resolved (a declared parent absent from the index, or a
+chain that reaches the top without passing through `piControl`) raises a
+`ParentResolutionError`, which this script catches and prints.  Headers are stored
+on `File.header_attrs_json`, promoted onto `DatasetVersion`, and node statistics on
+`NodeHealthStat`, all in `esgf_cache.sqlite`.
 
 Run with: `uv run python scripts/enrich_uc2_headers.py`
 """
@@ -29,12 +32,24 @@ import time
 
 from cmip_data_manager import Settings, build_client, open_repository
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
-from cmip_data_manager.search import enrich_with_parents, per_variable_experiment
-from cmip_data_manager.search.parent_hop import (
-    DEFAULT_CHILD_EXPERIMENTS,
-    DEFAULT_PARENT_EXPERIMENT,
-    DEFAULT_REQUIRED_VARS,
+from cmip_data_manager.search import (
+    ParentResolutionError,
+    per_variable_experiment,
+    resolve_parent_chains,
 )
+
+DEFAULT_CHILD_EXPERIMENTS: tuple[str, ...] = (
+    "abrupt-4xCO2",
+    "abrupt-2xCO2",
+    "abrupt-0p5xCO2",
+)
+"""Abrupt-forcing experiments whose piControl parent this use case resolves."""
+
+DEFAULT_PARENT_EXPERIMENT = "piControl"
+"""The experiment the children are expected to branch from."""
+
+DEFAULT_REQUIRED_VARS: tuple[str, ...] = ("tas", "rsdt", "rsut", "rlut")
+"""Variables the forcing (Gregory) calculation needs; scopes the index search."""
 
 # --- Configuration (edit me) -------------------------------------------------
 DB_PATH = os.environ.get("UC2_DB_PATH", "esgf_cache.sqlite")
@@ -64,10 +79,7 @@ SEARCH_EXPERIMENTS: tuple[str, ...] = (*CHILD_EXPERIMENTS, PARENT_EXPERIMENT)
 """Experiments the from-scratch index search covers (children plus piControl)."""
 
 FREQUENCY = ("mon",)
-"""Frequency to search for and to scope a parent re-fetch to."""
-
-REFETCH_MISSING = True
-"""Re-fetch a declared piControl parent that is not among the cached datasets."""
+"""Frequency the from-scratch index search covers."""
 
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""
@@ -93,8 +105,8 @@ MAX_WORKERS = 12
 NODE_CONCURRENCY = 2
 """Default cap on simultaneous reads to a single data node (conservative)."""
 
-NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
-"""Per-node caps overriding `NODE_CONCURRENCY` (NCI tolerates more, and is fast)."""
+SEARCH_WORKERS = 8
+"""Parallel per-parent index searches and per-version file searches in the walk."""
 
 READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet."""
@@ -181,69 +193,44 @@ def main() -> None:
     read_timeout = health.suggested_timeout(default=READ_TIMEOUT_FALLBACK)
     print(f"  read timeout for this run: {read_timeout:.1f}s")
 
+    # Roots are the abrupt-forcing children; the walk discovers piControl parents
+    # itself (one index search per distinct parent) and stops at PARENT_EXPERIMENT.
+    roots = [r for r in records if r.experiment_id in set(CHILD_EXPERIMENTS)]
     started = time.perf_counter()
-    result = enrich_with_parents(
-        records,
-        client=client,
-        repository=repository,
-        child_experiments=CHILD_EXPERIMENTS,
-        parent_experiment=PARENT_EXPERIMENT,
-        required_vars=REQUIRED_VARS,
-        frequency=FREQUENCY,
-        refetch_missing=REFETCH_MISSING,
-        health=health,
-        timeout=read_timeout,
-        preferred_hosts=PREFERRED_HOSTS,
-        ignore_hosts=IGNORE_HOSTS,
-        max_workers=MAX_WORKERS,
-        node_concurrency=NODE_CONCURRENCY,
-        node_concurrency_overrides=NODE_CONCURRENCY_OVERRIDES,
-        skip_cached=SKIP_CACHED,
-    )
+    try:
+        result = resolve_parent_chains(
+            roots,
+            client=client,
+            repository=repository,
+            stopping_experiment=PARENT_EXPERIMENT,
+            health=health,
+            timeout=read_timeout,
+            preferred_hosts=PREFERRED_HOSTS,
+            ignore_hosts=IGNORE_HOSTS,
+            max_workers=MAX_WORKERS,
+            node_concurrency=NODE_CONCURRENCY,
+            skip_cached=SKIP_CACHED,
+            map_fn=thread_pool_map(max_workers=SEARCH_WORKERS),
+        )
+    except ParentResolutionError as exc:
+        print(f"parent resolution FAILED:\n{exc}")
+        print("node health:")
+        _print_node_health(repository)
+        return
     elapsed = time.perf_counter() - started
 
-    child = result.child_enrichment
-    parent = result.parent_enrichment
     print(
-        f"child headers:  read={child.read} reused={child.reused} "
-        f"stored={child.stored} skipped_cached={child.skipped_cached} "
-        f"failed={len(child.failed)}"
+        f"resolved {len(result.links)} version links across "
+        f"{result.hops} hop(s), {len(result.terminals)} terminal(s) "
+        f"in {elapsed:.2f}s"
     )
-    print(
-        f"parent headers: read={parent.read} reused={parent.reused} "
-        f"stored={parent.stored} skipped_cached={parent.skipped_cached} "
-        f"failed={len(parent.failed)}"
-    )
-    if result.refetched:
-        print(f"re-fetched {len(result.refetched)} datasets for absent parents")
-    print(f"resolved {len(result.links)} child simulations in {elapsed:.2f}s")
-
-    # Verified child -> parent pairs.
-    verified = result.verified
-    print(f"verified parents ({len(verified)}):")
-    for link in verified:
-        if link.parent is None:  # unreachable: verified implies a parent
-            continue
-        flags = []
-        if not link.same_variant:
-            flags.append("different-variant")
-        if link.refetched:
-            flags.append("re-fetched")
-        suffix = f" [{', '.join(flags)}]" if flags else ""
-        c_src, c_exp, c_var = link.child
-        p_var = link.parent[2]
-        print(
-            f"  {c_src} {c_exp}/{c_var} -> {PARENT_EXPERIMENT}/{p_var} "
-            f"(branch_time={link.branch_time_in_parent}){suffix}"
-        )
-
-    # Anything that did not verify, grouped by why.
-    unresolved = [link for link in result.links if not link.verified]
-    if unresolved:
-        print(f"unverified ({len(unresolved)}):")
-        for link in sorted(unresolved, key=lambda link: link.status):
-            c_src, c_exp, c_var = link.child
-            print(f"  [{link.status:<18}] {c_src} {c_exp}/{c_var}")
+    for child_version, parent_version in sorted(result.links):
+        print(f"  {child_version}")
+        print(f"    -> {parent_version}")
+    if result.terminals:
+        print("terminals (chain stops):")
+        for source_id, experiment_id, variant_label in sorted(result.terminals):
+            print(f"  {source_id} / {experiment_id} / {variant_label}")
 
     print("node health:")
     _print_node_health(repository)

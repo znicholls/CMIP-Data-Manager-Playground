@@ -5,14 +5,21 @@ from __future__ import annotations
 import pytest
 
 from cmip_data_manager.db.repository import HeaderAttempt
-from cmip_data_manager.esgf.headers import HeaderMetadata
 from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord
 
+_V = "v20240101"
+
+
+def _inst(master, version=_V):
+    """The instance id (version key) for a master + version."""
+    return f"{master}.{version}"
+
 
 def _rec(  # noqa: PLR0913 - a test builder; every field has a default
-    instance,
+    master,
     *,
+    version=_V,
     node="node1.org",
     timestamp="t0",
     source_id="M",
@@ -20,11 +27,14 @@ def _rec(  # noqa: PLR0913 - a test builder; every field has a default
     experiment="ssp245",
     variable="tas",
 ):
-    """Build a node-specific record for dataset `instance` served from `node`."""
+    """Build a node-specific record for dataset `master` at `version`, on `node`."""
+    instance = f"{master}.{version}"
     node_id = f"{instance}|{node}"
     return DatasetRecord(
         id=node_id,
         instance_id=instance,
+        master_id=master,
+        version=version,
         data_node=node,
         source_id=source_id,
         variant_label=variant,
@@ -40,8 +50,8 @@ def test_first_run_reports_everything_added(repository):
     result = repository.record_run(
         [_rec("a"), _rec("b")], endpoint_url="u", spec={}, tag="uc"
     )
-    assert result.num_found == 2  # two distinct datasets
-    assert result.added == ["a", "b"]
+    assert result.num_found == 2  # two distinct datasets (masters)
+    assert result.added == [_inst("a"), _inst("b")]  # reported at the version grain
     assert result.removed == []
     assert result.modified == []
     assert result.has_changes
@@ -55,9 +65,9 @@ def test_second_run_diffs_against_first(repository):
         spec={},
         tag="uc",
     )
-    assert result.added == ["c"]
-    assert result.removed == ["b"]
-    assert result.modified == ["a"]
+    assert result.added == [_inst("c")]
+    assert result.removed == [_inst("b")]
+    assert result.modified == [_inst("a")]
 
 
 def test_no_change_run(repository):
@@ -67,7 +77,7 @@ def test_no_change_run(repository):
 
 
 def test_replicas_collapse_to_one_dataset_with_many_locations(repository):
-    # The same dataset served from two nodes is one dataset, two locations.
+    # The same version served from two nodes is one dataset, one version, two locations.
     result = repository.record_run(
         [_rec("a", node="nci"), _rec("a", node="llnl")],
         endpoint_url="u",
@@ -75,10 +85,32 @@ def test_replicas_collapse_to_one_dataset_with_many_locations(repository):
         tag="uc",
     )
     assert result.num_found == 1  # one distinct dataset, not two
-    assert result.added == ["a"]
+    assert result.added == [_inst("a")]
     records = repository.get_dataset_records("uc")
-    assert {r.instance_key for r in records} == {"a"}
+    assert {r.master_key for r in records} == {"a"}
     assert {r.node_key for r in records} == {"nci", "llnl"}  # both nodes reconstructed
+
+
+def test_versions_of_one_dataset_are_one_master_many_versions(repository):
+    # Two versions of the same dataset: one master, two DatasetVersion rows.
+    result = repository.record_run(
+        [_rec("a", version="v20240101"), _rec("a", version="v20240202")],
+        endpoint_url="u",
+        spec={},
+        tag="uc",
+    )
+    assert result.num_found == 1  # one logical dataset
+    assert result.added == [_inst("a", "v20240101"), _inst("a", "v20240202")]
+    records = repository.get_dataset_records("uc")
+    assert {r.master_key for r in records} == {"a"}  # one master
+    assert {r.version for r in records} == {"v20240101", "v20240202"}  # two versions
+
+
+def test_non_date_version_is_rejected(repository):
+    with pytest.raises(ValueError, match="does not match format"):
+        repository.record_run(
+            [_rec("a", version="not-a-date")], endpoint_url="u", spec={}, tag="uc"
+        )
 
 
 def test_diffing_is_keyed_on_spec_not_tag(repository):
@@ -87,7 +119,7 @@ def test_diffing_is_keyed_on_spec_not_tag(repository):
     result = repository.record_run(
         [_rec("z")], endpoint_url="u", spec={"q": 2}, tag="uc"
     )
-    assert result.added == ["z"]
+    assert result.added == [_inst("z")]
     assert result.removed == []  # not diffed against the spec={"q": 1} run
 
 
@@ -97,86 +129,25 @@ def test_same_spec_forms_a_diff_series(repository):
     result = repository.record_run(
         [_rec("z")], endpoint_url="u", spec={"q": 1}, tag="uc2"
     )
-    assert result.added == ["z"]
-    assert result.removed == ["a"]
+    assert result.added == [_inst("z")]
+    assert result.removed == [_inst("a")]
 
 
 def test_changes_are_logged(repository):
     run = repository.record_run([_rec("a")], endpoint_url="u", spec={}, tag="uc")
     changes = repository.get_changes(run.run_id)
-    assert [(c.dataset_key, c.change_type) for c in changes] == [("a", "added")]
+    assert [(c.version_key, c.change_type) for c in changes] == [(_inst("a"), "added")]
 
 
 def test_offline_read_returns_latest_run_by_tag(repository):
     repository.record_run([_rec("a"), _rec("b")], endpoint_url="u", spec={}, tag="uc")
     repository.record_run([_rec("a")], endpoint_url="u", spec={}, tag="uc")  # latest
     records = repository.get_dataset_records("uc")
-    assert {r.instance_key for r in records} == {"a"}
+    assert {r.master_key for r in records} == {"a"}
 
 
 def test_offline_read_unknown_tag_is_empty(repository):
     assert repository.get_dataset_records("never-run") == []
-
-
-def _header(**attrs):
-    return HeaderMetadata(
-        attrs={
-            "parent_source_id": "ACCESS-ESM1-5",
-            "parent_experiment_id": "historical",
-            "parent_variant_label": "r1i1p1f1",
-            "tracking_id": "hdl:21.14100/abc",
-            "branch_time_in_parent": "60225.0",
-            "grid": "native atmosphere N96 grid",
-            **attrs,
-        },
-        source_url="https://esgf.nci.org.au/thredds/fileServer/x/tas.nc",
-    )
-
-
-_KEY = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "tas", "Amon")
-
-
-def test_store_and_get_header_roundtrips_all_attrs(repository):
-    stored = repository.store_headers({_KEY: _header()})
-    assert stored == 1
-    got = repository.get_header(_KEY)
-    assert got is not None
-    assert got.get("parent_experiment_id") == "historical"
-    assert got.get("grid") == "native atmosphere N96 grid"  # from attrs_json
-    assert got.source_url.endswith("tas.nc")
-
-
-def test_get_header_missing_is_none(repository):
-    assert repository.get_header(_KEY) is None
-
-
-def test_store_headers_upserts_on_same_key(repository):
-    repository.store_headers({_KEY: _header()})
-    repository.store_headers({_KEY: _header(parent_experiment_id="piControl")})
-    got = repository.get_header(_KEY)
-    assert got.get("parent_experiment_id") == "piControl"
-
-
-def test_table_id_distinguishes_same_variable(repository):
-    day_key = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "tas", "day")
-    repository.store_headers(
-        {
-            _KEY: _header(tracking_id="mon"),
-            day_key: _header(tracking_id="day"),
-        }
-    )
-    assert repository.get_header(_KEY).get("tracking_id") == "mon"
-    assert repository.get_header(day_key).get("tracking_id") == "day"
-
-
-def test_get_simulation_headers_spans_variables(repository):
-    rsut_key = ("ACCESS-ESM1-5", "ssp245", "r1i1p1f1", "rsut", "Amon")
-    other_sim = ("CanESM5", "ssp245", "r1i1p1f1", "tas", "Amon")
-    repository.store_headers(
-        {_KEY: _header(), rsut_key: _header(), other_sim: _header()}
-    )
-    headers = repository.get_simulation_headers("ACCESS-ESM1-5", "ssp245", "r1i1p1f1")
-    assert len(headers) == 2  # tas + rsut, not the CanESM5 simulation
 
 
 def test_node_health_persists_and_reloads(repository):

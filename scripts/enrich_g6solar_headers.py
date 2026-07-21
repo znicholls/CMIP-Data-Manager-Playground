@@ -5,22 +5,22 @@ This takes use case 2's one-hop idea and follows the parent chain *all the way u
 making no assumptions about which experiments it passes through.  Starting from
 `G6solar` / `tas` / `mon` alone, it:
 
-1. reads and stores one header per `G6solar` simulation (the same health-aware,
-   timeout/retry pipeline use cases 1 and 2 use);
+1. reads one header per `G6solar` simulation (the same health-aware, timeout/retry
+   pipeline use cases 1 and 2 use), stored on the `File` and promoted onto the
+   `DatasetVersion`;
 2. follows whatever parent each header declares (`parent_*` metadata) — typically
    `G6solar -> ssp585 -> historical -> piControl`, but the experiments and variants
-   are discovered, never assumed — reading and verifying each parent's header;
-3. re-fetches an ancestor that is not already among the datasets (here, essentially
-   every one, since the search covers only `G6solar`);
-4. de-duplicates ancestors shared across branches, so a scenario/historical/
-   piControl run reached by many children is read once;
-5. reports each child's resolved chain, where and why any chain stopped short, the
-   de-duplication win, and node health.
+   are discovered, never assumed — via one index search per distinct parent;
+3. links each child *version* to its parent *version* (`parent_version_key`), a
+   shared ancestor searched and read once (a global visited set collapses the tree);
+4. with `stopping_experiment=None`, walks all the way to the CMIP6 `"no parent"`
+   sentinel — the true top of the tree — and records those as terminals;
+5. reports the resolved version links, the terminals, and node health.
 
 By default this runs **cold**: a fresh database (`g6solar_cache.sqlite`) with no
-learned node health, so timeouts fall back to `READ_TIMEOUT_FALLBACK`.  Header rows
-land in `DatasetHeader` (with populated `parent_*` columns) and node statistics in
-`NodeHealthStat`.
+learned node health, so timeouts fall back to `READ_TIMEOUT_FALLBACK`.  Headers are
+stored on `File.header_attrs_json`, promoted onto `DatasetVersion`, and node
+statistics on `NodeHealthStat`.
 
 Run with: `uv run python scripts/enrich_g6solar_headers.py`
 """
@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import os
 import time
-from collections import Counter
 
 from cmip_data_manager import Settings, build_client, open_repository
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
-from cmip_data_manager.search import enrich_parent_chains, per_variable_experiment
+from cmip_data_manager.search import (
+    ParentResolutionError,
+    per_variable_experiment,
+    resolve_parent_chains,
+)
 
 # --- Configuration (edit me) -------------------------------------------------
 DB_PATH = os.environ.get("G6_DB_PATH", "g6solar_cache.sqlite")
@@ -57,13 +60,10 @@ REQUIRED_VARS: tuple[str, ...] = ("tas",)
 """Variable to read a header for (single variable, as requested)."""
 
 FREQUENCY = ("mon",)
-"""Frequency to search for and to scope an ancestor re-fetch to."""
+"""Frequency the from-scratch index search covers."""
 
 MAX_HOPS = 8
 """Safety cap on the number of hops up the tree (guards a metadata cycle)."""
-
-REFETCH_MISSING = True
-"""Re-fetch a declared ancestor that is not among the cached datasets."""
 
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""
@@ -89,8 +89,8 @@ MAX_WORKERS = 12
 NODE_CONCURRENCY = 2
 """Default cap on simultaneous reads to a single data node (conservative)."""
 
-NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
-"""Per-node caps overriding `NODE_CONCURRENCY` (NCI tolerates more, and is fast)."""
+SEARCH_WORKERS = 8
+"""Parallel per-parent index searches and per-version file searches in the walk."""
 
 READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet."""
@@ -143,23 +143,6 @@ def _print_node_health(repository) -> None:
         )
 
 
-def _chain_line(chain) -> str:
-    """Render one resolved chain as `root -> parent -> ... [flags]`."""
-    src, exp, var = chain.root
-    parts = [f"{src} {exp}/{var}"]
-    for edge in chain.edges:
-        _p_src, p_exp, p_var = edge.parent
-        flags = []
-        if not edge.same_variant:
-            flags.append("diff-variant")
-        if edge.refetched:
-            flags.append("re-fetched")
-        suffix = f" [{','.join(flags)}]" if flags else ""
-        parts.append(f"{p_exp}/{p_var}{suffix}")
-    tail = "" if chain.complete else f"  (stopped: {chain.terminal_reason})"
-    return " -> ".join(parts) + tail
-
-
 def main() -> None:
     """Walk G6solar's parent chains, verify each hop, and report."""
     repository = open_repository(DB_PATH)
@@ -191,67 +174,45 @@ def main() -> None:
     read_timeout = health.suggested_timeout(default=READ_TIMEOUT_FALLBACK)
     print(f"  read timeout for this run: {read_timeout:.1f}s")
 
+    # Roots are the G6solar children; stopping_experiment=None walks all the way to
+    # the CMIP6 "no parent" sentinel (the true top), searching each parent once.
+    roots = [r for r in records if r.experiment_id == CHILD_EXPERIMENT]
     started = time.perf_counter()
-    result = enrich_parent_chains(
-        records,
-        client=client,
-        repository=repository,
-        child_experiments=(CHILD_EXPERIMENT,),
-        required_vars=REQUIRED_VARS,
-        frequency=FREQUENCY,
-        project=PROJECT,
-        refetch_missing=REFETCH_MISSING,
-        max_hops=MAX_HOPS,
-        health=health,
-        timeout=read_timeout,
-        preferred_hosts=PREFERRED_HOSTS,
-        ignore_hosts=IGNORE_HOSTS,
-        max_workers=MAX_WORKERS,
-        node_concurrency=NODE_CONCURRENCY,
-        node_concurrency_overrides=NODE_CONCURRENCY_OVERRIDES,
-        skip_cached=SKIP_CACHED,
-    )
+    try:
+        result = resolve_parent_chains(
+            roots,
+            client=client,
+            repository=repository,
+            stopping_experiment=None,
+            project=PROJECT,
+            max_hops=MAX_HOPS,
+            health=health,
+            timeout=read_timeout,
+            preferred_hosts=PREFERRED_HOSTS,
+            ignore_hosts=IGNORE_HOSTS,
+            max_workers=MAX_WORKERS,
+            node_concurrency=NODE_CONCURRENCY,
+            skip_cached=SKIP_CACHED,
+            map_fn=thread_pool_map(max_workers=SEARCH_WORKERS),
+        )
+    except ParentResolutionError as exc:
+        print(f"parent resolution FAILED:\n{exc}")
+        print("node health:")
+        _print_node_health(repository)
+        return
     elapsed = time.perf_counter() - started
 
-    # Per-hop enrichment summary.
-    for hop, enrichment in enumerate(result.enrichment, start=1):
-        print(
-            f"hop {hop}: read={enrichment.read} reused={enrichment.reused} "
-            f"stored={enrichment.stored} skipped_cached={enrichment.skipped_cached} "
-            f"failed={len(enrichment.failed)}"
-        )
-    if result.refetched:
-        print(f"re-fetched {len(result.refetched)} datasets for absent ancestors")
-    print(f"walked {len(result.chains)} chains in {result.hops} hops ({elapsed:.2f}s)")
-
-    # The chains themselves.
-    complete = result.complete
-    print(f"chains ({len(complete)}/{len(result.chains)} reached the top of the tree):")
-    for chain in result.chains:
-        print(f"  {_chain_line(chain)}")
-
-    # Summary: distinct simulations read per experiment (the dedup grain).
-    per_experiment: Counter[str] = Counter()
-    for chain in result.chains:
-        per_experiment[chain.root[1]] += 1
-    seen: set = set()
-    for chain in result.chains:
-        for edge in chain.edges:
-            if edge.parent not in seen:
-                seen.add(edge.parent)
-                per_experiment[edge.parent[1]] += 1
-    total_edges = sum(len(chain.edges) for chain in result.chains)
-    print("summary:")
-    print(f"  simulations touched by experiment: {dict(per_experiment)}")
     print(
-        f"  headers read: {result.reads}  (vs {total_edges} chain edges = "
-        "the shared-ancestor dedup win)"
+        f"walked {result.hops} hop(s): {len(result.links)} version links, "
+        f"{len(result.terminals)} terminal(s) in {elapsed:.2f}s"
     )
-    stopped = Counter(
-        chain.terminal_reason for chain in result.chains if not chain.complete
-    )
-    if stopped:
-        print(f"  chains that stopped short, by reason: {dict(stopped)}")
+    for child_version, parent_version in sorted(result.links):
+        print(f"  {child_version}")
+        print(f"    -> {parent_version}")
+    if result.terminals:
+        print("terminals (tops of the tree reached):")
+        for source_id, experiment_id, variant_label in sorted(result.terminals):
+            print(f"  {source_id} / {experiment_id} / {variant_label}")
 
     print("node health:")
     _print_node_health(repository)

@@ -17,15 +17,15 @@ from cmip_data_manager.search.aggregate import (
     pairs_all_experiments,
     pairs_any_experiment,
 )
-from cmip_data_manager.search.headers import EnrichResult, enrich_headers
-from cmip_data_manager.search.parent_hop import (
-    ParentChain,
-    ParentChainResult,
-    ParentHopResult,
-    ParentLink,
+from cmip_data_manager.search.files import AddFilesResult, add_files
+from cmip_data_manager.search.parent_walk import (
+    ParentExperimentMissingError,
+    ParentNotAncestor,
+    ParentNotFound,
+    ParentResolutionError,
+    ParentWalkResult,
     declared_parent,
-    enrich_parent_chains,
-    enrich_with_parents,
+    resolve_parent_chains,
 )
 from cmip_data_manager.search.parentage import (
     ParentConflict,
@@ -41,32 +41,38 @@ from cmip_data_manager.search.runner import (
     per_variable_experiment,
     run_use_case,
 )
+from cmip_data_manager.search.version_headers import (
+    VersionEnrichResult,
+    enrich_version_headers,
+)
 
 __all__ = [
+    "AddFilesResult",
     "Cell",
-    "EnrichResult",
     "ModelVariant",
     "PairMatch",
-    "ParentChain",
-    "ParentChainResult",
     "ParentConflict",
-    "ParentHopResult",
-    "ParentLink",
+    "ParentExperimentMissingError",
+    "ParentNotAncestor",
+    "ParentNotFound",
+    "ParentResolutionError",
     "ParentResolver",
     "ParentSpec",
+    "ParentWalkResult",
     "UseCase",
     "UseCaseResult",
+    "VersionEnrichResult",
+    "add_files",
     "build_cells",
     "declared_parent",
     "discover_experiments",
-    "enrich_headers",
-    "enrich_parent_chains",
-    "enrich_with_parents",
+    "enrich_version_headers",
     "fetch_records",
     "pairs_all_experiments",
     "pairs_any_experiment",
     "parent_cell_of",
     "per_variable_experiment",
+    "resolve_parent_chains",
     "resolve_parent_links",
     "run_use_case",
 ]

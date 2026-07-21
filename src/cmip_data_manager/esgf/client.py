@@ -27,6 +27,9 @@ from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.query import FacetQuery
 
 
+# QUESTION: does the response have to be a Solr result, or do we just need to
+#  make it look like a Solr result?
+# Issue for project/esgf integration?
 class ESGFResponseError(RuntimeError):
     """Raised when a search response is not shaped like a Solr result."""
 

@@ -575,3 +575,34 @@ class DatasetVersion:
     parent_dataset: DatasetVersion  # link to parent dataset (including version)
     version_specific_attribute: float  # can't think of any other good examples right now, but you get the idea I hope
 Note that we will need to shift any version-specific columns from dataset to datasetversion. Such as: parent information, version information, auxiliary (e.g. areacella) links (although we will think about this later). Then we will also have to have this table link to the Dataset Location. Please explain how these will all be linked. You will need to update the serach-worlfow.md please so that I can see the diagram and that I have provided clear isntructions. Thank you
+
+### Week 2, day 2 (21/7)
+
+I'm starting my day. Plans for the day:
+
+Implement the new workflow which covers versions and the parent/child searching set up.
+Important to understand what is happening throughout workflow (in terms of table connections and which functions link to each other)
+In testing can be very explicit at each stage to confirm what's happening
+
+Start implementing auxiliary variables - use Claude's initial suggestion of hierarchy in searching, but this will likely raise questions for me / will be a learning opportunity where I realise how little I knew about these fx variables.
+Hoping to get up to here today, but we'll see.
+Next steps will be multi-project/esgf integration.
+
+Claude prompt leaving off from yesterday:
+by 'parent does not exist', I mean that the parent information found in the child receives no search results on the index node, which in itself is different to a parent dataset existing but not being
+available on any data nodes (i.e. dead nodes). I like this error "CanESM5 abrupt-4xCO2 r1i1p1f2 declares parent (CanESM5, piControl, r1i1p1f9) but no such dataset is published on the index node — the chain
+cannot be completed." Note that for this use case, we want an option for the user to 'override' (either from the beginngin or after error?). If they know the specific child/parent link and that the global
+metadata is wrong, then they should be able to implement a fix. We may also build a set of helper tools which offers our known fixes/overrides for parent information that a user could choose to implement.
+None of this is built, but there should be room to adopt these.
+
+Additionally, in this parent/child searching, we should not assume the institution_id is the same between parent and child. source_id has to be the same, but institution_id can sometimes vary. This should
+be implemented now.
+
+Going through repo workflow thoroughly to understand what is happening at each stage. Notes/questions
+- db/schema.py: SearchRun : status, spec_json, tag??
+- DatasetChange : detail_json (user input or error message??), necessary?
+- db/repository.py _DATASET_FACETS tuple maybe area for change in integration?
+  - record_run() uses spec. not sure where this is defined/written?
+- gb/esgf/client.py ESGFResponseError (shaped like solr result?) -> links to schema.py issues in TODO?
+- schema.py: FileAccess questions
+  - "Note the fsspec_url column: it's populated only for the two HTTPServer rows (an http→https upgrade so the URL is directly openable). The other services (OPENDAP/GridFTP/Globus) leave it NULL. Those two HTTPServer URLs are exactly the candidates Step 3 will try to byte-range read."

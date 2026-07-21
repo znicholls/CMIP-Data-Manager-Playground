@@ -13,7 +13,8 @@ from cmip_data_manager.db.repository import Repository, RunResult
 from cmip_data_manager.db.schema import (
     Dataset,
     DatasetChange,
-    DatasetLocation,
+    DatasetNodeSpecificInfo,
+    DatasetVersion,
     File,
     FileAccess,
     RunMembership,
@@ -23,7 +24,8 @@ from cmip_data_manager.db.schema import (
 __all__ = [
     "Dataset",
     "DatasetChange",
-    "DatasetLocation",
+    "DatasetNodeSpecificInfo",
+    "DatasetVersion",
     "File",
     "FileAccess",
     "Repository",

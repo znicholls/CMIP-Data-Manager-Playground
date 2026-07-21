@@ -133,7 +133,7 @@ class DatasetRecord(BaseModel):
     @property
     def instance_key(self) -> str:
         """
-        The node-independent dataset identity used as the storage primary key
+        The version-specific, node-independent identity (a `DatasetVersion` key)
 
         `instance_id` when the search provided it, otherwise the `id` with any
         trailing `|data_node` stripped (the ESGF `id` is `instance_id|data_node`).
@@ -141,6 +141,20 @@ class DatasetRecord(BaseModel):
         if self.instance_id:
             return self.instance_id
         return self.id.split("|", 1)[0]
+
+    @property
+    def master_key(self) -> str:
+        """
+        The version- and node-independent dataset identity (a `Dataset` key)
+
+        `master_id` when the search provided it, otherwise the `instance_key` with a
+        trailing `.[v]YYYYMMDD` version segment stripped (the ESGF `instance_id` is
+        `master_id` + `.` + version).
+        """
+        if self.master_id:
+            return self.master_id
+        head, sep, tail = self.instance_key.rpartition(".")
+        return head if sep and tail.lstrip("vV").isdigit() else self.instance_key
 
     @property
     def node_key(self) -> str:

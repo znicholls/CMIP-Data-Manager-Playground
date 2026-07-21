@@ -125,6 +125,7 @@ def test_run_use_case_api_then_offline(repository, solr_dataset):
             experiment_id="ssp245",
             variable_id="tas",
             frequency="mon",
+            version="v20240101",
         )
     ]
     client = _client(docs=docs)
@@ -149,6 +150,7 @@ def test_run_use_case_with_aggregation(repository, solr_dataset):
             experiment_id=exp,
             variable_id=var,
             frequency="mon",
+            version="v20240101",
         )
         for exp in ("abrupt-4xCO2", "piControl")
         for var in needed

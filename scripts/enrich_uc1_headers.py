@@ -1,21 +1,42 @@
 """
-Live header enrichment for use case 1 (monthly `tas`, experiment `ssp245`).
+Single-model walk-through of use case 1 (monthly `tas`, experiment `ssp245`).
 
-This reads use case 1's datasets straight from the local cache
-(`esgf_cache.sqlite`, populated by `scripts/esgf_search.py`), then reads and stores
-one header (global attributes) per *simulation* `(source_id, experiment_id,
-variant_label)` from the live ESGF data nodes — NCI preferred — and reports:
+Configured tiny by default (`SINGLE_MODEL` + `ONE_VARIANT_PER_MODEL`) so you can
+watch **one** simulation flow through the three node-independent steps and inspect
+exactly what each writes.  It runs the live index search, stores the version's
+files, then reads and promotes one header — NCI preferred — reporting timing,
+failures and node health along the way.
 
-- **timing**: the search step (loading the cached datasets) and the header-read
-  step, separately;
-- **failures**: which simulations fully failed (every candidate mirror unreadable);
-- **node health**: a reliability and speed ranking of the data nodes that served
-  the reads, the per-node concurrency the adaptive controller learned (and any node
-  it evicted), plus a data-driven timeout suggestion.
+The three steps, the function each calls, and the tables each writes:
 
-The header rows land in the `DatasetHeader` table and the node statistics in
-`NodeHealthStat`, both in `esgf_cache.sqlite`, so you can explore them afterwards
-(e.g. `sqlite3 esgf_cache.sqlite "SELECT * FROM datasetheader"`).
+- **Step 1 — Search.**  `client.search(...)` hits the index node, then
+  `Repository.record_run` writes `SearchRun`, `Dataset`, `DatasetVersion`,
+  `DatasetNodeSpecificInfo`, `RunMembership` and `DatasetChange`.
+- **Step 2 — Files.**  `search.add_files` searches each version's files and
+  `Repository.store_files` writes `File` + `FileAccess` (one access per node URL).
+- **Step 3 — Header.**  `search.enrich_version_headers` reads one header from the
+  stored `FileAccess` URLs and `Repository.promote_header` stores it on
+  `File.header_attrs_json`, promotes the `parent_*` subset onto `DatasetVersion`
+  (with `header_from_file_key`), and logs `HeaderReadAttempt` + `NodeHealthStat`.
+
+Everything lands in `DB_PATH` (a fresh `uc1_walkthrough.sqlite` by default).  To see
+what each step wrote, open it between runs — the tables above are all queryable:
+
+```sh
+DB=uc1_walkthrough.sqlite
+sqlite3 $DB '.tables'
+# Step 1: the simulation and where it is published
+sqlite3 $DB 'SELECT master_id FROM dataset;'
+sqlite3 $DB 'SELECT instance_id, is_latest FROM datasetversion;'
+sqlite3 $DB 'SELECT version_key, data_node FROM datasetnodespecificinfo;'
+# Step 2: its files and their per-node access URLs
+sqlite3 $DB 'SELECT filename, size FROM file;'
+sqlite3 $DB 'SELECT data_node, service, url FROM fileaccess;'
+# Step 3: the header on the file + the parent_* promoted onto the version
+sqlite3 $DB 'SELECT filename, substr(header_attrs_json,1,80) FROM file;'
+sqlite3 $DB 'SELECT parent_experiment_id, header_from_file_key FROM datasetversion;'
+sqlite3 $DB 'SELECT host, outcome, seconds FROM headerreadattempt;'
+```
 
 Run with: `uv run python scripts/enrich_uc1_headers.py`
 """
@@ -28,19 +49,20 @@ from datetime import datetime, timezone
 from cmip_data_manager import Settings, build_client, open_repository
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
 from cmip_data_manager.esgf.query import FacetQuery
-from cmip_data_manager.search import enrich_headers
+from cmip_data_manager.search import add_files, enrich_version_headers
 
 # --- Configuration (edit me) -------------------------------------------------
-DB_PATH = "esgf_cache.sqlite"
-"""The cache written by `scripts/esgf_search.py` (must already hold use case 1)."""
+DB_PATH = "uc1_walkthrough.sqlite"
+"""Fresh database for the one-model walk-through, so every table starts empty and
+each step's writes are easy to inspect.  Delete it to start over."""
 
 USE_CASE = "uc1_tas_ssp245"
 """The cached use case whose datasets to enrich."""
 
-SEARCH_SOURCE = "db"
+SEARCH_SOURCE = "api"
 """`"api"` to run the use case 1 index search live (from scratch), `"db"` to load
-the datasets from the cache.  `"db"` here reuses run 1's cached search results so
-the header step is a *cold* re-run (see the header/health table wipe below)."""
+the datasets from the cache.  For the walk-through use `"api"` so Step 1 actually
+runs (`record_run` populates Dataset / DatasetVersion / DatasetNodeSpecificInfo)."""
 
 UC1_QUERY = FacetQuery(
     project="CMIP6",
@@ -50,9 +72,16 @@ UC1_QUERY = FacetQuery(
 )
 """Use case 1: all monthly `tas` datasets for `ssp245`."""
 
-ONE_VARIANT_PER_MODEL = False
+SINGLE_MODEL: str | None = "ACCESS-ESM1-5"
+"""If set to a `source_id`, restrict the ENTIRE run to that one model — the tiniest
+possible live walk-through of steps 1→2→3.  With `ONE_VARIANT_PER_MODEL = True` this
+traces exactly one simulation (one `DatasetVersion`, its `File`/`FileAccess` rows,
+one header read).  Set to `None` to run the full use case (~553 simulations)."""
+
+ONE_VARIANT_PER_MODEL = True
 """If True, enrich only one variant (ensemble member) per model — a ~49-simulation
-smoke test rather than the full ~553.  Set to False for the complete run."""
+smoke test rather than the full ~553.  With `SINGLE_MODEL` set, this narrows to a
+single simulation.  Set to False for the complete run."""
 
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""
@@ -90,18 +119,8 @@ MAX_WORKERS = 12
 NODE_CONCURRENCY = 2
 """Default cap on simultaneous reads to a single data node (conservative)."""
 
-NODE_CONCURRENCY_OVERRIDES: dict[str, int] = {"esgf.nci.org.au": 4}
-"""Per-node caps overriding `NODE_CONCURRENCY` (NCI tolerates more, and is fast).
-An overridden node is *pinned*: the adaptive controller won't grow or shrink it."""
-
-CONCURRENCY_CEILING = 8
-"""Hard upper bound the adaptive per-node cap will never grow past (stay polite)."""
-
-EVICT_AFTER_ATTEMPTS = 6
-"""Minimum reads on a node before it can be judged for eviction (a fair sample)."""
-
-EVICT_MAX_SUCCESS_RATE = 0.2
-"""Evict a judged node whose overall success rate is at or below this (near-dead)."""
+FILE_SEARCH_WORKERS = 8
+"""Parallel per-version file searches in the Step-2 `add_files` pass (HTTP I/O)."""
 
 READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet.  Once health exists,
@@ -114,7 +133,7 @@ SETTINGS = Settings()
 
 def _search_uc1(client, repository):
     """Run the use case 1 index search live and cache the datasets."""
-    records = client.search(UC1_QUERY)
+    records = client.search(_effective_query())
     repository.record_run(
         records,
         endpoint_url=client.base_url,
@@ -122,6 +141,19 @@ def _search_uc1(client, repository):
         tag=USE_CASE,
     )
     return records
+
+
+def _effective_query() -> FacetQuery:
+    """Return the UC1 query, narrowed to `SINGLE_MODEL` when one is configured."""
+    if SINGLE_MODEL is None:
+        return UC1_QUERY
+    return FacetQuery(
+        project="CMIP6",
+        variable_id=("tas",),
+        frequency=("mon",),
+        experiment_id=("ssp245",),
+        source_id=(SINGLE_MODEL,),
+    )
 
 
 def _one_variant_per_model(records):
@@ -141,6 +173,22 @@ def _one_variant_per_model(records):
         for record in records
         if chosen.get(record.source_id) == record.variant_label
     ]
+
+
+def _narrow_records(records):
+    """Apply the `SINGLE_MODEL` and `ONE_VARIANT_PER_MODEL` smoke-test narrowings."""
+    if SINGLE_MODEL is not None:
+        records = [r for r in records if r.source_id == SINGLE_MODEL]
+        print(f"  (single model: {SINGLE_MODEL} -> {len(records)} datasets)")
+    if ONE_VARIANT_PER_MODEL:
+        records = _one_variant_per_model(records)
+        models = len({r.source_id for r in records})
+        sims = len({(r.source_id, r.experiment_id, r.variant_label) for r in records})
+        print(f"  (one variant per model: {sims} simulations across {models} models)")
+    else:
+        sims = len({(r.source_id, r.experiment_id, r.variant_label) for r in records})
+        print(f"  ({sims} simulations to enrich)")
+    return records
 
 
 def _print_node_health(repository) -> None:
@@ -237,16 +285,26 @@ def main() -> None:
         )
         return
 
-    if ONE_VARIANT_PER_MODEL:
-        records = _one_variant_per_model(records)
-        models = len({r.source_id for r in records})
-        sims = len({(r.source_id, r.experiment_id, r.variant_label) for r in records})
-        print(f"  (one variant per model: {sims} simulations across {models} models)")
-    else:
-        sims = len({(r.source_id, r.experiment_id, r.variant_label) for r in records})
-        print(f"  ({sims} simulations to enrich)")
+    records = _narrow_records(records)
 
-    # 2. Header step: read + store one header per simulation, from the live nodes.
+    # 2. File step: search each version's files once and store them as File /
+    #    FileAccess rows (the header read in step 3 reads from these, not the index).
+    started = time.perf_counter()
+    files = add_files(
+        records,
+        client=client,
+        repository=repository,
+        map_fn=thread_pool_map(max_workers=FILE_SEARCH_WORKERS),
+        skip_cached=not FORCE_REREAD,
+    )
+    files_seconds = time.perf_counter() - started
+    print(
+        f"file step: searched={files.searched} "
+        f"skipped_cached={files.skipped_cached} files_stored={files.files_stored} "
+        f"overflowed={len(files.overflowed)} in {files_seconds:.2f}s"
+    )
+
+    # 3. Header step: read + promote one header per simulation, from the live nodes.
     #    Size the stall timeout from what healthy nodes actually took last run
     #    (falls back to READ_TIMEOUT_FALLBACK on a cold DB with no health yet).
     health = repository.load_node_health()
@@ -257,9 +315,8 @@ def main() -> None:
         print("  re-probing health-condemned nodes this run (avoid_unreliable=False)")
     run_started = datetime.now(timezone.utc)
     started = time.perf_counter()
-    outcome = enrich_headers(
+    outcome = enrich_version_headers(
         records,
-        client=client,
         repository=repository,
         health=health,
         timeout=read_timeout,
@@ -267,10 +324,6 @@ def main() -> None:
         ignore_hosts=IGNORE_HOSTS,
         max_workers=MAX_WORKERS,
         node_concurrency=NODE_CONCURRENCY,
-        node_concurrency_overrides=NODE_CONCURRENCY_OVERRIDES,
-        concurrency_ceiling=CONCURRENCY_CEILING,
-        evict_after_attempts=EVICT_AFTER_ATTEMPTS,
-        evict_max_success_rate=EVICT_MAX_SUCCESS_RATE,
         skip_cached=not FORCE_REREAD,
         avoid_unreliable_hosts=AVOID_UNRELIABLE_HOSTS,
         record_attempts=RECORD_ATTEMPTS,
@@ -279,8 +332,9 @@ def main() -> None:
 
     print(
         f"header step: read={outcome.read} reused={outcome.reused} "
-        f"stored={outcome.stored} skipped_cached={outcome.skipped_cached} "
-        f"failed={len(outcome.failed)} in {header_seconds:.2f}s"
+        f"promoted={outcome.promoted} skipped_cached={outcome.skipped_cached} "
+        f"failed={len(outcome.failed)} no_files={len(outcome.no_files)} "
+        f"in {header_seconds:.2f}s"
     )
 
     # 3. Which simulations fully failed (every candidate mirror unreadable)?
