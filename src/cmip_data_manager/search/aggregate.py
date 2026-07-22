@@ -39,6 +39,7 @@ the netCDF headers: the search layer supplies a resolver backed by a client (see
 plain dictionary lookup.  Matching itself stays free of any I/O.
 """
 
+# QUESTION: is this reasonable ?
 _MAX_PARENT_HOPS = 5
 """Guard against runaway/cyclic parent chains (e.g. ssp -> historical -> piControl)."""
 

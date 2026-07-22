@@ -24,6 +24,9 @@ Stopping is **error-based, not warnings** (design decisions D5/D7/D8):
 A `parent_overrides` mapping (child simulation -> corrected parent simulation) takes
 precedence over the header — the seam for user corrections / a future fixes library.
 """
+# QUESTION: is it here that the parent search for (source_id, experimetn_id,
+# variant_id) is defined? want to be more specific in search -> for variable/s
+# and table_id (ned multiple variables eg. for Gregory use case)
 
 from __future__ import annotations
 
@@ -213,6 +216,7 @@ class ParentWalkResult:
     """How many frontier hops the walk performed."""
 
 
+# QUESTION: Removing default of CMIP6?
 def parent_experiment_exists(
     client: ESGFSearchClient, experiment: str, *, project: str = "CMIP6"
 ) -> bool:

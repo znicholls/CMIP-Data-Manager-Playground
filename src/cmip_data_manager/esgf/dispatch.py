@@ -51,6 +51,8 @@ from cmip_data_manager.esgf.routing import SimulationCandidates
 HeaderReader = Callable[[str], HeaderMetadata]
 """Reads one file's header from a URL (typically wrapped with timeout/retry)."""
 
+# QUESTION: would this be user specific? e.g. if running on cmip-cruncher server
+# with 64 CPUs could have more workers?
 DEFAULT_MAX_WORKERS = 12
 """Default cap on header reads in flight *anywhere* (the shared local budget)."""
 

@@ -14,9 +14,14 @@ from dataclasses import dataclass
 DEFAULT_BASE_URL = "https://metagrid.esgf-west.org/proxy/search"
 """Default ESGF search endpoint (a thin proxy in front of the esg-search API)."""
 
+# QUESTION: do we wan to get rid of this? Should this be something we specify?
+# Likely this changes as we do project/esgf integration (honestly same with above)
 DEFAULT_PROJECT = "CMIP6"
 """Project searched by default."""
 
+# QUESTION: Are these still used? With current workflow should
+# never hit limit? Or is it possible to hit limit on index node search?
+# Or is index node search not where the 10000 limit applies?
 MAX_PAGE_SIZE = 10_000
 """Hard limit the ESGF API places on the `limit` parameter of a single query."""
 

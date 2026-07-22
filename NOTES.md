@@ -603,6 +603,51 @@ Going through repo workflow thoroughly to understand what is happening at each s
 - DatasetChange : detail_json (user input or error message??), necessary?
 - db/repository.py _DATASET_FACETS tuple maybe area for change in integration?
   - record_run() uses spec. not sure where this is defined/written?
-- gb/esgf/client.py ESGFResponseError (shaped like solr result?) -> links to schema.py issues in TODO?
+- db/esgf/client.py ESGFResponseError (shaped like solr result?) -> links to schema.py issues in TODO?
 - schema.py: FileAccess questions
   - "Note the fsspec_url column: it's populated only for the two HTTPServer rows (an http→https upgrade so the URL is directly openable). The other services (OPENDAP/GridFTP/Globus) leave it NULL. Those two HTTPServer URLs are exactly the candidates Step 3 will try to byte-range read."
+
+  - config.py 10,000 limit question
+
+  - search/headers.py - a number of default choices written in here -> some of these will want to be user choice?
+
+STep 4: parent walk
+- search/parent_walk.py -> remove default of CMIP6?
+- search/aggregate.py MAX_PARENT_HOPS = 5 -> reasonable assumption?
+
+### Week 2, day 3 (22/7)
+
+Responses to QUESTIONS throughout:
+
+Group A — CMIP6 → CMIP7 / ESGF integration (the recurring one)
+
+Five questions are really the same underlying question: "how much of the CMIP6-shaped assumptions survive ESGF/CMIP7 integration?"
+
+- config.py:17 DEFAULT_PROJECT = "CMIP6" — [I understand / partly your call] This constant only supplies the default for Settings.project; it's already overridable via Settings(project=...). Nothing is hard-coded harmfully. The real question — does a single project facet even survive CMIP7 (which may merge activities differently) — is a forward-design decision that depends on what the CMIP7 index exposes. Safe to keep for now.
+- client.py:30 "must the response be a Solr result?" — [I understand / client's call] The client parses the Solr/Globus-Search JSON shape (numFound, docs). It only has to look like that shape. If CMIP7/ESGF-next moves to STAC or another API, this contract changes. This is a genuine integration decision, not something I can resolve — flagging it as yours.
+- repository.py:58 _DATASET_FACETS and :74 _VERSION_PROMOTED — [I understand] These two tuples are the schema contract: which facets are version-invariant vs. which are promoted from netCDF headers. Your note on :74 is the sharp one — for CMIP7 the parent linkage (parent_source_id, etc.) may come from the index-node search itself rather than from reading headers. If so, that whole header-read step for parents becomes optional. That's a real design fork worth deciding once we know CMIP7's index capabilities. Flag as client/CMIP7-dependent.
+- parent_walk.py:218 "removing default of CMIP6?" — [I understand / recommend] Yes — I'd thread project from Settings rather than defaulting "CMIP6" in the function signature, so it can't drift from the configured project. Small code-hygiene fix, I can do it.
+
+Group B — factual answers (I checked the code)
+
+- config.py:22 "are MAX_PAGE_SIZE/MAX_RETRIEVABLE still used?" — [factual: yes, actively] Both are used in both the sync and async clients (client.py:117,181, async_client.py:129,150): they clamp page_size and raise DeepPaginationError when num_found > 10000. The 10000 limit applies to the index-node search (the Globus Search backend rejects offset >= 10000), not header reads. A narrow query (source_id, experiment_id, variable) won't hit it; a broad one (one experiment × one variable across all models/variants) can. So it's a live guard — keep it.
+- schema.py:114 / repository.py:182 "does the user specify spec_json?" — [factual: no] It's machine-generated. runner.py:264 builds spec={"queries": [q.as_spec() ...]} and parent_walk.py:423 builds spec={"parent": ...}, then repository.py:196 does json.dumps(spec, sort_keys=True). The "note: walkthrough uc1" string you saw is the tag, not spec_json. So: spec_json = normalized machine identity used for diff-series matching; the user never types it.
+- schema.py:131 "is the status marker meaningful?" — [factual: not currently] Grep finds no writer that ever sets status= to anything — it's always the default "ok". So today it's vestigial. It only earns its place if (a) a failed/partial run sets it to an error marker and (b) the diff logic skips diffing against a failed run (so a node outage doesn't look like mass "removed"). Decide whether to wire that up or drop the column.
+
+Group C — change-tracking design (I understand these)
+
+- schema.py:135 "tag vs spec_json — why both?" — [I understand] They do different jobs: spec_json = machine identity for "the same search over time" (diffing); tag = optional human label for retrieval convenience. Both justified; the docstrings could say this more bluntly.
+- schema.py:380 detail_json on DatasetChange — [I understand] Code-filled (not user), holds old/new _timestamp for "modified" events so you can show what changed. Keep it for modified; it's null for add/remove.
+
+Group D — data-model details
+
+- schema.py:345 "must fsspec_url start with fsspec?" — [factual: no] It's a URL openable by fsspec (currently plain https://), not one literally prefixed fsspec. The name is misleading — openable_url would be clearer. Cosmetic.
+- schema.py:350 "is replica important?" — [I understand] Marks primary vs. replica location. Not needed for data correctness, but useful for node ranking/provenance. Cheap to keep.
+- schema.py:355 "raw_json null in uc1 — ever populated?" — [factual: partially] There are two raw_json fields. The one at :266 is required and written at repository.py:979 (record.raw). The location-level one at :356 is the optional debug escape-hatch that was null in uc1. It's provenance-only — either populate it always (storage cost) or drop it. I'd lean drop unless you want it for debugging.
+
+Group E — tunables (I understand; the value is your/client's call)
+
+- aggregate.py:42 _MAX_PARENT_HOPS = 5 — [I understand / recommend keep] Real chains are ≤3 (ssp→historical→piControl = 2 hops). 5 is a safe cycle guard. Reasonable.
+- headers.py:51 user-specifiable promoted attrs — [I understand / your call] Right instinct: split into a required core (parent_source_id, etc. — the parent workflow breaks without them) plus a user-extensible set. Which extras to expose is a client-facing choice.
+- headers.py:609 _BLOCK_SIGNATURES — [I understand / your call] Heuristic substrings (429, 403, "rate limit"). Correct to centralize and grow as we observe real node behavior. Exact list is a judgment call — keep it configurable.
+- dispatch.py:54 DEFAULT_MAX_WORKERS = 12 — [I understand — one correction] A 64-CPU cruncher server does not imply more workers: header reads are network-I/O-bound, not CPU-bound. The right scaling axis is how much load shared scientific servers tolerate, not local CPUs. So it should stay a modest, per-node-aware budget (which the controller already learns), not scale with cores. It's already a DEFAULT_ param, so overridable.

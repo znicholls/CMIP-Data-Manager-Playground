@@ -48,6 +48,10 @@ from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
 T = TypeVar("T")
 
+# QUESTION: a number of these variables will want to be user_specified. Will want to
+# recommendations / default but will want users to be able to choose
+# See also Promoted_attrs (below): some of those HAVE to be there for our parent
+# workflow to be successful, but we should allow users to add to that if they want?
 HTTP_SERVICE = "HTTPServer"
 """The `service` token marking a directly downloadable HTTP URL in `FileRecord.urls`."""
 
@@ -603,6 +607,8 @@ class HeaderReadBlocked(OSError):
         )
 
 
+# QUESTION: specified here? I think this makes sense. We don't know what the block
+# signatures would be
 # Substrings (matched case-insensitively) that mark a read failure as a node-level
 # *block* — an explicit rate-limit or refusal — rather than an ordinary transient
 # error.  A single connection reset is deliberately *not* here: one reset is treated
