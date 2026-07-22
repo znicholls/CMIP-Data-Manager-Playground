@@ -53,7 +53,7 @@ flowchart TB
     subgraph ST1["Step 1 — search index node (SEARCH API)"]
         R1["runner.fetch_records + _dedupe<br/>build FacetQuery per (var, experiment)"]
         C1["client.ESGFSearchClient.search / search_many<br/>guards: DeepPaginationError > 10k"]
-        RR["Repository.record_run<br/>group master_id -> version -> node; diff vs prev spec"]
+        RR["Repository.record_run<br/>group master_id -> version -> node (ALL versions); diff vs prev spec"]
         R1 -->|"FacetQuery[]"| C1 -->|"DatasetRecord[]"| RR
     end
 
@@ -92,7 +92,8 @@ flowchart TB
     MAP -->|"map over parents"| W1
     HR --> DISP
 
-    RR --> ST2
+    RR --> VSEL["search.versions.select_target_versions<br/>narrow to target version per dataset (default: latest by version DATE)"]
+    VSEL --> ST2
     SF --> ST3
     PH -->|"UC-simple: DONE"| DONE["Dataset + versions + files + header metadata"]
     PH -->|"UC-chain"| ST4

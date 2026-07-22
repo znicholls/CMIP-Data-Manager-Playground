@@ -7,9 +7,10 @@ calls these to obtain a ready-to-use client and repository.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
-from cmip_data_manager.config import Settings
+from cmip_data_manager.config import DEFAULT_INDEX_ENDPOINTS, Settings
 from cmip_data_manager.db.engine import create_db_engine, init_db
 from cmip_data_manager.db.repository import Repository
 from cmip_data_manager.esgf.client import ESGFSearchClient
@@ -50,6 +51,53 @@ def build_client(
         max_results=settings.max_results,
         timeout=settings.timeout,
     )
+
+
+def build_file_search_clients(
+    endpoints: Sequence[str] = DEFAULT_INDEX_ENDPOINTS,
+    *,
+    settings: Settings | None = None,
+    map_fn: MapFn = serial_map,
+) -> list[ESGFSearchClient]:
+    """
+    Build one search client per endpoint, in preference order, for Step 2
+
+    The clients are deliberately built with **`no_retry`**: retry/backoff for the file
+    search is owned by `search.files.add_files`, so it can count retries in index-node
+    health and drive the endpoint fallback.  A version is tried on the next endpoint
+    only after the current one's retries and requeues are exhausted.
+
+    Parameters
+    ----------
+    endpoints
+        Search endpoints in preference order (defaults to `DEFAULT_INDEX_ENDPOINTS`:
+        metagrid-west, then CEDA).
+
+    settings
+        Paging/timeout settings shared by every client; defaults to `Settings()`.
+        Its `base_url` is ignored — the endpoints come from `endpoints`.
+
+    map_fn
+        Concurrency strategy handed to each client (only used for multi-query
+        searches, not the single-query file lookups Step 2 makes).
+
+    Returns
+    -------
+    :
+        One configured, non-retrying client per endpoint, in the given order.
+    """
+    settings = settings or Settings()
+    return [
+        ESGFSearchClient(
+            endpoint,
+            retry=no_retry,
+            map_fn=map_fn,
+            page_size=settings.page_size,
+            max_results=settings.max_results,
+            timeout=settings.timeout,
+        )
+        for endpoint in endpoints
+    ]
 
 
 def open_repository(db: str | Path, *, echo: bool = False) -> Repository:

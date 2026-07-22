@@ -651,3 +651,38 @@ Group E — tunables (I understand; the value is your/client's call)
 - headers.py:51 user-specifiable promoted attrs — [I understand / your call] Right instinct: split into a required core (parent_source_id, etc. — the parent workflow breaks without them) plus a user-extensible set. Which extras to expose is a client-facing choice.
 - headers.py:609 _BLOCK_SIGNATURES — [I understand / your call] Heuristic substrings (429, 403, "rate limit"). Correct to centralize and grow as we observe real node behavior. Exact list is a judgment call — keep it configurable.
 - dispatch.py:54 DEFAULT_MAX_WORKERS = 12 — [I understand — one correction] A 64-CPU cruncher server does not imply more workers: header reads are network-I/O-bound, not CPU-bound. The right scaling axis is how much load shared scientific servers tolerate, not local CPUs. So it should stay a modest, per-node-aware budget (which the controller already learns), not scale with cores. It's already a DEFAULT_ param, so overridable.
+
+Questions: is_latest (defined by us or cmip?)
+get file -> kills all when receives 500 kill
+
+Questions for Zeb:
+- Running live use-case-1 (ssp245, tas). Expectation is 553 simulations returned from the initial search step. Version question, do we want to search and save all the versions available? Or do we only care about latest_version = True for the cold run, then on additional runs we want to know if more versions have been published? It looks like the code is currently written to search for latest_version = True, which I only picked up on becuase two model-variants have two versions, both of which are True for latest version. The latest_version is populated from the json data in the search step, meaning that we cannot necessarily rely on 'latest' data (unless it comes from the same node?). So, do we want to save 'latest' as a column? Do we want to get all available versions initially in Step 1, then we make a choice at a later step about which one to focus on?
+- The Step 2 (search for file location) has a little bug. It searches for file location with default search proxy as metagrid.esgf-west.org (which is set in config.py Settings()). In the first live run attempt, about 50% of searches were returning as failures. We retry 5 times for each dataset before the entire step is killed ("HTTP 500" error), with nothing written into Files or FileAccess tables (even for successful models). So potential areas to fix this is to make this save as we go (somethign along those lines?) and also to attempt different mirrors (could you explain what a 'mirror' is? - claude uses it for the different nodes?), rather than our default esgf-west (such as CEDA, DKRZ, ORNL), although this risks not all of the datasets being available on these to link to files.
+
+Updates based on above questions:
+- Get all versions (Q: at what step do we not care about version information? Files? Headers? download?)
+- "I also don't know what claude means here for mirrors. Does it mean different search API URLs? I would be more tempted to just back off our searches and do them more slowly/with fewer threads. The other option is to use different search API URLs. In theory, they should all give the same results..."
+
+Before we continue and re-attempt the full use-case-1 (553 simulations), I want to make some updates based on the two issues found from the first attempt. Firstly, regarding the versions, in the Step 1 search step, we want to find all versions. In the datasetversion table, we want to keep the is_latest column, although we now know that we cannot rely on this information. For the Step 2, this is where we want to only get file (and for step 3, header) information for the latest version. We will need to build a little function which finds the true latest version based on the str version date. Please add these (in theory a user could also specify which version they want in the search step).
+Secondly, for the Step 2, we will need to make some updates to the workflow (what do you mean when you refer to mirrors?) Is it possible to save data as we go? Potentially what would the impact be of using fewer threads as well, to back off our searches and do them slightly more slowly? How could we also incorporate different URL/APIs rather than the default if there are datasets that are failing?
+
+Vocabulary I'll use (and stop abusing):
+- search endpoint — an index server that answers search queries (metagrid-west, CEDA); configured by base_url (+ distrib). Not "mirror."
+- data node — a server hosting file copies (FileAccess.data_node); a replica if it's a copy. This is the Step 3 concept.
+- dataset — a Dataset row (master_id).
+- dataset version — a DatasetVersion row (instance_id = master_id + version); its version is the vYYYYMMDD string.
+- file search — the Step 2 query that finds a dataset version's files.
+- So when a Step 2 query doesn't return, I'll say "the file search for a dataset version failed" — the search failed; the dataset version is just its subject. I won't call it a "failed version."
+
+Step 2 prompt:
+
+I want to make updates to the second step in the workflow: this step searches for the file URL in preparation for accessing the headers. This step populates File and FileAccess tables. Since completeley updating the repository a few days ago, we now are getting the 500 error for a number of datasets when attempting to call the metagrid-west API. I think this is related to our current chunking/retry/backoff methods, rather than due to other people attempting connections to the index node. In general, I would always like you to prefer paralelisation rather than chunking (except at the very initial step 1, index node search step). So, for Step 2, for each dataset, I would like you to start n_workers to paralelise, call a single URL, eg.g. metagrid-west, and save the file URL. If this is not successful, implement an exponentnial back-off strategy with default 3 retries. If this fails, then return to queue, and retry the URL again. An additional update is at this step we want to set a preference for URLs. Our recommendation is (metagrid-west, ceda) (first, second choice), and this should be used as the default but a user could specify at this step too. In addition to this, we want to retain all the index node health, similar to datanodehealth table. Retries, success, failure. Please create a detailed plan of this, then we can get started.
+
+Claude suggestion based on prompt
+Per-dataset, three escalating levels of resilience against a preference-ordered list of index endpoints (default (metagrid-west, ceda)):
+
+- Level 1 — in-request backoff: each per-dataset search retries with exponential backoff, default 3 retries, against the current endpoint.
+- Level 2 — requeue: datasets still failing after backoff go back on a queue and get one more full pass against the same endpoint (workers preserved).
+- Level 3 — endpoint fallback: datasets still failing move to the next preferred endpoint (metagrid-west → ceda) and repeat levels 1–2.
+
+Parallelism throughout via n_workers (thread pool — HTTP I/O), never aborting the pass: a per-dataset exception becomes a recorded failure + requeue, never propagates.

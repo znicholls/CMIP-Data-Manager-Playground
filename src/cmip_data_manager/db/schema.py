@@ -472,3 +472,45 @@ class NodeHealthStat(SQLModel, table=True):
     """Per-node connection count this host converged on last run (0 = not learned)."""
 
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class IndexNodeHealthStat(SQLModel, table=True):
+    """
+    Persisted per-search-index-endpoint file-search outcomes (Step 2)
+
+    The Step-2 twin of `NodeHealthStat`: where that records *data node* header-read
+    health, this records *search index* endpoint health — attempts, successes,
+    failures, how many calls were **retries**, and the subset of failures that were
+    **server errors** (5xx) or **timeouts**.  One row per endpoint, keyed on the full
+    search URL (two proxies on the same host differ by path), carrying accumulated
+    counters so index-node health survives across runs and can be ranked with a plain
+    `ORDER BY`.  A run loads these, records fresh outcomes against them, and writes
+    them back (incrementally, so a crash keeps what was learned).
+    """
+
+    endpoint: str = Field(primary_key=True)
+    """Full search endpoint URL (e.g. `https://esgf.ceda.ac.uk/esg-search/search`)."""
+
+    attempts: int = 0
+    """Total search calls made to this endpoint, including retries."""
+
+    successes: int = 0
+    failures: int = 0
+    """Calls that errored (`attempts == successes + failures`)."""
+
+    retries: int = 0
+    """Calls that were a retry of an earlier attempt (attempt number > 1)."""
+
+    server_errors: int = 0
+    """Failures that were an HTTP 5xx (e.g. the metagrid-west 500s)."""
+
+    timeouts: int = 0
+    """Failures that were a connect/read timeout."""
+
+    total_success_seconds: float = 0.0
+    """Summed duration of successful calls (numerator of the mean)."""
+
+    max_success_seconds: float = 0.0
+    """Slowest successful call seen; surfaces a pathologically slow-but-alive node."""
+
+    updated_at: datetime = Field(default_factory=_utcnow)

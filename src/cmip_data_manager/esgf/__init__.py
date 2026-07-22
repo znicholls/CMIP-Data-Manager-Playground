@@ -41,6 +41,12 @@ from cmip_data_manager.esgf.health import (
     ReadOutcome,
     recording,
 )
+from cmip_data_manager.esgf.index_health import (
+    IndexNodeHealth,
+    IndexNodeStat,
+    SearchOutcome,
+    classify_search_error,
+)
 from cmip_data_manager.esgf.models import (
     AmbiguousFieldError,
     DatasetRecord,
@@ -77,14 +83,18 @@ __all__ = [
     "HeaderReadBlocked",
     "HeaderReadCrashed",
     "HeaderReadTimeout",
+    "IndexNodeHealth",
+    "IndexNodeStat",
     "NodeHealth",
     "NodeStat",
     "ParentInfo",
     "ParentMetadataConflictError",
     "ReadOutcome",
+    "SearchOutcome",
     "SimulationCandidates",
     "build_candidates",
     "candidate_urls_for_files",
+    "classify_search_error",
     "exponential_backoff",
     "header_key",
     "hosts_to_simulations",

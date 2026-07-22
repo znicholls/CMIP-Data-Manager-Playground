@@ -14,6 +14,17 @@ from dataclasses import dataclass
 DEFAULT_BASE_URL = "https://metagrid.esgf-west.org/proxy/search"
 """Default ESGF search endpoint (a thin proxy in front of the esg-search API)."""
 
+CEDA_BASE_URL = "https://esgf.ceda.ac.uk/esg-search/search"
+"""CEDA's esg-search endpoint — a fast, independent index used as the Step-2 file-search
+fallback.  It returns the same Solr JSON shape as the metagrid proxy, so no separate
+parsing is needed."""
+
+DEFAULT_INDEX_ENDPOINTS = (DEFAULT_BASE_URL, CEDA_BASE_URL)
+"""Preference-ordered search-index endpoints for the Step-2 file search: metagrid-west
+first, then CEDA.  `search.files.add_files` tries each in turn, falling back to the next
+only after an endpoint's retries and requeues are exhausted.  Override the order or the
+set to search different mirrors."""
+
 # QUESTION: do we wan to get rid of this? Should this be something we specify?
 # Likely this changes as we do project/esgf integration (honestly same with above)
 DEFAULT_PROJECT = "CMIP6"

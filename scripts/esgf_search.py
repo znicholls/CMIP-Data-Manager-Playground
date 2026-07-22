@@ -19,7 +19,12 @@ Run with: ``uv run python scripts/esgf_search.py``
 
 from __future__ import annotations
 
-from cmip_data_manager import Settings, build_client, open_repository
+from cmip_data_manager import (
+    Settings,
+    build_client,
+    build_file_search_clients,
+    open_repository,
+)
 from cmip_data_manager.esgf.client import ESGFSearchClient
 from cmip_data_manager.esgf.concurrency import (
     exponential_backoff,
@@ -370,14 +375,15 @@ def main() -> None:
             # Step 2: store each version's files, then Step 3: read + promote headers.
             files = add_files(
                 result.records,
-                client=client,
+                clients=build_file_search_clients(settings=SETTINGS),
                 repository=repository,
                 map_fn=thread_pool_map(max_workers=FILE_SEARCH_WORKERS),
             )
             print(
                 "file search: "
                 f"searched={files.searched} skipped_cached={files.skipped_cached} "
-                f"files_stored={files.files_stored} overflowed={len(files.overflowed)}"
+                f"files_stored={files.files_stored} overflowed={len(files.overflowed)} "
+                f"failed={len(files.failed)}"
             )
             outcome = enrich_version_headers(
                 result.records,

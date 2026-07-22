@@ -384,8 +384,14 @@ class _WalkState:
 
     def hop(self, frontier: list[DatasetRecord]) -> list[DatasetRecord]:
         """Read a frontier's headers, resolve each declared parent, return the next."""
+        # Re-use Step 2 for this hop's files; a failed file search must not hard-raise
+        # mid-walk (the header read below handles a parent with no stored files).
         add_files(
-            frontier, client=self.client, repository=self.repository, map_fn=self.map_fn
+            frontier,
+            clients=(self.client,),
+            repository=self.repository,
+            map_fn=self.map_fn,
+            raise_on_incomplete=False,
         )
         enrich_version_headers(
             list(frontier),

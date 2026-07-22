@@ -42,6 +42,7 @@ from cmip_data_manager.db.schema import (
     File,
     FileAccess,
     HeaderReadAttempt,
+    IndexNodeHealthStat,
     NodeHealthStat,
     RunMembership,
     SearchRun,
@@ -53,6 +54,7 @@ from cmip_data_manager.esgf.headers import (
     https_twin,
 )
 from cmip_data_manager.esgf.health import NodeHealth, NodeStat
+from cmip_data_manager.esgf.index_health import IndexNodeHealth, IndexNodeStat
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
 # QUESTION: Is this an area that we may need to specify
@@ -364,6 +366,78 @@ class Repository:
         return sorted(
             with_success,
             key=lambda r: (r.total_success_seconds / r.successes, r.host),
+        )
+
+    def save_index_health(self, health: IndexNodeHealth) -> int:
+        """
+        Persist a search-index health registry, upserting one row per endpoint
+
+        The Step-2 twin of `save_node_health`: writes the current in-memory counters
+        back to `IndexNodeHealthStat` so index-node health accumulates across runs.
+        Upserting the whole snapshot is idempotent, so Step 2 can call this
+        incrementally (save-as-you-go) — a crash keeps what was learned so far.
+
+        Parameters
+        ----------
+        health
+            The registry to persist.
+
+        Returns
+        -------
+        :
+            Number of endpoint rows written or updated.
+        """
+        snapshot = health.snapshot()
+        with Session(self._engine) as session:
+            for endpoint, stat in snapshot.items():
+                existing = session.get(IndexNodeHealthStat, endpoint)
+                columns = _index_health_columns(stat)
+                if existing is None:
+                    session.add(IndexNodeHealthStat(endpoint=endpoint, **columns))
+                else:
+                    for column, value in columns.items():
+                        setattr(existing, column, value)
+                    session.add(existing)
+            session.commit()
+        return len(snapshot)
+
+    def load_index_health(self) -> IndexNodeHealth:
+        """
+        Rebuild an in-memory search-index health registry from persisted rows
+
+        Returns
+        -------
+        :
+            An `IndexNodeHealth` seeded with every stored endpoint's counters (empty
+            if none have been persisted).
+        """
+        health = IndexNodeHealth()
+        with Session(self._engine) as session:
+            for row in session.exec(select(IndexNodeHealthStat)).all():
+                health.restore(_index_stat_from_row(row))
+        return health
+
+    def rank_index_nodes_by_reliability(self) -> list[IndexNodeHealthStat]:
+        """
+        Return persisted search endpoints best-to-worst by success rate
+
+        The Step-2 twin of `rank_nodes_by_reliability`.  Ordered by descending
+        `successes/attempts`, with more-tried endpoints winning ties.
+
+        Returns
+        -------
+        :
+            The stored endpoint rows, most reliable first.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(select(IndexNodeHealthStat)).all()
+        return sorted(
+            rows,
+            key=lambda r: (
+                -(r.successes / r.attempts) if r.attempts else 0.0,
+                -r.attempts,
+                r.endpoint,
+            ),
         )
 
     def record_header_attempts(self, attempts: Sequence[HeaderAttempt]) -> int:
@@ -1139,4 +1213,34 @@ def _stat_from_row(row: NodeHealthStat) -> NodeStat:
         max_success_seconds=row.max_success_seconds,
         max_safe_concurrency=row.max_safe_concurrency,
         last_concurrency=row.last_concurrency,
+    )
+
+
+def _index_health_columns(stat: IndexNodeStat) -> dict[str, Any]:
+    """Return the storable columns of an index-health stat (excluding the endpoint)."""
+    return {
+        "attempts": stat.attempts,
+        "successes": stat.successes,
+        "failures": stat.failures,
+        "retries": stat.retries,
+        "server_errors": stat.server_errors,
+        "timeouts": stat.timeouts,
+        "total_success_seconds": stat.total_success_seconds,
+        "max_success_seconds": stat.max_success_seconds,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def _index_stat_from_row(row: IndexNodeHealthStat) -> IndexNodeStat:
+    """Rebuild an in-memory `IndexNodeStat` from a stored index-health row."""
+    return IndexNodeStat(
+        endpoint=row.endpoint,
+        attempts=row.attempts,
+        successes=row.successes,
+        failures=row.failures,
+        retries=row.retries,
+        server_errors=row.server_errors,
+        timeouts=row.timeouts,
+        total_success_seconds=row.total_success_seconds,
+        max_success_seconds=row.max_success_seconds,
     )

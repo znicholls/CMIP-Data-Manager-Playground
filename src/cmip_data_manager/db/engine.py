@@ -62,17 +62,23 @@ def create_db_engine(target: str | Path, *, echo: bool = False) -> Engine:
     url = _to_url(target)
     engine = create_engine(url, echo=echo)
     if engine.dialect.name == "sqlite":
-        _enable_sqlite_foreign_keys(engine)
+        _configure_sqlite(engine)
     return engine
 
 
-def _enable_sqlite_foreign_keys(engine: Engine) -> None:
-    """Turn on `PRAGMA foreign_keys` for every SQLite connection."""
+def _configure_sqlite(engine: Engine) -> None:
+    """Set per-connection SQLite pragmas.
+
+    Enables foreign-key enforcement (so the `Dataset`/`File` relationships behave)
+    and write-ahead logging, so Step 2's save-as-you-go commits do not block a
+    reader inspecting the database while a run is in progress.
+    """
 
     @event.listens_for(engine, "connect")
     def _set_pragma(dbapi_connection: Any, _connection_record: object) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 
 

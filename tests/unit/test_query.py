@@ -18,10 +18,19 @@ def test_and_across_facets_or_within():
     assert params["variable_id"] == "tas"
     assert params["frequency"] == "mon"
     assert params["type"] == "Dataset"
-    assert params["latest"] == "true"
+    # `latest` is omitted by default, so the search returns all versions.
+    assert "latest" not in params
     assert params["format"] == "application/solr+json"
     assert params["offset"] == "0"
     assert params["limit"] == "10"
+
+
+def test_latest_default_omitted_and_explicit():
+    # Default: no `latest` param -> all published versions returned.
+    assert "latest" not in FacetQuery().to_params(0, 10)
+    # Explicit True/False are still emitted.
+    assert FacetQuery(latest=True).to_params(0, 10)["latest"] == "true"
+    assert FacetQuery(latest=False).to_params(0, 10)["latest"] == "false"
 
 
 def test_optional_flags_and_free_text():

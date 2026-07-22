@@ -17,6 +17,7 @@ from cmip_data_manager.db.schema import (
     DatasetVersion,
     File,
     FileAccess,
+    IndexNodeHealthStat,
     RunMembership,
     SearchRun,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "DatasetVersion",
     "File",
     "FileAccess",
+    "IndexNodeHealthStat",
     "Repository",
     "RunMembership",
     "RunResult",

@@ -17,7 +17,11 @@ from cmip_data_manager.search.aggregate import (
     pairs_all_experiments,
     pairs_any_experiment,
 )
-from cmip_data_manager.search.files import AddFilesResult, add_files
+from cmip_data_manager.search.files import (
+    AddFilesResult,
+    FileSearchIncompleteError,
+    add_files,
+)
 from cmip_data_manager.search.parent_walk import (
     ParentExperimentMissingError,
     ParentNotAncestor,
@@ -45,10 +49,16 @@ from cmip_data_manager.search.version_headers import (
     VersionEnrichResult,
     enrich_version_headers,
 )
+from cmip_data_manager.search.versions import (
+    VersionSelection,
+    latest_version,
+    select_target_versions,
+)
 
 __all__ = [
     "AddFilesResult",
     "Cell",
+    "FileSearchIncompleteError",
     "ModelVariant",
     "PairMatch",
     "ParentConflict",
@@ -62,12 +72,14 @@ __all__ = [
     "UseCase",
     "UseCaseResult",
     "VersionEnrichResult",
+    "VersionSelection",
     "add_files",
     "build_cells",
     "declared_parent",
     "discover_experiments",
     "enrich_version_headers",
     "fetch_records",
+    "latest_version",
     "pairs_all_experiments",
     "pairs_any_experiment",
     "parent_cell_of",
@@ -75,4 +87,5 @@ __all__ = [
     "resolve_parent_chains",
     "resolve_parent_links",
     "run_use_case",
+    "select_target_versions",
 ]

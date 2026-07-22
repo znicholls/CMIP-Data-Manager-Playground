@@ -111,8 +111,17 @@ class FacetQuery(BaseModel):
     >>> params = q.to_params(offset=0, limit=10)
     >>> params["experiment_id"], params["variable_id"], params["frequency"]
     ('ssp245', 'tas', 'mon')
-    >>> params["type"], params["latest"], params["limit"], params["offset"]
-    ('Dataset', 'true', '10', '0')
+    >>> params["type"], params["limit"], params["offset"]
+    ('Dataset', '10', '0')
+
+    By default `latest` is omitted, so **all** published versions are returned
+    (Steps 2-3 then select a target version); pass ``latest=True`` to restrict to
+    the latest at the index:
+
+    >>> "latest" in params
+    False
+    >>> FacetQuery(latest=True).to_params(0, 10)["latest"]
+    'true'
 
     Multiple values for one facet are comma-joined (logical OR):
 
@@ -169,8 +178,17 @@ class FacetQuery(BaseModel):
     `"experiment_id:ssp*"` or `"experiment_id:(historical OR esm-ssp*)"`.
     """
 
-    latest: bool = True
-    """Restrict to the latest version of each dataset."""
+    latest: bool | None = None
+    """
+    Restrict to the latest version of each dataset (`True`) or to superseded
+    versions only (`False`).
+
+    Defaults to `None`, which **omits** the parameter so the search returns **all**
+    published versions of each dataset.  The workflow stores every version at Step 1
+    and then selects a target version for Steps 2-3
+    (see `cmip_data_manager.search.versions.select_target_versions`); `is_latest`
+    from ESGF is recorded but not trusted, because data nodes disagree about it.
+    """
 
     replica: bool | None = None
     """If set, restrict to (`True`) or exclude (`False`) replicas."""
@@ -222,10 +240,11 @@ class FacetQuery(BaseModel):
             "project": self.project,
             "offset": str(offset),
             "limit": str(limit),
-            "latest": _bool_param(self.latest),
         }
         for name, values in self._facet_items():
             params[name] = ",".join(values)
+        if self.latest is not None:
+            params["latest"] = _bool_param(self.latest)
         if self.replica is not None:
             params["replica"] = _bool_param(self.replica)
         if self.distrib is not None:

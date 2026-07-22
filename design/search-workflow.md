@@ -246,6 +246,22 @@ flowchart TD
     AGG -- "yes" --> RAISE["RAISE aggregate error listing every broken chain<br/>(child -> missing/searched parent) after all chains attempted"]
 ```
 
+### Version handling — store all versions, select a target for Steps 2-3
+
+Step 1 fetches **all** published versions of each dataset: the index query omits the
+`latest` parameter (`FacetQuery.latest` defaults to `None`), so `DatasetVersion` holds
+the full version history. ESGF's `latest` flag is still recorded on `is_latest` but is
+**not trusted** — data nodes disagree about it (a superseded and a newer version can
+each be flagged `latest=true` by different nodes).
+
+Between Step 1 and Step 2, `search/versions.py::select_target_versions` narrows to a
+**target version per dataset**, and only those versions get files (Step 2) and headers
+(Step 3). The default is the **true latest by version date** (`parse_version_date`, not
+a string sort, so a stray `v` prefix cannot mis-rank). The `selection` seam accepts
+`"latest"` (default), `"all"` (every version), or a `{master_id: version}` mapping that
+pins specific datasets to a chosen (e.g. older) version — the "user asks for a specific
+version" case. A dataset with no date-parseable version is kept in full, never dropped.
+
 ### The parent loop (UC-chain)
 
 A discovered *intermediate* parent re-enters at **Step 2** (add its files) → Step 3

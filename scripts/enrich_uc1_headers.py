@@ -46,15 +46,26 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from cmip_data_manager import Settings, build_client, open_repository
+from cmip_data_manager import (
+    Settings,
+    build_client,
+    build_file_search_clients,
+    open_repository,
+)
+from cmip_data_manager.config import DEFAULT_INDEX_ENDPOINTS
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
 from cmip_data_manager.esgf.query import FacetQuery
-from cmip_data_manager.search import add_files, enrich_version_headers
+from cmip_data_manager.search import (
+    add_files,
+    enrich_version_headers,
+    select_target_versions,
+)
 
 # --- Configuration (edit me) -------------------------------------------------
-DB_PATH = "uc1_walkthrough.sqlite"
-"""Fresh database for the one-model walk-through, so every table starts empty and
-each step's writes are easy to inspect.  Delete it to start over."""
+DB_PATH = "uc1_full_ranked.sqlite"
+"""Fresh database for the full ranked cold run (NCI->ORNL preference).  A distinct
+file from the one-model walk-through so this run starts with no learned node health
+(genuinely cold) and leaves the earlier walk-through DB untouched.  Delete to redo."""
 
 USE_CASE = "uc1_tas_ssp245"
 """The cached use case whose datasets to enrich."""
@@ -72,19 +83,28 @@ UC1_QUERY = FacetQuery(
 )
 """Use case 1: all monthly `tas` datasets for `ssp245`."""
 
-SINGLE_MODEL: str | None = "ACCESS-ESM1-5"
+VERSION_SELECTION = "latest"
+"""Which dataset version(s) to fetch files/headers for.  Step 1 now stores **all**
+published versions; this narrows Steps 2-3.  `"latest"` (true latest by version
+date), `"all"` (every version), or a `{master_id: version}` mapping to pin specific
+datasets to a chosen (e.g. older) version."""
+
+SINGLE_MODEL: str | None = None
 """If set to a `source_id`, restrict the ENTIRE run to that one model — the tiniest
 possible live walk-through of steps 1→2→3.  With `ONE_VARIANT_PER_MODEL = True` this
 traces exactly one simulation (one `DatasetVersion`, its `File`/`FileAccess` rows,
 one header read).  Set to `None` to run the full use case (~553 simulations)."""
 
-ONE_VARIANT_PER_MODEL = True
+ONE_VARIANT_PER_MODEL = False
 """If True, enrich only one variant (ensemble member) per model — a ~49-simulation
 smoke test rather than the full ~553.  With `SINGLE_MODEL` set, this narrows to a
 single simulation.  Set to False for the complete run."""
 
-PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
-"""Data nodes to try first when reading headers (empty tuple = no preference)."""
+PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au", "esgf-node.ornl.gov")
+"""Data nodes to try first when reading headers, **most-preferred first** (ranked):
+NCI, then ORNL.  `order_candidates` ranks by tuple position, above the health tier,
+so on this cold run the NCI->ORNL preference dominates and health only breaks ties
+among the remaining mirrors.  Empty tuple = no preference."""
 
 IGNORE_HOSTS: frozenset[str] = frozenset(
     {
@@ -121,6 +141,14 @@ NODE_CONCURRENCY = 2
 
 FILE_SEARCH_WORKERS = 8
 """Parallel per-version file searches in the Step-2 `add_files` pass (HTTP I/O)."""
+
+FILE_SEARCH_ENDPOINTS: tuple[str, ...] = DEFAULT_INDEX_ENDPOINTS
+"""Preference-ordered index endpoints for the Step-2 file search (metagrid-west, then
+CEDA).  add_files tries each in turn, falling back only after an endpoint's retries and
+requeues are exhausted.  Edit to search different mirrors or change the order."""
+
+FILE_SEARCH_RETRIES = 5
+"""In-request exponential-backoff retries per version, per endpoint, before requeue."""
 
 READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet.  Once health exists,
@@ -234,6 +262,24 @@ def _print_node_health(repository) -> None:
         print(f"  suggested read timeout (from observed reads): {suggested:.1f}s")
 
 
+def _print_index_health(repository) -> None:
+    """Print the persisted per-endpoint (index-node) file-search health."""
+    ranked = repository.rank_index_nodes_by_reliability()
+    if not ranked:
+        print("  (no index-node health recorded)")
+        return
+    print("  index-node health (file searches, best first):")
+    for stat in ranked:
+        mean = stat.total_success_seconds / stat.successes if stat.successes else 0.0
+        pct = 100.0 * (stat.attempts - stat.successes) / stat.attempts
+        print(
+            f"    {stat.endpoint:<52} {pct:5.1f}% failed "
+            f"({stat.successes}/{stat.attempts} ok, {stat.retries} retries, "
+            f"{stat.server_errors} 5xx, {stat.timeouts} timeout) "
+            f"{mean:5.2f}s mean"
+        )
+
+
 def _print_failed_trail(
     repository,
     source_id: str,
@@ -287,22 +333,39 @@ def main() -> None:
 
     records = _narrow_records(records)
 
+    # Version selection: Step 1 stored ALL versions; narrow Steps 2-3 to the target
+    # version per dataset (default: true latest by version date, not ESGF's flag).
+    before_versions = len({r.instance_key for r in records})
+    records = select_target_versions(records, selection=VERSION_SELECTION)
+    after_versions = len({r.instance_key for r in records})
+    print(
+        f"version selection ({VERSION_SELECTION}): "
+        f"{before_versions} -> {after_versions} dataset versions"
+    )
+
     # 2. File step: search each version's files once and store them as File /
     #    FileAccess rows (the header read in step 3 reads from these, not the index).
+    #    One search per version, parallelised across workers, with per-endpoint
+    #    backoff -> requeue -> fallback over FILE_SEARCH_ENDPOINTS, saving as it goes.
+    file_clients = build_file_search_clients(FILE_SEARCH_ENDPOINTS, settings=SETTINGS)
+    print(f"  file-search endpoints (in order): {list(FILE_SEARCH_ENDPOINTS)}")
     started = time.perf_counter()
     files = add_files(
         records,
-        client=client,
+        clients=file_clients,
         repository=repository,
         map_fn=thread_pool_map(max_workers=FILE_SEARCH_WORKERS),
+        retries=FILE_SEARCH_RETRIES,
         skip_cached=not FORCE_REREAD,
     )
     files_seconds = time.perf_counter() - started
     print(
         f"file step: searched={files.searched} "
         f"skipped_cached={files.skipped_cached} files_stored={files.files_stored} "
-        f"overflowed={len(files.overflowed)} in {files_seconds:.2f}s"
+        f"overflowed={len(files.overflowed)} failed={len(files.failed)} "
+        f"in {files_seconds:.2f}s"
     )
+    _print_index_health(repository)
 
     # 3. Header step: read + promote one header per simulation, from the live nodes.
     #    Size the stall timeout from what healthy nodes actually took last run

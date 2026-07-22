@@ -52,6 +52,10 @@ class _FileClient:
     def __init__(self, files_by_dataset_id):
         self._files = files_by_dataset_id
 
+    @property
+    def base_url(self) -> str:
+        return "https://index/search"
+
     def search_files(self, query: FacetQuery) -> list[FileRecord]:
         out: list[FileRecord] = []
         for dataset_id in query.dataset_id:
@@ -77,7 +81,7 @@ def _setup(repository, records):
     """Run Step 1 (versions) and Step 2 (files) so Step 3 has stored candidates."""
     repository.record_run(records, endpoint_url="u", spec={}, tag="uc")
     files = {r.id: [_file(r.id, f"{r.variable_id}.nc")] for r in records}
-    add_files(records, client=_FileClient(files), repository=repository)
+    add_files(records, clients=(_FileClient(files),), repository=repository)
 
 
 def _reader_for(records):
