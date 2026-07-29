@@ -33,7 +33,7 @@ flowchart TB
         CLIENT["client<br/>search · search_files · count"]
         DISP["dispatch · routing<br/>dispatch_reads · build_candidates"]
         HDR["headers<br/>read_header · with_timeout · declared_parent"]
-        HEALTH["health · concurrency<br/>NodeHealth · thread_pool_map"]
+        HEALTH["health · index_health · concurrency<br/>NodeHealth · IndexNodeHealth · thread_pool_map"]
     end
 
     subgraph L1["db/repository.py — Repository (the ONLY layer that touches tables)"]
@@ -42,7 +42,7 @@ flowchart TB
         SF["store_files<br/>get_version_files"]
         PH["promote_header<br/>version_header"]
         SPV["set_parent_version<br/>latest_version_for"]
-        NH["load/save_node_health<br/>record_header_attempts"]
+        NH["load/save_node_health · record_header_attempts<br/>load/save_index_health · record_file_access_attempts (Step 2)"]
     end
 
     subgraph L0["db/schema.py — SQLite tables (the bottom: data, no logic)"]
@@ -50,7 +50,7 @@ flowchart TB
         T_RUN["SearchRun<br/>RunMembership · DatasetChange"]
         T_DS["Dataset (1 to many) DatasetVersion<br/>(1 to many) DatasetNodeSpecificInfo"]
         T_FILE["DatasetVersion (1 to many) File<br/>(1 to many) FileAccess"]
-        T_OBS["NodeHealthStat<br/>HeaderReadAttempt"]
+        T_OBS["DataNodeHealthStat · HeaderReadAttempt<br/>IndexNodeHealthStat · FileAccessAttempt (Step 2)"]
     end
 
     %% scripts drive the workflow
@@ -93,7 +93,10 @@ flowchart TB
 - **`search/` (step orchestrators).** One function per workflow step. Each function
   is the "what happens in this step" — it uses the `esgf/` layer for the network and
   the `Repository` for persistence, but never opens a DB session itself:
-  - `add_files` — **Step 2**, one file search per version → `store_files`;
+  - `add_files` — **Step 2**, one file search per version over preference-ordered
+    endpoints (backoff → requeue → fallback), saving as it goes → `store_files` +
+    `save_index_health`, and logging every search call (retry/requeue/fallback) via
+    `record_file_access_attempts`;
   - `enrich_version_headers` — **Step 3**, read one header per simulation from the
     stored file URLs → `promote_header`;
   - `resolve_parent_chains` — **Step 4**, walk the parent tree, one search per
@@ -118,7 +121,7 @@ flowchart TB
     (one per version) → many `DatasetNodeSpecificInfo` (one per data node);
   - `DatasetVersion` → many `File` → many `FileAccess` (one per node URL);
   - `SearchRun` with `RunMembership`/`DatasetChange` (what each run returned and how
-    it changed); `NodeHealthStat`/`HeaderReadAttempt` (the node-health observations).
+    it changed); `DataNodeHealthStat`/`HeaderReadAttempt` (the node-health observations).
 
 ## Simplifications made here
 

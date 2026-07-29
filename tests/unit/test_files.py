@@ -354,3 +354,76 @@ def test_health_can_be_supplied_and_is_accumulated(repository):
     # the supplied registry is updated in place, and the run also persisted it
     assert health.stat(WEST).successes == 1
     assert repository.load_index_health().stat(WEST).successes == 1
+
+
+def test_logs_a_success_attempt_per_version(repository):
+    a = _rec("a")
+    _store_versions(repository, [a])
+    client = _FakeClient({a.id: [_file("f", a.id, "a.nc")]})
+
+    add_files([a], clients=[client], repository=repository)
+
+    (attempt,) = repository.get_file_access_attempts()
+    assert attempt.endpoint == WEST
+    assert attempt.version_key == a.instance_key
+    assert attempt.outcome == "success"
+    assert attempt.files_found == 1
+    assert attempt.attempt_no == 1
+
+
+def test_logs_empty_distinctly_from_success(repository):
+    a = _rec("a")
+    _store_versions(repository, [a])
+    client = _FakeClient({})  # HTTP 200, but the index knows no files for this version
+
+    result = add_files([a], clients=[client], repository=repository)
+
+    assert not result.failed  # an empty hit is a successful (if fruitless) search
+    assert result.files_stored == 0
+    (attempt,) = repository.get_file_access_attempts(outcome="empty")
+    assert attempt.version_key == a.instance_key
+    assert attempt.files_found == 0
+
+
+def test_logs_every_attempt_across_retries_and_fallback(repository):
+    a = _rec("a")
+    _store_versions(repository, [a])
+    west = _FakeClient(base_url=WEST, raises=_http_500())  # always 500
+    ceda = _FakeClient({a.id: [_file("f", a.id, "a.nc")]}, base_url=CEDA)
+
+    add_files(
+        [a],
+        clients=[west, ceda],
+        repository=repository,
+        retries=1,
+        requeue_rounds=0,
+        sleep=_noop,
+    )
+
+    attempts = repository.get_file_access_attempts(version_key=a.instance_key)
+    # two failed calls on WEST (initial + one retry), then one success on CEDA
+    west_attempts = [x for x in attempts if x.endpoint == WEST]
+    ceda_attempts = [x for x in attempts if x.endpoint == CEDA]
+    assert [x.outcome for x in west_attempts] == ["server_error", "server_error"]
+    assert all(x.detail for x in west_attempts)  # the 500 text is captured
+    assert [x.outcome for x in ceda_attempts] == ["success"]
+
+
+def test_logs_an_error_attempt_when_a_worker_raises_unexpectedly(repository):
+    bad = _rec("bad")
+    _store_versions(repository, [bad])
+    client = _FakeClient(base_url=WEST, raises=ValueError("boom"))
+
+    add_files(
+        [bad],
+        clients=[client],
+        repository=repository,
+        retries=0,
+        requeue_rounds=0,
+        sleep=_noop,
+        raise_on_incomplete=False,
+    )
+
+    (attempt,) = repository.get_file_access_attempts(version_key=bad.instance_key)
+    assert attempt.outcome == "error"
+    assert "boom" in attempt.detail

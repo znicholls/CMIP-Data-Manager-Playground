@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cmip_data_manager.db.repository import HeaderAttempt
+from cmip_data_manager.db.repository import FileSearchAttempt, HeaderAttempt
 from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord
 
@@ -270,6 +270,68 @@ def test_get_header_attempts_newest_first(repository):
     repository.record_header_attempts([_attempt(url="https://nci/second.nc")])
     urls = [a.url for a in repository.get_header_attempts()]
     assert urls == ["https://nci/second.nc", "https://nci/first.nc"]
+
+
+_CEDA = "https://esgf.ceda.ac.uk/esg-search/search"
+_ORNL = "https://esgf-node.ornl.gov/proxy/search"
+
+
+def _file_attempt(**overrides):
+    """Build a FileSearchAttempt with sensible defaults for the log tests."""
+    fields = {
+        "endpoint": _CEDA,
+        "version_key": "M.ssp245.r1.tas.v20240101",
+        "outcome": "success",
+        "files_found": 3,
+        "seconds": 1.5,
+        "attempt_no": 1,
+    }
+    fields.update(overrides)
+    return FileSearchAttempt(**fields)
+
+
+def test_record_file_access_attempts_is_append_only(repository):
+    assert repository.record_file_access_attempts([]) == 0  # nothing to write
+    n = repository.record_file_access_attempts(
+        [_file_attempt(version_key="a"), _file_attempt(version_key="b")]
+    )
+    assert n == 2
+    # Recording the same logical attempt again appends rather than upserting.
+    repository.record_file_access_attempts([_file_attempt(version_key="a")])
+    assert len(repository.get_file_access_attempts()) == 3
+
+
+def test_record_file_access_attempts_persists_the_error_detail(repository):
+    repository.record_file_access_attempts(
+        [_file_attempt(outcome="server_error", files_found=0, detail="500 from index")]
+    )
+    (stored,) = repository.get_file_access_attempts()
+    assert stored.outcome == "server_error"
+    assert stored.files_found == 0
+    assert stored.detail == "500 from index"
+
+
+def test_get_file_access_attempts_filters(repository):
+    repository.record_file_access_attempts(
+        [
+            _file_attempt(endpoint=_CEDA, version_key="v1", outcome="empty"),
+            _file_attempt(endpoint=_ORNL, version_key="v1", outcome="success"),
+            _file_attempt(endpoint=_CEDA, version_key="v2", outcome="server_error"),
+        ]
+    )
+    by_endpoint = repository.get_file_access_attempts(endpoint=_CEDA)
+    assert len(by_endpoint) == 2
+    by_version = repository.get_file_access_attempts(version_key="v1")
+    assert {a.endpoint for a in by_version} == {_CEDA, _ORNL}
+    only_empty = repository.get_file_access_attempts(outcome="empty")
+    assert [a.version_key for a in only_empty] == ["v1"]
+
+
+def test_get_file_access_attempts_newest_first(repository):
+    repository.record_file_access_attempts([_file_attempt(version_key="first")])
+    repository.record_file_access_attempts([_file_attempt(version_key="second")])
+    keys = [a.version_key for a in repository.get_file_access_attempts()]
+    assert keys == ["second", "first"]
 
 
 def test_header_attempt_summary_rolls_up_by_host(repository):

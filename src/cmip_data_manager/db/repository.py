@@ -35,15 +35,16 @@ from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
 from cmip_data_manager.db.schema import (
+    DataNodeHealthStat,
     Dataset,
     DatasetChange,
     DatasetNodeSpecificInfo,
     DatasetVersion,
     File,
     FileAccess,
+    FileAccessAttempt,
     HeaderReadAttempt,
     IndexNodeHealthStat,
-    NodeHealthStat,
     RunMembership,
     SearchRun,
     parse_version_date,
@@ -129,6 +130,26 @@ class HeaderAttempt:
     attempt_no: int = 1
     detail: str | None = None
     """The error/exception text (or a note for a synthetic row); `None` on success."""
+
+
+@dataclass(frozen=True)
+class FileSearchAttempt:
+    """
+    One file-search attempt to persist to the `FileAccessAttempt` log
+
+    The write-side counterpart of the schema row: `search.files.add_files` builds one
+    of these per search call it issues for a version (each backoff retry, each requeue,
+    each endpoint fallback) and hands them to `record_file_access_attempts`.
+    """
+
+    endpoint: str
+    version_key: str
+    outcome: str
+    files_found: int = 0
+    detail: str | None = None
+    """The error/exception text for a failed attempt; `None` on `success`/`empty`."""
+    seconds: float = 0.0
+    attempt_no: int = 1
 
 
 @dataclass(frozen=True)
@@ -279,7 +300,7 @@ class Repository:
         """
         Persist a node-health registry, upserting one row per host
 
-        Writes the current in-memory counters back to `NodeHealthStat` so health
+        Writes the current in-memory counters back to `DataNodeHealthStat` so health
         accumulates across runs.  Load with `load_node_health` at the start of a
         run, record onto it, then save it here at the end.
 
@@ -296,10 +317,10 @@ class Repository:
         snapshot = health.snapshot()
         with Session(self._engine) as session:
             for host, stat in snapshot.items():
-                existing = session.get(NodeHealthStat, host)
+                existing = session.get(DataNodeHealthStat, host)
                 columns = _node_health_columns(stat)
                 if existing is None:
-                    session.add(NodeHealthStat(host=host, **columns))
+                    session.add(DataNodeHealthStat(host=host, **columns))
                 else:
                     for column, value in columns.items():
                         setattr(existing, column, value)
@@ -319,11 +340,11 @@ class Repository:
         """
         health = NodeHealth()
         with Session(self._engine) as session:
-            for row in session.exec(select(NodeHealthStat)).all():
+            for row in session.exec(select(DataNodeHealthStat)).all():
                 health.restore(_stat_from_row(row))
         return health
 
-    def rank_nodes_by_reliability(self) -> list[NodeHealthStat]:
+    def rank_nodes_by_reliability(self) -> list[DataNodeHealthStat]:
         """
         Return persisted hosts best-to-worst by success rate
 
@@ -337,7 +358,7 @@ class Repository:
             The stored host rows, most reliable first.
         """
         with Session(self._engine) as session:
-            rows = session.exec(select(NodeHealthStat)).all()
+            rows = session.exec(select(DataNodeHealthStat)).all()
         return sorted(
             rows,
             key=lambda r: (
@@ -347,7 +368,7 @@ class Repository:
             ),
         )
 
-    def rank_nodes_by_speed(self) -> list[NodeHealthStat]:
+    def rank_nodes_by_speed(self) -> list[DataNodeHealthStat]:
         """
         Return persisted hosts fastest-to-slowest by mean successful-read time
 
@@ -361,7 +382,7 @@ class Repository:
             The stored host rows with successes, fastest first.
         """
         with Session(self._engine) as session:
-            rows = session.exec(select(NodeHealthStat)).all()
+            rows = session.exec(select(DataNodeHealthStat)).all()
         with_success = [row for row in rows if row.successes]
         return sorted(
             with_success,
@@ -533,6 +554,92 @@ class Repository:
         if since is not None:
             statement = statement.where(HeaderReadAttempt.created_at >= since)
         statement = statement.order_by(col(HeaderReadAttempt.id).desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        with Session(self._engine) as session:
+            return list(session.exec(statement).all())
+
+    def record_file_access_attempts(self, attempts: Sequence[FileSearchAttempt]) -> int:
+        """
+        Append per-attempt file-search records to the log
+
+        The Step-2 twin of `record_header_attempts`: append-only, so every search call
+        (including backoff retries, requeues, endpoint fallbacks and versions that fully
+        failed) becomes its own `FileAccessAttempt` row and the log builds a history
+        across runs rather than being overwritten.
+
+        Parameters
+        ----------
+        attempts
+            The attempts to record.
+
+        Returns
+        -------
+        :
+            Number of rows written.
+        """
+        if not attempts:
+            return 0
+        with Session(self._engine) as session:
+            for attempt in attempts:
+                session.add(
+                    FileAccessAttempt(
+                        endpoint=attempt.endpoint,
+                        version_key=attempt.version_key,
+                        outcome=attempt.outcome,
+                        files_found=attempt.files_found,
+                        detail=attempt.detail,
+                        seconds=attempt.seconds,
+                        attempt_no=attempt.attempt_no,
+                    )
+                )
+            session.commit()
+        return len(attempts)
+
+    def get_file_access_attempts(
+        self,
+        *,
+        endpoint: str | None = None,
+        version_key: str | None = None,
+        outcome: str | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[FileAccessAttempt]:
+        """
+        Return logged file-search attempts, filtered and newest-first
+
+        The queryable window onto the Step-2 attempt log (the twin of
+        `get_header_attempts`): any combination of the (indexed) filters narrows it, so
+        "how did endpoint X do?" (`endpoint=...`), "what happened to this version?"
+        (`version_key=...`) or "today's empty hits" (`since=..., outcome="empty"`) are
+        each one call.
+
+        Parameters
+        ----------
+        endpoint, version_key, outcome
+            Exact-match filters; omit any to leave that dimension unconstrained.
+
+        since
+            Keep only attempts recorded at or after this time.
+
+        limit
+            Cap on rows returned (the newest ones); unbounded if omitted.
+
+        Returns
+        -------
+        :
+            Matching attempts, most recent first.
+        """
+        statement = select(FileAccessAttempt)
+        if endpoint is not None:
+            statement = statement.where(FileAccessAttempt.endpoint == endpoint)
+        if version_key is not None:
+            statement = statement.where(FileAccessAttempt.version_key == version_key)
+        if outcome is not None:
+            statement = statement.where(FileAccessAttempt.outcome == outcome)
+        if since is not None:
+            statement = statement.where(FileAccessAttempt.created_at >= since)
+        statement = statement.order_by(col(FileAccessAttempt.id).desc())
         if limit is not None:
             statement = statement.limit(limit)
         with Session(self._engine) as session:
@@ -790,6 +897,28 @@ class Repository:
             version = session.get(DatasetVersion, version_key)
             return None if version is None else version.header_from_file_key
 
+    def _header_from_version(
+        self, session: Session, version: DatasetVersion
+    ) -> tuple[HeaderMetadata, int] | None:
+        """Reconstruct a version's promoted header and the `File.id` it came from.
+
+        Returns the `HeaderMetadata` (its `attrs` from `File.header_attrs_json`, its
+        `source_url` recovered from the file's recorded access) alongside that
+        `File.id`, or `None` if the version has no header promoted onto it.
+        """
+        file_id = version.header_from_file_key
+        if file_id is None:
+            return None
+        file = session.get(File, file_id)
+        if file is None or file.header_attrs_json is None:
+            return None
+        attrs = json.loads(file.header_attrs_json)
+        source_url: str | None = None
+        if file.header_from_access_key is not None:
+            access = session.get(FileAccess, file.header_from_access_key)
+            source_url = access.url if access is not None else None
+        return HeaderMetadata(attrs=attrs, source_url=source_url), file_id
+
     def version_header(self, version_key: str) -> HeaderMetadata | None:
         """
         Return the header-only metadata promoted onto a dataset version, if any
@@ -797,7 +926,8 @@ class Repository:
         Reconstructs a `HeaderMetadata` from the `File` the version's
         `header_from_file_key` points at (its full `header_attrs_json`), with the
         `source_url` recovered from that file's recorded access.  Header lookup is
-        keyed at the version grain.
+        keyed at the version grain; use `simulation_header` to reuse a header across a
+        simulation's variables.
 
         Parameters
         ----------
@@ -811,17 +941,54 @@ class Repository:
         """
         with Session(self._engine) as session:
             version = session.get(DatasetVersion, version_key)
-            if version is None or version.header_from_file_key is None:
+            if version is None:
                 return None
-            file = session.get(File, version.header_from_file_key)
-            if file is None or file.header_attrs_json is None:
-                return None
-            attrs = json.loads(file.header_attrs_json)
-            source_url: str | None = None
-            if file.header_from_access_key is not None:
-                access = session.get(FileAccess, file.header_from_access_key)
-                source_url = access.url if access is not None else None
-            return HeaderMetadata(attrs=attrs, source_url=source_url)
+            result = self._header_from_version(session, version)
+            return None if result is None else result[0]
+
+    def simulation_header(
+        self, source_id: str, experiment_id: str, variant_label: str
+    ) -> tuple[HeaderMetadata, int] | None:
+        """
+        Return a stored header for a simulation, from any of its variables/versions
+
+        Header-only metadata (the `parent_*` lineage) is **independent of variable**: a
+        header read once for a simulation `(source_id, experiment_id, variant_label)`
+        describes the whole run, so every variable of that simulation shares it.  This
+        looks the header up at the **simulation** grain — any stored `DatasetVersion` of
+        the simulation that already carries a promoted header, regardless of its
+        `variable_id`, its version, or which earlier run read it — so a later search for
+        a new variable can **copy** the header instead of re-reading it.
+
+        Parameters
+        ----------
+        source_id, experiment_id, variant_label
+            The simulation to look a header up for.
+
+        Returns
+        -------
+        :
+            The reconstructed `HeaderMetadata` and the `File.id` it was read from (so
+            the caller can promote it onto the new versions), or `None` if no version of
+            the simulation has a header yet.
+        """
+        statement = (
+            select(DatasetVersion)
+            .where(
+                DatasetVersion.dataset_key == Dataset.master_id,
+                Dataset.source_id == source_id,
+                Dataset.experiment_id == experiment_id,
+                Dataset.variant_label == variant_label,
+                col(DatasetVersion.header_from_file_key).is_not(None),
+            )
+            .order_by(col(DatasetVersion.version).desc())
+        )
+        with Session(self._engine) as session:
+            for version in session.exec(statement):
+                result = self._header_from_version(session, version)
+                if result is not None:
+                    return result
+            return None
 
     def promote_header(
         self,
@@ -1199,7 +1366,7 @@ def _node_health_columns(stat: NodeStat) -> dict[str, Any]:
     }
 
 
-def _stat_from_row(row: NodeHealthStat) -> NodeStat:
+def _stat_from_row(row: DataNodeHealthStat) -> NodeStat:
     """Rebuild an in-memory `NodeStat` from a stored node-health row."""
     return NodeStat(
         host=row.host,

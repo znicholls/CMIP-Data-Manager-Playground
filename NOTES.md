@@ -359,7 +359,7 @@ Separate three things: node reachable ≠ file present ≠ file readable.
   distress does.
 - **Persist** so learning survives runs (mirrors the `suggested_timeout` pattern).
 
-### Data-model changes (`db/schema.py` `NodeHealthStat` + `health.py` `NodeStat`)
+### Data-model changes (`db/schema.py` `DataNodeHealthStat` + `health.py` `NodeStat`)
 
 - `max_safe_concurrency: int` — highest L_n that ran clean.
 - `last_concurrency: int` — where it converged; seeds next run.
@@ -686,3 +686,244 @@ Per-dataset, three escalating levels of resilience against a preference-ordered 
 - Level 3 — endpoint fallback: datasets still failing move to the next preferred endpoint (metagrid-west → ceda) and repeat levels 1–2.
 
 Parallelism throughout via n_workers (thread pool — HTTP I/O), never aborting the pass: a per-dataset exception becomes a recorded failure + requeue, never propagates.
+
+NOte for parent retries!!
+
+Call-site updates made
+
+- parent_walk.py → clients=(self.client,), raise_on_incomplete=False
+- test_version_headers.py / test_files.py → new clients= API
+
+One thing to flag: parent_walk now passes its (retry-wrapped) client as a single-endpoint list, so on a persistent failure during a parent hop it double-retries (orchestrator 5× on top of the client's own backoff). Harmless but wasteful; I'd clean it up when we wire endpoints properly. That's part of step 3 (config default (metagrid-west, esgf.ceda) + building no_retry per-endpoint clients + updating the scripts), which is next whenever you're ready.
+
+### Week 2, day 4 (23/7)
+Plan for today:
+- Finish with step 2
+  - Note that esgf-west down until 3/8? So preference ceda, then ornl, then metagrid-west.
+  - But ultimately still prefer esgf-west because seems to have most acces to all data consistently
+- Look into header step and if Step 2 changes affect header step at all.
+- auxiliary
+- Re-do headers so save as it goes.
+- Fetch anna-setup-zn (NOTES-PROD.md)
+- May need to fetch repo because path changed
+
+Longer term plans:
+- Start with ESGF1/NG querying. Potentially let's say we have an esgf-client currently set up. Let's rename that esgf1-client and create a new one for esgfng-client. The goal is that for the same search (e.g. tas ssp245) we will receive similar if not identical search results to be able to populate the database, but we may not know until we look into this and see what the esgf-ng api returns
+- Then go ahead with CMIP5 and how/where those differences are. Overrides, user specifications.
+
+Longer-longer term:
+- Downloads
+- Production phase
+
+3. The no_files refinement, made specific
+
+The one concrete stone I laid while here: the log now records an empty outcome (HTTP 200, zero files) distinctly from success — so the 7 problem versions are queryable today via get_file_access_attempts(outcome="empty"). No behaviour change.
+
+The full refinement, precisely:
+
+- Symptom: 7 latest versions (CESM2 ×3, MRI-ESM2-0 ×4) ended Step 3 as no_files.
+- Root cause: CEDA's search returned 200 with zero File records — it indexes the dataset record (Step 1 found them) but not the file records for those models. add_files treats 200-empty as _OK, and escalation fires only on exceptions, so those versions were never tried on ORNL/west.
+- The fix has two halves:
+  a. Detect the soft-miss — 200-with-0 ≠ 200-with-N. (Built: the empty outcome.)
+  b. Escalate — treat empty as a soft-failure that falls through to the next endpoint, but re-query the fallback by the node-independent instance_id facet, not the node-specific dataset_id. This is the crux: a naive fallback reusing CEDA's dataset_id on ORNL would also return empty (ORNL doesn't know CEDA's node-scoped ids — the cross-index portability limit). The instance_id requery is what lets any federated index answer, and it doubles as a disambiguator: found somewhere ⇒ index gap; found nowhere ⇒ genuinely retracted/unpublished.
+- Guardrails: cap at "every endpoint tried once by instance_id", then record a terminal outcome (e.g. no_files_any_endpoint) and have the version_has_files cache gate treat it as resolved, so re-runs don't re-search fileless versions forever; only escalate empties, never successes, to avoid a fan-out storm. Cost in the observed run is ~14 extra calls.
+
+Updates before uc2 gregory retry
+- Attempted for 1h47m before killed session
+- Now needing to update so header step save as it goes rather than all at the end
+- Don't want to have this issue again
+- Unrelated to esgf-west (index node search not institution data node connections)
+Out of scope (flagging, not doing unless you want)
+
+- Persisting parent links incrementally within a hop (currently hop-end) — small, separate.
+- The dead-node tail itself (shorter read timeout / ignore list) — that's a config choice for the next run, independent of this change.❯ go ahead, implement it as specified, not the out of scope, I've got that in my notes. Although, the first out of scope is that related to parent use cases and this save on the go?
+
+Good question — yes, that first out-of-scope item is specifically the parent-walk (uc2/Gregory) case, and here's how it relates:
+
+In each hop the walk does three things in order: (1) add_files — already saves as-you-go; (2) enrich_version_headers — this change makes it save headers as-you-go; (3) after the hop's whole header batch finishes, it resolves declared parents, searches for them, and writes the child→parent links (parent_version_key).
+
+So with this change, killing mid-hop preserves the expensive header reads, but the parent links for that hop are still written only at hop-end — that's the out-of-scope item. The reason it's low-cost to leave: links are cheap to regenerate. On a re-run, the now-cached headers are skipped (skip_cached), so the walk just re-does the fast parent search + linking. The 2-hour risk you're worried about is entirely in the header reads, and those are what we're protecting. Fully-incremental links would be a small separate follow-up (in your notes — good).
+
+The extra time is retry × URL × timeout amplification on unreachable data nodes, and there's a specific classification gap driving it:
+
+- with_retry is meant to skip stalls — its give_up_on list includes HeaderReadTimeout (our 90s subprocess kill). But curl's own connect timeout (~75s) fires first, and it surfaces as a plain OSError ("Failed to connect ... after 75003 ms"), which lands in retry_on=(OSError,). So a dead node is retried max_attempts=3 times, not given up.
+- read_on_host tries each host's ranked URLs — the https twin + the http original = 2 URLs per host.
+- So one dead host costs roughly 2 URLs × 3 attempts × ~75s ≈ 7.5 minutes per simulation, plus backoff sleeps.
+- The circuit-breaker only evicts a node after 6 host-attempts (evict_after_attempts), and node_concurrency=2 throttles each dead host — so a node like CNRM takes ~6 × 7.5 min / 2 ≈ 20+ min just to get evicted.
+- A simulation whose only mirrors are several dead EU nodes (CNRM → NSC → BSC) pays ~7.5 min per host before failing. ~30 such simulations across three concurrently-dead nodes stack up to ~2 hours.
+
+The two stacked timeouts
+
+Here's the crux of your question — there are two separate timeouts, at two different layers, and we only set one of them:
+
+Timeout #1 — the OUTER one, which we DO set (90s).
+with_timeout(read_header, seconds=90) runs the whole read_header call in a separate child process and, if that child hasn't returned after 90 seconds, kills the process (headers.py:28-31, 767). We have to do it this way because a stall isn't a Python error we can except — the netCDF call just sits there, so the only way to bound it is to kill the whole process from outside. When this fires, we raise HeaderReadTimeout.
+
+Timeout #2 — the INNER one, which we do NOT set (~75s).
+Down in libcurl/the OS, connecting to a host that never answers has its own timeout. When you try to open a TCP connection to a dead/firewalled node, your machine sends a SYN packet and waits for a reply. No reply → it retransmits, waits longer, retransmits again (exponential backoff)… and the operating system gives up on its own at about 75 seconds. On macOS that limit is literally net.inet.tcp.keepinit = 75000 ms. That's why every failure line in the log says the oddly-specific "after 75003 ms" — that's not a number we chose, it's the OS's built-in connect timeout leaking through.
+
+So yes — to answer you directly: our 90s is in addition to, and wrapped around, curl's own ~75s connect timeout. They are independent. We never configured curl's connect timeout, so it falls back to the OS default of ~75s.
+
+
+First, the terminology — you're right to flag it, because "child" means two completely different things here:
+
+- "child dataset" / "parent dataset" = your science meaning. abrupt-4xCO2 is the child dataset, piControl is the parent dataset. I'll always say "child dataset" for this.
+- "reader process" = an operating-system meaning. To read one file's header, the code launches a separate throwaway OS process to do that one network read. I'll call this a "reader process" (never "child process") so it doesn't collide with your dataset lineage. This has nothing to do with parent/child datasets — it's purely a computing mechanism.
+
+Everything below is about reader processes, not datasets.
+
+---
+Why there are throwaway reader processes at all
+
+Reading a header means opening a remote file over the network. Sometimes a data node accepts the connection and then just… hangs — sends nothing, forever. Python code stuck waiting for network bytes cannot be politely interrupted ("cancel" doesn't work on a frozen network read).
+
+So the design does the only thing that reliably works: it runs each read in a separate throwaway OS process, and if that process takes too long, it force-kills the whole process from the outside — like Force-Quitting a frozen app. That's the with_timeout mechanism (now set to 25s).
+
+The header step is organised like a small work crew:
+
+   MANAGER (scheduler)  ── hands out read jobs ──►  a pool of ~12 WORKER THREADS
+                                                      │      │            │
+                                                      ▼      ▼            ▼
+   each worker launches a throwaway  ───►         reader  reader  ...  reader
+   READER PROCESS to do one network read          proc    proc         proc
+
+- Healthy node: reader process returns the header in ~1s ✓ → the worker is free to grab the next job.
+- Dead node: reader process hangs → after 25s the worker says "die" and force-kills it → then waits for it to finish dying → moves on.
+
+---
+The problem (the deadlock), visually
+
+That last step — "wait for the killed reader process to finish dying" — has no time limit. Here's the normal vs. broken flow:
+
+NORMAL kill:
+  worker: "you're too slow" → SIGTERM → reader dies → worker waits (instant) → free ✓
+
+BROKEN case (black-holed node):
+  worker: SIGTERM → (ignored, reader is deep in a
+  worker: SIGKILL "DIE NOW" → OS can't kill it yet (it's stuck mid-network-syscall)
+  worker: wait for it to die ......... with NO ti
+
+The subtlety: SIGKILL normally is instant, but when a reader process is stuck deep in the operating system waiting on network
+bytes from a black-holed node, the OS won't actuak operation gives up — which can take a very longtime, or effectively never. So the worker thread that's "waiting for it to die" is stuck too.
+
+One frozen worker isn't fatal — but there are only ~12. With several dead nodes in play (this cold run hit 3+ at once), worker after worker gets stuck on an un-killable reader process:
+
+  worker1  🔒 (stuck on CNRM reader)
+  worker2  🔒 (stuck on NSC reader)
+  worker3  🔒 (stuck on BSC reader)
+   ...
+  worker12 🔒
+        ▲
+        └── MANAGER now has zero free workers, and nothing ever finishes
+            → the whole header step freezes: 0% CPU, no progress, forever.  ← THE DEADLOCK
+
+That's precisely what we saw: process alive, 0% CS "wait for process to die" call (waitpid), themanager blocked waiting for a worker to report back — none ever will.
+
+---
+Why uc1 (ssp245 / tas) never hit this
+
+It comes down to which data nodes get touched — and it never got near the trap:
+
+1. uc1's files live on healthy, fast nodes. Monthly tas for ssp245 is broadly mirrored (NCI, etc.). Reads connected and returned in ~1s, so a reader process almost never hung — the kill path was barely exercised, let alone the un-killable version of it.
+2. uc2-Gregory drags in flaky nodes. The abrupt-4s like CNRM, EC-Earth (NSC), BSC live primarily onthose specific EU data nodes — exactly the ones that black-hole reads on a bad day. That's what produces un-killable reader processes.
+3. The deadlock needs many stuck reads at once toarely had even one; uc2-Gregory on a cold run withseveral of those nodes down had dozens simultaneously — the perfect storm.
+
+So it's not that uc1 was written differently — itprocess against a black-holing node, so it neversprang the trap.
+
+---
+The fix, and how big it is
+
+The fix in one sentence: put a time limit on the "wait for the killed reader process to die" step; if it still won't die, stop
+waiting for it — leave it as a harmless orphan fod janitor thread) to clean up later — mark the read as timed-out, and free the worker to move on.
+
+BEFORE:  SIGKILL → wait forever for it to die
+AFTER:   SIGKILL → wait ~2s → still alive? walk away,     ✓ worker free
+                   hand it to a background janitor, move on
+
+Analogy: right now, if you Force-Quit a frozen app and it doesn't close, the code stands there staring at it forever. The fix:  give it a couple seconds, then walk away and let  background — and get back to work. A single stuckreader process can then never freeze a worker, so the crew never grinds to a halt.
+How intensive — will it change the workflow?
+- Very small and very localized. It's essentially turning one unbounded "wait" into a bounded wait plus a "give up and detach"  path — on the order of ~10–20 lines, all inside t/with_timeout). Plus optionally a tiny backgroundreaper to mop up orphans.
+- It does not change the workflow at all. Search → files → headers → parent-dataset resolution, the parallelism, save-as-you-go, and every result stay identical. Same headers read, same child→parent dataset links. It's purely a robustness patch to the kill mechanism — invisible to the rest of the pipeline
+- Low risk. The only new behavior is: in the rare "won't die" case, we leave a short-lived orphan reader process (it's already a
+daemon, so it dies with the run) instead of freez trade — a possible stray process vs. a total hang.
+- The reproduction test I wrote flips from red to green with this change, so we'll have proof it's fixed.
+
+### Week 3 (starting 27th July)
+
+Claude prompt:
+In uc2, we found some nodes that were dead, but allowed connection to try to read file headers. Firstly, could you please look into the database to find those dead nodes from the abrupt-4xCO2 experiment header read attempts? So the current set-up I want to implement is 90s stall on connecting to the data node. If the node connects and then stalls, then I want to implement a 25s stall. If that stall happens, we should just assume that the node is dead. We can try the http or https, but I do not then want to try otehr variables, or other files in the dataset. I want to implement quite a hard cut-off so that we don't waste time trying to connect to nodes that likely won't work. That will be for a user to decide if they want to try connecting to a dead node and waste a day attempting connection. Please let me know your plan. I want to still have the distinction between success and failiure and retries, for nodes that genuinely might work. For nodes we describe as dead for that query, we would retry them the next time someone attempts the same query.
+
+┌────────────────────────────────────────────────────────────────┬─────────────────────────────────────────┬───────────────────────────────┐
+│                       Connection failure                       │              Classified as              │           Retried?            │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ Connection refused (down but may recover / momentary overload) │ plain OSError                           │ ✅ Yes — full 3× with backoff │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ Connection reset / other transient OSError                     │ plain OSError                           │ ✅ Yes — 3×                   │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ Black-holed connect (no answer, hits 90s)                      │ HeaderReadHostFault                     │ ❌ No — one strike, next node │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ SSL / certificate error                                        │ HeaderReadHostFault                     │ ❌ No                         │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ DNS resolution failure                                         │ HeaderReadHostFault                     │ ❌ No                         │
+├────────────────────────────────────────────────────────────────┼─────────────────────────────────────────┼───────────────────────────────┤
+│ Connects, then read-stalls (25s)                               │ HeaderReadTimeout / HeaderReadHostFault │ ❌ No                         │
+└────────────────────────────────────────────────────────────────┴─────────────────────────────────────────┴───────────────────────────────┘
+
+### Day 2 (28/7)
+ Earlier, we did a cold uc2 live run. This created a .json file which showed dead nodes. However, if you go to the .json file, you will see # working comments, because I tried the links and they successfully downloaded onto my computer. What could have caused this? why were they mis-identified as dead nodes? All the other ones seemed successfully dead. Please write a plan to investgiate this.
+
+Byte range reader vs download
+- Following connection with data node, can take up to 75s to access header (max stall time). We're conservative and just say if hits 75s we assume node is dead. To assess node health if we want to we can then investigate and download to see if truly dead. Or will just increase stall time.
+┌────────────────────┬────────┬─────────────────┬────────────────────────────┬───────────────────────┐
+│        Node        │  Size  │ Byte-range read │ Full download + local read │        Winner         │
+├────────────────────┼────────┼─────────────────┼────────────────────────────┼───────────────────────┤
+│ esg-dn1.nsc.liu.se │ 5.2 MB │ 58.8s           │ 27.8s (dl) + 0.0s = 27.8s  │ download, 2.1× faster │
+├────────────────────┼────────┼─────────────────┼────────────────────────────┼───────────────────────┤
+│ vesg.ipsl.upmc.fr  │ 46 MB  │ 39.8s           │ 10.1s (dl) + 0.0s = 10.1s  │ download, 3.9× faster │
+└────────────────────┴────────┴─────────────────┴────────────────────────────┴───────────────────────┘
+- THese were the two nodes that >25s original cut off, but download was super quick. Should be seen as 'healthy' though with raised to 75s
+
+Parent/variable/hop information.
+Could you please explore the parent hop / multi-hop system and variables. The ideal case would be to only search for (source, experiment, varaint) for parents, and not have to specify variables. However, if this is then implemented in the get file step, then this can lead to thousands of unecesssary file URLs being accessed. Please explore if there's a way for this step to work without having to specify the variable? Or could we search in an initial query then speicfy the variable for file URL? Please explain the current workflow (which may be just variable) and the potential debugging limitations of either not specifying variable, or specifying variable.
+
+Following the >50k file access blowout in the g6solar multi-hop live test, I implemented a really strict 'only search for the required variables' in the parent step. So, this means that when parent information is obtained from a child experiment, we query (source, experiment,variant, variable) (step 1), then runs one file searh per dataset version (step 2), then reads one header per simulation (step 3).
+It is logical that we could ease-up on Step 1, meaning that we only query the index node for (source, experiment, variant), however in the interests of time, for step 2 it feels like we should only search by variable (then step 3, obtain header information, only relies on a single simulation, regardless of the variable). This distinction would at least mean we will find in the search query stage "does the parent dataset exist for any variables", then step 2/3 ascertains are those variables available.
+Would this workflow reduce/fix the bugs you're concerned about? Or would the ideal case (if time weren't an issue), be to also search for files of all variables in Step 2?
+
+### Day 3 (29/7)
+Claude prompt following ZN catch up:
+
+I want to clarify the workflow of our set up please, and implement some changes before going to some live runs again. We have a number of different steps and a separation between simple use case (like ssp245 with no parent) compared to use cases with parent hops. Firstly, we consider a use case with no parent hops. For this case, we only need to implement step 1: dataset search. There is no need to get header information, so following the index node query for (variable, frequency), then we can stop the search there.
+Then, we move to the next set of use cases which require parent information (which requires header information for cmip5/6, but not for cmip7, although we are only looking at cmip6 right now). We note that parent information may require one-to-multiple hops, but at some point the workflow repeats itself.
+For the parent use case, we start with the initial child (as requested by the user, with one or multiple variables). We query ESGF index node and populate the relevant tables (such as dataset, for all requested varaible/s). Following this, (new step?) we want to check our local dataset/database for matching (source, experiment, variant) to see if there is already enriched metadata (i.e. header information). For example, if we already have searched for all tas abrupt-4xCO2 experiments then want to do another search for rsut, we would already have all the parent information for the (experiment, source, variant) because we would have found the header information based on tas already. In this case, we would not need to search for the header and could copy the information over. header information we say is independent for variable. If header metadata is not already available for a (experiment, source, variant), we move on to file/fileacess, which IS dependent on variable (i.e. dependent on what is in dataset), execute the query to obtain header information, saving results into the database. The header information, we only want to attempt access of one file for one variable for each (experiemnt, source, variant). We assume header information is the same across variables. Note here the steps which require specific variables, and the steps which are independent of variable. Use the header results to add the enriched metadata into the database.
+Once we have the parent information, we either stop here (if only doing a single parent hop), or we use the parent information to create a new parent query in ESGF index node, dependent on the variable. We note as well that the parent and child may have different instituions, so shouldn't be dependent on institufion. Once we have queried ESGF, we also need to make sure that if we need to search for files and then headers, that if multiple children have the same parents, then we don't need to double up with file/header search. We then start form file/file access (per variable) then header (for a single file/variable), until we have reached the final parent specified by the user (in which case we don't need the header inforamtion).
+A few additional notes: I want to maintain the workflow I have with workers and saving information at each step, plus not sending out file/header informatoin in batches, just one at a time. Secondly, this workflow may require some updates. Thirdly, some parent information won't be found in the ESGF search query. Here, we want a user to be able to override/fix if necessary to supply correct information. Fourthly, in the get header information step, we have a big workflow to determine is a node dead. We have a new method of potentially testing if a node is dead in addition to the current workflow, however maybe we make sure we are on the same page with the overall workflow before implementing that test? Please make a plan for how this description of the workflow is different to the current workflow and make a plan to update.
+
+which requires header information for cmip5/6, but not for cmip7
+
+Change to "which requires header information for cmip6, we don't know about cmip5 or cmip7 yet"
+
+header information we say is independent for variable
+
+We assume that this 'enriched' metadata about parent information is independent of variable. Please make this assumption clear in the docstring of the relevant function.
+
+we move on to file/fileacess, which IS dependent on variable (i.e. dependent on what is in dataset)
+
+we move on to file/fileacess, which we want to make variable specific so that we avoid getting 10 000 files results
+
+Once we have the parent information, we either stop here (if only doing a single parent hop), or we use the parent information to create a new parent query in ESGF index node, dependent on the variable
+
+Once we have the parent information we use the parent information to create a new parent query in ESGF index node, dependent on the variable
+
+so shouldn't be dependent on institufion
+
+so the generated query shouldn't include assumptions about the institution (i.e. any institution is ok)
+
+We have a new method of potentially testing if a node is dead in addition to the current workflow, however maybe we make sure we are on the same page with the overall workflow before implementing that test?
+
+I wouldn't mention that now. Let's just make it a completely separate, standalone task
+
+serially (grouping on source/variant/experimt) -> multiple variables.
+
+CLAUDE PROMPT Data node health.
+ I would like to add a node-health test to my workflow pipeline. When we implement a search and populate the datanode, we obtain information on every potential data node for that search. If we need to do multiple parent hops (where we will need to connect to a node to access header information), I want to perform a test where, for every single node (can choose a random dataset to trial this on), we attempt to download a single chunk of data. If unsuccessful, consider this node dead for that session and put it in ignore_host. The user should be able to overrride this if they want, but otherwise assume it is dead. Otherwise, if a single chunk of data works for that node we should assume for that session it is alive. I would take recommendations on if we say a node is alive but still then 'fails' in header read (for example is our stall time too short, not enough retries, etc). Please make a plan of how this fits into our workflow, and how to implement this. Also offer your suggestions for if there are multiple parent hops and additional nodes become available through parents.

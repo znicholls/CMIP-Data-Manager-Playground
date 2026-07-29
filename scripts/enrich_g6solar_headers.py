@@ -20,7 +20,7 @@ making no assumptions about which experiments it passes through.  Starting from
 By default this runs **cold**: a fresh database (`g6solar_cache.sqlite`) with no
 learned node health, so timeouts fall back to `READ_TIMEOUT_FALLBACK`.  Headers are
 stored on `File.header_attrs_json`, promoted onto `DatasetVersion`, and node
-statistics on `NodeHealthStat`.
+statistics on `DataNodeHealthStat`.
 
 Run with: `uv run python scripts/enrich_g6solar_headers.py`
 """
@@ -30,8 +30,15 @@ from __future__ import annotations
 import os
 import time
 
-from cmip_data_manager import Settings, build_client, open_repository
+from cmip_data_manager import (
+    Settings,
+    build_client,
+    build_file_search_clients,
+    open_repository,
+)
+from cmip_data_manager.config import CEDA_BASE_URL
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
+from cmip_data_manager.esgf.preflight import ProbeCache
 from cmip_data_manager.search import (
     ParentResolutionError,
     per_variable_experiment,
@@ -56,6 +63,12 @@ PROJECT = "CMIP6"
 CHILD_EXPERIMENT = "G6solar"
 """The experiment whose parent chain we walk up."""
 
+STOPPING_EXPERIMENT: str | None = "piControl"
+"""Experiment the walk stops at.  `"piControl"` here: confirm it exists on the index
+node, walk each chain up, and stop the moment a parent lands on `piControl` (its header
+is not read, the walk does not go higher).  `None` would instead walk to the CMIP6
+`"no parent"` sentinel (the true top)."""
+
 REQUIRED_VARS: tuple[str, ...] = ("tas",)
 """Variable to read a header for (single variable, as requested)."""
 
@@ -68,20 +81,48 @@ MAX_HOPS = 8
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""
 
-IGNORE_HOSTS: frozenset[str] = frozenset(
-    {
-        # http-only nodes observed to stall byte-range reads (~75s each to fail);
-        # the same files are served over https elsewhere.
-        "esgf-data02.diasjp.net",
-        "esgf-data03.diasjp.net",
-        "esgf-data04.diasjp.net",
-        "esg.iap.ac.cn",
-    }
-)
-"""Data nodes to never read headers from (unioned with what NodeHealth has learned)."""
+IGNORE_HOSTS: frozenset[str] = frozenset()
+"""Data nodes to never read headers from.
+
+COLD-RUN POLICY: keep this **empty**.  A cold run learns node health from scratch and
+must give *every* node a fresh chance — never pre-exclude one.  Only a **warm** run
+should populate an ignore list (from learned health), and even then we prefer re-probing
+"dead" nodes in case they have recovered (a node that stalled last week may have fixed
+its https).  Cost accepted: a cold run may eat a ~75-100s stall on a genuinely-dead node
+before falling back to a healthy mirror.
+
+Known http-only stallers observed historically (byte-range reads stall ~75-100s each;
+the same files are served over https elsewhere) — candidates for a *warm-run* ignore
+list only, deliberately NOT wired in here: `esgf-data02.diasjp.net`,
+`esgf-data03.diasjp.net`, `esgf-data04.diasjp.net`, `esg.iap.ac.cn`."""
+
+PREFLIGHT_PROBE = True
+"""Sweep every candidate data node with a cheap chunk probe before reading headers,
+dropping the ones that fail it into `ignore_hosts` for this session (`esgf.preflight`).
+
+This is the payoff for a **multi-hop** cold run like G6solar: instead of eating a
+~75-100s stall on each historically-dead node (the diasjp/iap stallers above) the moment
+the walk routes a read there, one cheap parallel sweep condemns them up front — and a
+`ProbeCache` shared across every hop means a node the deeper `ssp585 -> historical ->
+piControl` parents introduce is probed only when it first appears."""
+
+FORCE_ALIVE_HOSTS: frozenset[str] = frozenset()
+"""Data nodes to keep in play even if the probe judges them dead (user override)."""
 
 SKIP_CACHED = True
-"""Skip simulations whose header is already cached (don't re-read a known header)."""
+"""Skip simulations whose header is already cached (don't re-read a known header).
+
+Reuse is at the simulation `(source_id, experiment_id, variant_label)` grain (header
+metadata is variable-independent): a header stored by any variable/earlier run is
+copied onto new versions instead of re-reading, and its file search is skipped (files
+are only substrate for the read)."""
+
+PARENT_OVERRIDES: dict[tuple[str, str, str], tuple[str, str, str]] = {
+    # Correct a wrong/missing declared parent in the ESGF metadata.  Keys/values are
+    # (source_id, experiment_id, variant_label) tuples; an entry overrides the header.
+    # On a `ParentResolutionError`, add the correct parent here and re-run.
+}
+"""User overrides for wrong/missing child->parent links (empty = trust the headers)."""
 
 MAX_WORKERS = 12
 """Cap on header reads in flight across all nodes (the shared local budget)."""
@@ -95,8 +136,11 @@ SEARCH_WORKERS = 8
 READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet."""
 
-SETTINGS = Settings()
-"""Endpoint/paging settings for the live file lookups and ancestor re-fetches."""
+SETTINGS = Settings(base_url=CEDA_BASE_URL)
+"""Endpoint/paging settings.  `base_url` drives the Step-1 G6solar index search and the
+`piControl` existence gate; pointed at CEDA today because metagrid-west is in
+maintenance.  The parent walk's per-hop file and per-parent dataset searches use the
+preference-ordered `SEARCH_CLIENTS` (CEDA -> ORNL -> metagrid-west) instead."""
 # -----------------------------------------------------------------------------
 
 
@@ -143,6 +187,24 @@ def _print_node_health(repository) -> None:
         )
 
 
+def _print_probe(probe_cache: ProbeCache) -> None:
+    """Print the pre-flight probe's verdict for every data node it touched."""
+    outcomes = probe_cache.outcomes()
+    if not outcomes:
+        print("  (no nodes probed)")
+        return
+    alive = sorted(probe_cache.alive_hosts())
+    dead = sorted(probe_cache.dead_hosts())
+    print(f"  {len(alive)} alive, {len(dead)} dead (session verdict):")
+    for host in dead:
+        outcome = outcomes[host]
+        print(f"    DEAD  {host:<40} {outcome.reason}")
+    for host in alive:
+        outcome = outcomes[host]
+        forced = " (forced)" if outcome.attempts == 0 else ""
+        print(f"    alive {host:<40} {outcome.seconds:5.1f}s chunk{forced}")
+
+
 def main() -> None:
     """Walk G6solar's parent chains, verify each hop, and report."""
     repository = open_repository(DB_PATH)
@@ -151,8 +213,14 @@ def main() -> None:
         retry=exponential_backoff(retries=4),
         map_fn=thread_pool_map(max_workers=8),
     )
-    print(f"=== {USE_CASE} (walk the parent tree; no assumed chain) ===")
+    # Preference-ordered endpoints (CEDA -> ORNL -> metagrid-west) that drive both the
+    # per-hop Step-2 file search and each per-parent dataset search in the walk, with
+    # backoff -> requeue -> next-endpoint fallback.
+    search_clients = build_file_search_clients(settings=SETTINGS)
+    endpoints = ", ".join(c.base_url for c in search_clients)
+    print(f"=== {USE_CASE} (walk the parent tree; stop at {STOPPING_EXPERIMENT}) ===")
     print(f"db: {DB_PATH}   search source: {SEARCH_SOURCE}")
+    print(f"parent search endpoints (in order): {endpoints}")
 
     search_started = time.perf_counter()
     if SEARCH_SOURCE == "api":
@@ -174,17 +242,24 @@ def main() -> None:
     read_timeout = health.suggested_timeout(default=READ_TIMEOUT_FALLBACK)
     print(f"  read timeout for this run: {read_timeout:.1f}s")
 
-    # Roots are the G6solar children; stopping_experiment=None walks all the way to
-    # the CMIP6 "no parent" sentinel (the true top), searching each parent once.
+    # Roots are the G6solar children; the walk climbs each chain and stops the moment a
+    # parent lands on STOPPING_EXPERIMENT ("piControl"), searching each parent once.
     roots = [r for r in records if r.experiment_id == CHILD_EXPERIMENT]
+    print(f"  pre-flight node probe: {'on' if PREFLIGHT_PROBE else 'off'}")
+    # One probe cache shared across every hop, so each data node is probed at most once;
+    # kept here so its verdicts can be reported after the walk (or on a failure).
+    probe_cache = ProbeCache()
     started = time.perf_counter()
     try:
         result = resolve_parent_chains(
             roots,
             client=client,
+            search_clients=search_clients,
             repository=repository,
-            stopping_experiment=None,
+            stopping_experiment=STOPPING_EXPERIMENT,
             project=PROJECT,
+            variables=REQUIRED_VARS,
+            parent_overrides=PARENT_OVERRIDES,
             max_hops=MAX_HOPS,
             health=health,
             timeout=read_timeout,
@@ -194,9 +269,14 @@ def main() -> None:
             node_concurrency=NODE_CONCURRENCY,
             skip_cached=SKIP_CACHED,
             map_fn=thread_pool_map(max_workers=SEARCH_WORKERS),
+            preflight_probe=PREFLIGHT_PROBE,
+            force_alive_hosts=FORCE_ALIVE_HOSTS,
+            probe_cache=probe_cache,
         )
     except ParentResolutionError as exc:
         print(f"parent resolution FAILED:\n{exc}")
+        print("pre-flight probe:")
+        _print_probe(probe_cache)
         print("node health:")
         _print_node_health(repository)
         return
@@ -213,7 +293,15 @@ def main() -> None:
         print("terminals (tops of the tree reached):")
         for source_id, experiment_id, variant_label in sorted(result.terminals):
             print(f"  {source_id} / {experiment_id} / {variant_label}")
+    if result.variable_gaps:
+        # The parent simulation exists (found for some variable), it just does not
+        # publish the requested variable here — a lineage hole, not a broken chain.
+        print("variable gaps (parent exists but lacks the requested variable):")
+        for gap in sorted(result.variable_gaps, key=str):
+            print(f"  {gap}")
 
+    print("pre-flight probe:")
+    _print_probe(probe_cache)
     print("node health:")
     _print_node_health(repository)
 

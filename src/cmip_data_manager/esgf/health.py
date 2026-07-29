@@ -235,7 +235,7 @@ class NodeHealth:
 
     def restore(self, stat: NodeStat) -> None:
         """
-        Seed a host's stats wholesale (e.g. from persisted `NodeHealthStat` rows)
+        Seed a host's stats wholesale (e.g. from persisted `DataNodeHealthStat` rows)
 
         Replaces any existing counters for `stat.host`, so a run can pick up where
         earlier runs left off before recording fresh outcomes on top.

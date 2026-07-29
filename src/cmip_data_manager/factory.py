@@ -71,7 +71,8 @@ def build_file_search_clients(
     ----------
     endpoints
         Search endpoints in preference order (defaults to `DEFAULT_INDEX_ENDPOINTS`:
-        metagrid-west, then CEDA).
+        CEDA, then ORNL, then metagrid-west — the latter is currently last while it is
+        in maintenance).
 
     settings
         Paging/timeout settings shared by every client; defaults to `Settings()`.

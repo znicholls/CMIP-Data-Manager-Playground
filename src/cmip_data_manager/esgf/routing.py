@@ -71,9 +71,10 @@ class SimulationCandidates:
     The data nodes that can serve one simulation's header, ranked best-first
 
     One readable file is enough for a whole simulation (the header describes the
-    run, not the variable), so `urls_by_host` keeps every mirror URL per host and
-    the dispatcher reads the first that works, both across hosts (fall through to
-    the next node) and within a host (fall through to another of its files).
+    run, not the variable), so `urls_by_host` keeps, per host, only that host's
+    **one representative file** — its `https` twin and `http` original — and the
+    dispatcher reads the first that works, falling through to the next node.  A dead
+    node therefore costs at most those two attempts, not one per variable and chunk.
     """
 
     simulation: SimulationKey
@@ -87,6 +88,47 @@ class SimulationCandidates:
 
     urls_by_host: Mapping[str, tuple[str, ...]]
     """Each host's readable URLs, best-first (keys match `hosts`)."""
+
+
+def _url_basename(url: str) -> str:
+    """Return a URL's filename (last path segment), ignoring query and fragment."""
+    return urlparse(url).path.rsplit("/", 1)[-1]
+
+
+def _one_file(urls: Sequence[str]) -> list[str]:
+    """
+    Keep only the URLs naming the same file as the first (best-ranked) one
+
+    One header serves a whole simulation, so a single readable file is enough;
+    restricting a host to one file's URLs (its `https` twin + `http` original)
+    stops a dead node from being probed once per variable and per time-chunk.
+
+    Parameters
+    ----------
+    urls
+        A host's candidate URLs, best-first.
+
+    Returns
+    -------
+    :
+        The best-first subset sharing the first URL's basename (empty if `urls` is).
+
+    Examples
+    --------
+    >>> _one_file(
+    ...     [
+    ...         "https://n/tas_2000.nc",
+    ...         "http://n/tas_2000.nc",
+    ...         "https://n/tas_2001.nc",
+    ...         "https://n/pr_2000.nc",
+    ...     ]
+    ... )
+    ['https://n/tas_2000.nc', 'http://n/tas_2000.nc']
+    """
+    if not urls:
+        return []
+    keep = _url_basename(urls[0])
+    return [url for url in urls if _url_basename(url) == keep]
 
 
 def simulation_candidates(  # noqa: PLR0913 - ordering controls, keyword-only, defaulted
@@ -103,8 +145,9 @@ def simulation_candidates(  # noqa: PLR0913 - ordering controls, keyword-only, d
 
     Pools the `HTTPServer` mirrors of `files` (any variable, chunk or replica of the
     simulation) and orders them with `candidate_urls_for_files`, then groups the
-    ranked URLs by host — so `hosts` is the best-first host order and
-    `urls_by_host[h]` is that host's URLs, also best-first.
+    ranked URLs by host and collapses each host to its **one representative file**
+    (its `https` twin + `http` original) — so `hosts` is the best-first host order
+    and `urls_by_host[h]` is that host's two URLs for a single readable file.
 
     Parameters
     ----------
@@ -163,11 +206,17 @@ def simulation_candidates(  # noqa: PLR0913 - ordering controls, keyword-only, d
     for url in ranked:
         host = urlparse(url).hostname or url
         urls_by_host.setdefault(host, []).append(url)
+    # Collapse each host to a single representative file (its https twin + http
+    # original).  One readable file answers the whole simulation, so trying every
+    # variable and time-chunk on a node only multiplies wasted attempts on a dead
+    # one — uc2's 142-URL BSC death spiral.  The list is already best-first, so its
+    # first URL names the representative file; keep only URLs sharing that basename.
+    collapsed = {host: _one_file(urls) for host, urls in urls_by_host.items()}
     return SimulationCandidates(
         simulation=simulation,
         group=group,
-        hosts=tuple(urls_by_host),
-        urls_by_host={host: tuple(urls) for host, urls in urls_by_host.items()},
+        hosts=tuple(collapsed),
+        urls_by_host={host: tuple(urls) for host, urls in collapsed.items()},
     )
 
 

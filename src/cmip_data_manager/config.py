@@ -15,15 +15,23 @@ DEFAULT_BASE_URL = "https://metagrid.esgf-west.org/proxy/search"
 """Default ESGF search endpoint (a thin proxy in front of the esg-search API)."""
 
 CEDA_BASE_URL = "https://esgf.ceda.ac.uk/esg-search/search"
-"""CEDA's esg-search endpoint — a fast, independent index used as the Step-2 file-search
-fallback.  It returns the same Solr JSON shape as the metagrid proxy, so no separate
-parsing is needed."""
+"""CEDA's esg-search endpoint — a fast, independent index.  Returns the same Solr JSON
+shape as the metagrid proxy, so no separate parsing is needed."""
 
-DEFAULT_INDEX_ENDPOINTS = (DEFAULT_BASE_URL, CEDA_BASE_URL)
-"""Preference-ordered search-index endpoints for the Step-2 file search: metagrid-west
-first, then CEDA.  `search.files.add_files` tries each in turn, falling back to the next
-only after an endpoint's retries and requeues are exhausted.  Override the order or the
-set to search different mirrors."""
+ORNL_BASE_URL = "https://esgf-node.ornl.gov/proxy/search"
+"""ORNL's MetaGrid search proxy — another fast, independent index (the `/esg-search/`
+path on that host is only the web UI; the API lives at `/proxy/search`)."""
+
+DEFAULT_INDEX_ENDPOINTS = (CEDA_BASE_URL, ORNL_BASE_URL, DEFAULT_BASE_URL)
+"""Preference-ordered search-index endpoints for the Step-2 file search.
+
+`search.files.add_files` tries each in turn, falling back to the next only after an
+endpoint's retries and requeues are exhausted.  Override the order or set for different
+mirrors.
+
+NOTE (2026-07): `metagrid.esgf-west.org` is under maintenance, so it is currently placed
+**last**; normally it would lead.  Order today is CEDA -> ORNL -> metagrid-west.  Move
+metagrid-west back to the front once the proxy is healthy again."""
 
 # QUESTION: do we wan to get rid of this? Should this be something we specify?
 # Likely this changes as we do project/esgf integration (honestly same with above)

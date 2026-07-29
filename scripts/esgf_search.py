@@ -25,6 +25,7 @@ from cmip_data_manager import (
     build_file_search_clients,
     open_repository,
 )
+from cmip_data_manager.config import CEDA_BASE_URL
 from cmip_data_manager.esgf.client import ESGFSearchClient
 from cmip_data_manager.esgf.concurrency import (
     exponential_backoff,
@@ -55,8 +56,10 @@ DB_PATH = "esgf_cache.sqlite"
 SOURCE = "api"
 """``"api"`` to query ESGF (and update the cache), ``"db"`` for offline."""
 
-SETTINGS = Settings()
-"""Endpoint/paging settings; swap ``base_url`` here to use a different mirror."""
+SETTINGS = Settings(base_url=CEDA_BASE_URL)
+"""Endpoint/paging settings.  ``base_url`` drives the Step-1 index search; Step 2's file
+search uses the preference list (`DEFAULT_INDEX_ENDPOINTS`).  Pointed at CEDA today
+because metagrid-west is in maintenance; restore to ``Settings()`` when it is back."""
 
 FREQUENCY = ("mon",)
 """The ``frequency`` these use cases search for (ESGF uses ``"mon"`` for monthly)."""
@@ -64,8 +67,14 @@ FREQUENCY = ("mon",)
 PARENT_READS = process_pool_map(max_workers=8)
 """How to read netCDF parent headers online: process pool (netCDF isn't thread-safe)."""
 
-ENRICH_HEADERS = True
-"""Whether to read + cache header metadata (global attrs) for use case 1's datasets."""
+ENRICH_HEADERS = False
+"""Whether to run Steps 2-3 (files + header) for use case 1.
+
+**Off by default:** a simple, no-parent use case (like uc1 `ssp245` `tas`) stops at
+**Step 1** — the index search is the deliverable; there is no parent lineage to read a
+header for.  Files and header-only metadata exist to serve the parent-walk use cases
+(uc2/g6solar), where a file is only the substrate for one header read per simulation.
+Set this to `True` only to demo the Step-2/Step-3 machinery on uc1's datasets."""
 
 PREFERRED_HOSTS: tuple[str, ...] = ("esgf.nci.org.au",)
 """Data nodes to try first when reading headers (empty tuple = no preference)."""

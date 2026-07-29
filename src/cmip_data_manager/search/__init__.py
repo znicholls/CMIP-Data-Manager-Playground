@@ -28,6 +28,7 @@ from cmip_data_manager.search.parent_walk import (
     ParentNotFound,
     ParentResolutionError,
     ParentWalkResult,
+    VariableGap,
     declared_parent,
     resolve_parent_chains,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "ParentWalkResult",
     "UseCase",
     "UseCaseResult",
+    "VariableGap",
     "VersionEnrichResult",
     "VersionSelection",
     "add_files",

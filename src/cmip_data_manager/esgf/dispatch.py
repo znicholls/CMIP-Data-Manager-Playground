@@ -44,6 +44,8 @@ from enum import Enum, auto
 from cmip_data_manager.esgf.headers import (
     HeaderMetadata,
     HeaderReadBlocked,
+    HeaderReadHostFault,
+    HeaderReadTimeout,
     SimulationKey,
 )
 from cmip_data_manager.esgf.routing import SimulationCandidates
@@ -344,6 +346,8 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     increase_after: int = DEFAULT_INCREASE_AFTER,
     evict_after_attempts: int = DEFAULT_EVICT_AFTER_ATTEMPTS,
     evict_max_success_rate: float = DEFAULT_EVICT_MAX_SUCCESS_RATE,
+    on_success: Callable[[SimulationKey, HeaderMetadata], None] | None = None,
+    on_flush: Callable[[], None] | None = None,
 ) -> DispatchResult:
     """
     Read one header per simulation, routed across data nodes with adaptive load
@@ -383,6 +387,19 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     ceiling, increase_after, evict_after_attempts, evict_max_success_rate
         Adaptive-cap and eviction knobs (see the module docstring).
 
+    on_success
+        Optional callback invoked the instant a simulation's header is read, with
+        `(simulation, metadata)`.  It runs in the single controller thread (the same
+        one draining completions), so a caller can persist each header **as it
+        arrives** without any locking — the reads run on the pool, but this and every
+        other DB write happen serially here.  Used for save-as-you-go persistence.
+
+    on_flush
+        Optional callback invoked once per drain iteration, after the just-completed
+        reads have been applied.  Runs in the controller thread; use it to flush
+        accumulated side outputs (e.g. an attempt log, node-health counters) so a
+        long run — even a stretch of only failures — persists progress periodically.
+
     Returns
     -------
     :
@@ -407,16 +424,25 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     def read_on_host(
         simulation: SimulationKey, host: str
     ) -> tuple[_Outcome, HeaderMetadata | None]:
-        # Try the host's mirror URLs in ranked order (e.g. an https twin ahead of
-        # its http original), falling through only on a plain failure.  A block is
-        # node-level distress, so it stops and backs the host off immediately rather
-        # than hammering its other URLs.
+        # Try the host's mirror URLs in ranked order (e.g. an https twin ahead of its
+        # http original), falling through only on a *plain* failure.  Three outcomes
+        # stop the host immediately rather than hammering its remaining URLs:
+        #   - a block (429/403/503) is node-level distress; back the host off;
+        #   - a stall (timeout) means the node is hanging on *every* read; and
+        #   - a host fault (SSL/cert, DNS, connect-timeout) means the node is
+        #     unreachable/misconfigured, so its other URLs fail identically.
+        # The header is one-per-simulation, so in each case its remaining URLs would
+        # only burn more time (the tail that held uc2 open); move to the next mirror.
+        # A *plain* failure (incl. connection refused) still falls through to the next
+        # URL — only unmistakable host-level failures short-circuit.
         outcome: _Outcome = _Outcome.FAILURE
         for url in candidates[simulation].urls_by_host[host]:
             try:
                 metadata = reader(url)
             except HeaderReadBlocked:
                 return (_Outcome.BLOCKED, None)
+            except (HeaderReadTimeout, HeaderReadHostFault):
+                return (_Outcome.FAILURE, None)  # node-level fault; skip its other URLs
             except OSError:
                 outcome = _Outcome.FAILURE
                 continue
@@ -444,10 +470,16 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
                 if outcome is _Outcome.SUCCESS and metadata is not None:
                     scheduler.on_success(simulation, host)
                     headers[simulation] = metadata
+                    if on_success is not None:
+                        on_success(simulation, metadata)
                 elif outcome is _Outcome.BLOCKED:
                     scheduler.on_block(simulation, host)
                 else:
                     scheduler.on_failure(simulation, host)
+            # One flush per drain iteration (not per future), so periodic side-output
+            # persistence is amortised over the batch of completions just applied.
+            if on_flush is not None:
+                on_flush()
 
     return DispatchResult(
         headers=headers, failed=scheduler.failed, learned=scheduler.learned()

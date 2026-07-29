@@ -390,7 +390,7 @@ class HeaderReadAttempt(SQLModel, table=True):
     """
     One header-read attempt against a data node — an append-only log
 
-    Where the promoted metadata keeps only the *winning* read and `NodeHealthStat`
+    Where the promoted metadata keeps only the *winning* read and `DataNodeHealthStat`
     keeps per-host *aggregates*, this is the raw, timestamped per-attempt fact table:
     every URL tried for every simulation, in order, with its outcome and duration —
     including `with_retry` sub-attempts and simulations that fully failed.  It is
@@ -440,7 +440,7 @@ class HeaderReadAttempt(SQLModel, table=True):
     """1-based ordinal of this attempt among retries of the same `(host, url)`."""
 
 
-class NodeHealthStat(SQLModel, table=True):
+class DataNodeHealthStat(SQLModel, table=True):
     """
     Persisted per-data-node header-read outcomes
 
@@ -478,7 +478,7 @@ class IndexNodeHealthStat(SQLModel, table=True):
     """
     Persisted per-search-index-endpoint file-search outcomes (Step 2)
 
-    The Step-2 twin of `NodeHealthStat`: where that records *data node* header-read
+    The Step-2 twin of `DataNodeHealthStat`: where that records *data node* header-read
     health, this records *search index* endpoint health — attempts, successes,
     failures, how many calls were **retries**, and the subset of failures that were
     **server errors** (5xx) or **timeouts**.  One row per endpoint, keyed on the full
@@ -514,3 +514,52 @@ class IndexNodeHealthStat(SQLModel, table=True):
     """Slowest successful call seen; surfaces a pathologically slow-but-alive node."""
 
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class FileAccessAttempt(SQLModel, table=True):
+    """
+    One file-search attempt against a search-index endpoint (Step 2) — append-only
+
+    The Step-2 twin of `HeaderReadAttempt`: where `IndexNodeHealthStat` keeps
+    per-endpoint *aggregates*, this is the raw, timestamped per-attempt fact table —
+    every file search issued for every dataset version, in order, with the endpoint it
+    hit, its outcome and duration, including in-request backoff retries, requeue passes,
+    endpoint fallbacks and versions that fully failed.  It is append-only (never
+    upserted), so it accumulates a history across runs.
+
+    It underpins two things the aggregate cannot:
+
+    - **diagnosis** — for a version whose files could not be found, exactly which
+      endpoints were tried and how each ended (`server_error`, `timeout`, `error`,
+      `overflow`, or an **`empty`** 200 that returned no files — the case behind
+      Step 3's `no_files`);
+    - **ad-hoc questions** — because `created_at`, `endpoint`, `version_key` and
+      `outcome` are all indexed, a plain `GROUP BY` answers "how did endpoint X do
+      today?", "what happened to this version's file search?", or "which versions came
+      back empty?".
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+    endpoint: str = Field(index=True)
+    """Search-index endpoint the attempt hit (the full search URL)."""
+
+    version_key: str = Field(index=True)
+    """`DatasetVersion.instance_id` whose files this attempt searched for."""
+
+    outcome: str = Field(index=True)
+    """`success`, `empty` (HTTP 200 but zero files), `server_error`, `timeout`, `error`,
+    or `overflow` (the single-version result exceeded the retrieval cap)."""
+
+    files_found: int = 0
+    """Number of file records the search returned (0 on a failure or an `empty` hit)."""
+
+    detail: str | None = None
+    """Underlying error/exception text for a failed attempt; `None` on success/empty."""
+
+    seconds: float = 0.0
+    """Wall-clock duration of the attempt."""
+
+    attempt_no: int = 1
+    """1-based ordinal of this attempt among the backoff retries on this endpoint."""

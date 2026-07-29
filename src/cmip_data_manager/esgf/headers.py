@@ -35,7 +35,9 @@ Two facts shape the design:
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue
 import random
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -43,6 +45,8 @@ from multiprocessing.connection import Connection, wait
 from multiprocessing.process import BaseProcess
 from typing import TypeVar
 from urllib.parse import urlparse
+
+import httpx
 
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
@@ -66,6 +70,17 @@ A healthy header read was measured at ~1s from a nearby node and ~20s from a
 distant one, so this is generous enough that a slow-but-alive node completes while
 sitting far below the ~25-minute stall it exists to cut off.  Tune it towards a
 high percentile of the *observed* healthy-read time once `NodeHealth` has data.
+"""
+
+DEFAULT_CONNECT_TIMEOUT = 90.0
+"""
+Default deadline in seconds for the connect *probe* to reach a data node.
+
+A header read has two very different phases: **reaching** the node (TCP + TLS
+handshake, which a distant-but-healthy node can legitimately make slow) and, once
+connected, **reading** the tiny header (which should be near-instant).  The probe
+allows this long window to *connect* — a slow-but-alive node is not a dead one — and
+only the far shorter `DEFAULT_READ_TIMEOUT`-class deadline bounds the read itself.
 """
 
 DEFAULT_KILL_GRACE = 2.0
@@ -607,6 +622,32 @@ class HeaderReadBlocked(OSError):
         )
 
 
+class HeaderReadHostFault(OSError):
+    """
+    Raised when a read fails with a *node-level connection fault*
+
+    Distinct from an ordinary `OSError` and from `HeaderReadBlocked` (a rate-limit):
+    an **SSL/certificate error, a DNS-resolution failure or a connect-timeout** means
+    the whole **data node** is unreachable or misconfigured right now — not that one
+    file is bad.  Retrying the same host in seconds gives the identical failure, and
+    its other URLs fail the same way, so `with_retry` declines to retry it and the
+    dispatcher skips the node's remaining URLs and moves to the next mirror.
+
+    A plain **connection refused** is deliberately **not** one of these: it can be a
+    momentary overload that succeeds on retry, so it is left an ordinary retryable
+    `OSError` (that is what retries are for).  `promote_host_faults` produces this from
+    an `OSError` whose message matches `is_host_fault`.  Still an `OSError`, so it also
+    falls through to the next mirror like any other dead host.
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        super().__init__(
+            f"Data node for {url!r} has a connection-level fault: {reason}"
+        )
+
+
 # QUESTION: specified here? I think this makes sense. We don't know what the block
 # signatures would be
 # Substrings (matched case-insensitively) that mark a read failure as a node-level
@@ -696,6 +737,220 @@ def promote_blocks(reader: Callable[[str], T]) -> Callable[[str], T]:
     return read
 
 
+# Substrings (matched case-insensitively) that mark a read failure as a node-level
+# *connection fault* — the data node is unreachable or misconfigured right now, so
+# retrying it or trying its other URLs is wasted.  A plain "connection refused" is
+# deliberately **absent**: it can be a momentary overload that succeeds on retry, so it
+# stays an ordinary retryable error (that is what retries are for).  Only unmistakable
+# node-level faults are listed: SSL/certificate errors, DNS-resolution failures, and
+# connect-timeouts (curl's "timeout was reached", distinct from a fast refusal).
+_HOST_FAULT_SIGNATURES = (
+    "ssl",
+    "certificate",
+    "could not resolve host",
+    "couldn't resolve host",
+    "timeout was reached",
+)
+
+
+def is_host_fault(exc: BaseException) -> bool:
+    """
+    Return whether an exception is a node-level connection fault (not a refusal)
+
+    Inspects the exception text for an unmistakable node-level fault — an SSL /
+    certificate error, a DNS-resolution failure, or a connect-timeout.  A plain
+    *connection refused* returns `False` (it can be a momentary overload, so it is
+    left retryable).  Like `is_block_signal`, this is a text heuristic: the
+    netCDF/libcurl driver surfaces the failure as `OSError` message text.
+
+    Parameters
+    ----------
+    exc
+        The exception raised by a read.
+
+    Returns
+    -------
+    :
+        `True` if the message matches a known node-level connection fault.
+
+    Examples
+    --------
+    >>> is_host_fault(OSError("curl (60) SSL certificate problem: self-signed"))
+    True
+    >>> is_host_fault(OSError("Could not resolve host: esgf.example.org"))
+    True
+    >>> is_host_fault(OSError("Failed to connect: Connection refused"))
+    False
+    """
+    text = str(exc).lower()
+    return any(signature in text for signature in _HOST_FAULT_SIGNATURES)
+
+
+def promote_host_faults(reader: Callable[[str], T]) -> Callable[[str], T]:
+    """
+    Wrap a reader so a node-level connection fault becomes `HeaderReadHostFault`
+
+    An `OSError` whose message matches `is_host_fault` (an SSL/certificate error, a DNS
+    failure, or a connect-timeout) is a node-level fault, not a per-file error, so it is
+    promoted to `HeaderReadHostFault` — which `with_retry` declines to retry and the
+    dispatcher treats as "skip this node, next mirror".  A plain *connection refused* is
+    left an ordinary retryable `OSError`.  Already-typed failures pass through as-is.
+
+    Compose it alongside `promote_blocks`, inside `recording` and `with_retry`.
+
+    Parameters
+    ----------
+    reader
+        The underlying `url -> value` read to classify.
+
+    Returns
+    -------
+    :
+        A reader that raises `HeaderReadHostFault` on an unmistakable node-level fault.
+    """
+
+    def read(url: str) -> T:
+        try:
+            return reader(url)
+        except (
+            HeaderReadTimeout,
+            HeaderReadCrashed,
+            HeaderReadBlocked,
+            HeaderReadHostFault,
+        ):
+            raise
+        except OSError as exc:
+            if is_host_fault(exc):
+                raise HeaderReadHostFault(url, str(exc)) from exc
+            raise
+
+    return read
+
+
+def _probe_host_fault(
+    url: str, *, connect_timeout: float, read_timeout: float
+) -> str | None:
+    """
+    Cheaply probe a data node, returning a host-fault reason or `None` to proceed
+
+    Issues a tiny `Range: bytes=0-0` request (the body is never read) purely to
+    separate the two phases of reaching the node, each with its own deadline:
+
+    - **connect** — TCP + TLS handshake — is allowed `connect_timeout` seconds, since
+      a distant-but-healthy node can be slow to reach; exceeding it (a black-holed
+      connect) returns a fault;
+    - **read** — the server's first response byte — is allowed `read_timeout`
+      seconds; a node that connects then stalls is dead, and returns a fault.
+
+    An **SSL/certificate** or **DNS-resolution** failure also returns a fault (the
+    node is unreachable/misconfigured).  Everything else — including a plain
+    **connection refused** (kept retryable) and any HTTP status (even 404/500, which
+    are the real read's business) — returns `None`, so the probe can only ever
+    *short-circuit a provably-dead node*, never turn a retryable or per-file problem
+    into a host fault.
+
+    Parameters
+    ----------
+    url
+        The `HTTPServer` URL about to be read.
+
+    connect_timeout, read_timeout
+        Deadlines for the connect and read phases (see above).
+
+    Returns
+    -------
+    :
+        A short fault reason if the node is unreachable, otherwise `None`.
+    """
+    timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=read_timeout,
+        pool=connect_timeout,
+    )
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={"Range": "bytes=0-0"},
+            timeout=timeout,
+            follow_redirects=True,
+        ):
+            return None  # the node answered — leave the read to the real reader
+    except httpx.ConnectTimeout:
+        return f"connect timed out after {connect_timeout}s"
+    except httpx.ReadTimeout:
+        return f"read stalled after {read_timeout}s"
+    except httpx.ConnectError as exc:
+        # DNS/TLS handshake failures surface here too; a plain refusal stays
+        # retryable, so only non-refusals are treated as a node-level fault.
+        if "refused" in str(exc).lower():
+            return None
+        return f"connect error: {exc}"
+    except httpx.HTTPError:
+        # Anything else (protocol quirks, unexpected transport errors): don't block;
+        # let the real read surface it as its ordinary (retryable) failure.
+        return None
+
+
+def with_connect_probe(
+    reader: Callable[[str], T],
+    *,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
+) -> Callable[[str], T]:
+    """
+    Gate a reader behind a connect probe that fails fast on a dead node
+
+    Runs `_probe_host_fault` in the **calling (worker) thread** *before* the wrapped
+    read.  If the probe finds the node unreachable it raises `HeaderReadHostFault` —
+    which `with_retry` declines to retry and the dispatcher treats as "skip this
+    node, next mirror" — so a dead node costs one cheap probe, not a full read.
+    Otherwise it calls `reader(url)` unchanged.
+
+    Wrap this **outside** `with_timeout` (the probe must run in the worker thread, not
+    the read subprocess) and inside `promote_host_faults`/`recording`/`with_retry`:
+
+    ```python
+    reader = with_retry(
+        recording(
+            promote_host_faults(
+                with_connect_probe(with_timeout(read_header, seconds=read_timeout))
+            )
+        )
+    )
+    ```
+
+    Because the probe gives the connect phase its own long window, a slow-but-alive
+    node is *not* cut off; only the far shorter read deadline bounds the read.
+
+    Parameters
+    ----------
+    reader
+        The underlying `url -> value` read to gate (e.g. a `with_timeout`-wrapped
+        `read_header`).
+
+    connect_timeout, read_timeout
+        Probe deadlines forwarded to `_probe_host_fault`.
+
+    Returns
+    -------
+    :
+        A reader with the same contract that raises `HeaderReadHostFault` when the
+        probe finds the node unreachable, and otherwise reads as normal.
+    """
+
+    def read(url: str) -> T:
+        fault = _probe_host_fault(
+            url, connect_timeout=connect_timeout, read_timeout=read_timeout
+        )
+        if fault is not None:
+            raise HeaderReadHostFault(url, fault)
+        return reader(url)
+
+    return read
+
+
 def _run_reader(reader: Callable[[str], T], url: str, conn: Connection) -> None:
     """Child entry point: send `("ok", result)` or `("err", exception)` back."""
     try:
@@ -710,13 +965,73 @@ def _run_reader(reader: Callable[[str], T], url: str, conn: Connection) -> None:
         conn.close()
 
 
+DEFAULT_ORPHAN_POLL = 5.0
+"""Seconds between background sweeps of read subprocesses that would not die."""
+
+
+class _OrphanReaper:
+    """Background reaper for read subprocesses that would not die on `SIGKILL`.
+
+    A wedged read (a black-holed data node) can survive `SIGKILL` until its kernel
+    syscall returns; rather than block a worker thread waiting on such a process,
+    `_terminate` hands it here.  A single lazily-started daemon polls each detached
+    process with a **non-blocking** `join(0)` on every sweep, so it is reaped the
+    moment it finally dies — without ever blocking a caller.
+    """
+
+    def __init__(self, poll: float = DEFAULT_ORPHAN_POLL) -> None:
+        self._poll = poll
+        self._queue: queue.SimpleQueue[BaseProcess] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._started = False
+
+    def detach(self, proc: BaseProcess) -> None:
+        """Hand off a process that would not die (starts the daemon on first use)."""
+        with self._lock:
+            if not self._started:
+                threading.Thread(
+                    target=self._run, name="header-read-reaper", daemon=True
+                ).start()
+                self._started = True
+        self._queue.put(proc)
+
+    def _run(self) -> None:
+        pending: list[BaseProcess] = []
+        while True:
+            try:
+                pending.append(self._queue.get(timeout=self._poll))
+            except queue.Empty:
+                pass
+            survivors: list[BaseProcess] = []
+            for proc in pending:
+                proc.join(0)  # non-blocking poll; reaps the process if it has died
+                if proc.is_alive():
+                    survivors.append(proc)
+            pending = survivors
+
+
+_ORPHAN_REAPER = _OrphanReaper()
+"""Process-wide reaper for read subprocesses that outlive their grace window."""
+
+
 def _terminate(proc: BaseProcess, grace: float) -> None:
-    """Stop a process, escalating from `terminate` to `kill` if it clings on."""
+    """Stop a read subprocess, never blocking the caller on one that will not die.
+
+    Escalates `terminate` (SIGTERM) -> `kill` (SIGKILL), each with a **bounded** join.
+    A read wedged in an uninterruptible kernel network wait (a black-holed data node)
+    can survive even SIGKILL until its syscall returns; waiting on it unbounded would
+    freeze this worker thread, and once every worker is frozen the whole header step
+    deadlocks.  So if the process is still alive after the grace window it is handed to
+    a background reaper and this returns at once — a short-lived orphan (already a
+    `daemon`) is a strictly better outcome than a hung worker.
+    """
     proc.terminate()
     proc.join(grace)
     if proc.is_alive():
         proc.kill()
-        proc.join()
+        proc.join(grace)  # bounded: give SIGKILL the grace window, never wait forever
+        if proc.is_alive():
+            _ORPHAN_REAPER.detach(proc)
 
 
 def with_timeout(
@@ -797,6 +1112,7 @@ def with_retry(  # noqa: PLR0913 - configurable but every knob has a sane defaul
         HeaderReadTimeout,
         HeaderReadCrashed,
         HeaderReadBlocked,
+        HeaderReadHostFault,
     ),
     base: float = DEFAULT_RETRY_BASE,
     cap: float = DEFAULT_RETRY_CAP,
@@ -812,13 +1128,15 @@ def with_retry(  # noqa: PLR0913 - configurable but every knob has a sane defaul
     throttle or block us.
 
     By default it retries any `OSError` **except** `HeaderReadTimeout`,
-    `HeaderReadCrashed` and `HeaderReadBlocked`: a *stall* means the node answered
-    but is hanging, so burning another full deadline on it is wasteful — better to
-    fall through to the next mirror (`read_first_readable` will); a crash on a
-    specific file is unlikely to fix itself; and a *block* means the node is
-    rate-limiting us, so retrying the same host only hammers it (the concurrency
-    controller backs it off instead).  Only genuine connect-time failures are
-    retried.
+    `HeaderReadCrashed`, `HeaderReadBlocked` and `HeaderReadHostFault`: a *stall* means
+    the node answered but is hanging, so burning another full deadline on it is wasteful
+    — better to fall through to the next mirror (`read_first_readable` will); a crash on
+    a specific file is unlikely to fix itself; a *block* means the node is rate-limiting
+    us, so retrying only hammers it (the concurrency controller backs it off instead);
+    and a *host fault* (SSL/cert, DNS, connect-timeout) means the node is unreachable or
+    misconfigured, so the identical failure would just repeat.  A plain *connection
+    refused* is **not** excluded — it can be a momentary overload, so it is retried
+    (that is what retries are for).
 
     Compose it *outside* `recording` so every attempt is recorded as its own read
     (retries then show up in `NodeHealth` failure counts), and inside

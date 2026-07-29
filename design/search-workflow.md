@@ -11,14 +11,21 @@ GitHub renders them, or paste into <https://mermaid.live> to view.
 
 ## The two use cases
 
-- **UC-simple** — e.g. `ssp245` `tas`. Search the index node, add files, read one
-  header per dataset. Stops at Step 3.
+- **UC-simple** — e.g. `ssp245` `tas`. No parent, so **Step 1 only**: search the index
+  node for the datasets and stop. There is no parent lineage to resolve, so no header
+  is needed — and files/headers exist only to serve that resolution (see below).
 - **UC-chain** — we know the **child** experiment and the **stopping parent**
   experiment, but *not* the intermediate hops. We only search the index node for
   the child at the start; every parent is discovered from a child's header, then
   searched for individually. Runs Steps 1-4 and loops.
 
-They share Steps 1-3 exactly. They diverge at Step 4 (only UC-chain hops).
+**Files are only the substrate for a header read.** Header-only metadata (the
+`parent_*` lineage) is **independent of variable**, so one header per simulation
+`(source_id, experiment_id, variant_label)` serves every variable, read from **one**
+file. Steps 2-3 therefore run *only* for the parent-walk use case: a simulation whose
+header is already known (from any variable, including an earlier run) is copied over,
+skipping both its file search and its read. So UC-simple stops at Step 1; UC-chain runs
+Steps 1-4 (files/header for lineage only) and loops.
 
 ## Data model (reconciled)
 
@@ -143,7 +150,12 @@ Notes on identity / grains:
   (`enrich_with_parents`/`enrich_parent_chains`) modules and the `DatasetHeader` table
   are deleted, and the live scripts are rewired onto the new path. `declared_parent`
   (the `parent_*` → parent-simulation projection) now lives in `search/parent_walk.py`.
-- `HeaderReadAttempt` and `NodeHealthStat` are unchanged (diagnostics + health).
+- `HeaderReadAttempt` and `DataNodeHealthStat` are unchanged (data-node diagnostics +
+  health). Two new twins cover the *search index* endpoints hit in Step 2:
+  `IndexNodeHealthStat` mirrors `DataNodeHealthStat` (per-endpoint aggregates), and
+  `FileAccessAttempt` mirrors `HeaderReadAttempt` (an append-only per-search-call log —
+  every retry, requeue and fallback, with an `empty` outcome recorded distinctly from a
+  `success`). See "Node health & attempt logging" below.
 - `RunMembership`/`DatasetChange` record which **versions** (`instance_id`) a run
   returned, so a new version appears as an `added` (and the superseded one as
   `removed`) — surfacing version changes between two searches of the same spec.
@@ -189,23 +201,28 @@ flowchart TD
         A1 --> A2 --> A3 --> A4
     end
 
-    subgraph S2["Step 2 - add files to each dataset (SEARCH API - threads)"]
-        B0{"cache check:<br/>files already stored<br/>for this dataset?"}
-        B1["PARALLEL over datasets: ONE file search per dataset<br/>(no OR-batching -> no 10k overflow, no bisect)"]
-        B2["save immediately: File(node-independent)<br/>+ FileAccess(per node, fsspec url)"]
-        B0 -- no --> B1 --> B2
+    subgraph S2["Step 2 - add files to each dataset version (SEARCH API - threads)"]
+        B0{"cache check:<br/>files already stored<br/>for this version?"}
+        B1["PARALLEL over versions (n_workers): ONE file search per version<br/>preference-ordered endpoints (today CEDA -> ORNL -> metagrid-west)"]
+        BR["per version, escalate on failure:<br/>in-request backoff (5 retries) -> requeue -> next endpoint"]
+        B2["save-as-you-go: commit File + FileAccess the moment a search succeeds<br/>(DB writes serialised behind a lock; index-node health flushed too)"]
+        BH["record IndexNodeHealthStat per endpoint<br/>(attempts, successes, failures, retries, 5xx, timeouts, latency)"]
+        BX["all endpoints + requeues exhausted -> raise FileSearchIncompleteError<br/>(AFTER successes persisted; re-run retries only the failures)"]
+        B0 -- no --> B1 --> BR --> B2
+        BR --> BH
+        BR -- "still failing" --> BX
         B0 -- yes --> B2cache["skip (reuse cache)"]
     end
 
     subgraph S3["Step 3 - header-only metadata (DATA NODE byte-range - process pool)"]
-        C0{"cache check:<br/>header already on a file<br/>of this version's simulation?"}
+        C0{"cache check (simulation grain):<br/>header already stored for this (source,exp,variant)?<br/>ANY variable, incl. an earlier run"}
         C1["pick ONE file per version; rank its FileAccess mirrors"]
         C2["PARALLEL reads: shared worker pool + per-node concurrency caps<br/>(timeout via subprocess, retry, health-aware)"]
         C3["save header_attrs_json on that File<br/>promote parent_* onto DatasetVersion (header_from_file_key)"]
-        CH["persist NodeHealthStat + HeaderReadAttempt<br/>(load at start, record per read, save at end)"]
+        CH["persist DataNodeHealthStat + HeaderReadAttempt<br/>(load at start, record per read, save at end)"]
         C0 -- no --> C1 --> C2 --> C3
         C2 --> CH
-        C0 -- yes --> C3reuse["reuse sibling's promoted metadata"]
+        C0 -- yes --> C3reuse["copy stored header onto the new versions<br/>(no file search, no read)"]
     end
 
     subgraph S4["Step 4 - discover parent, one search per parent (UC-chain ONLY)"]
@@ -215,14 +232,14 @@ flowchart TD
         OV["apply parent overrides (optional seam):<br/>user-supplied / known-fixes take precedence over header"]
         D1["project declared parent from DatasetVersion.parent_* (or override)<br/>source_id assumed SAME; institution_id NOT assumed"]
         D2["dedupe parents (many children -> one parent) via DB check"]
-        D4["PARALLEL: ONE search per parent (no AND/OR),<br/>broad: any variable, latest-agnostic, replicas ok"]
+        D4["PARALLEL: ONE search per parent (no AND/OR),<br/>VARIABLE-SCOPED (OR over requested vars), latest-agnostic, replicas ok"]
         DF{"search outcome?"}
         PNF["terminal parent_not_found:<br/>declares parent (S,E,V) but NO such dataset<br/>is published on the index node"]
         D5["save parent version + set child.parent_version_key<br/>(institution_id read from the PARENT's own result)"]
         DS{"reached target?<br/>parent experiment == stopping experiment"}
         DN{"header declares 'no_parent'?"}
         DE["terminal not_an_ancestor:<br/>reached 'no_parent' without the specified parent"]
-        OK["end of chain: Step 1+2 for this parent<br/>(dataset + files, NO header, NO further hop)"]
+        OK["end of chain: Step 1 for this parent<br/>(dataset stored; NO files - only header substrate, NO header, NO further hop)"]
         P0 -- "yes" --> P1
         P1 -- "missing" --> P1E
         P1 -- "exists" --> OV
@@ -303,8 +320,14 @@ whether any node is currently up. To avoid false negatives:
 - conclude "absent" only from a **successful** search returning zero — never from a
   timeout/HTTP error (that is a transient `search_failed`, retried, and if it persists
   raised as a *different* error);
-- make the existence search **broad** — the declared `(source, experiment, variant)`
-  across *any* variable, latest-agnostic, replicas allowed;
+- the search is **variable-scoped** — the declared `(source, experiment, variant)`
+  constrained to the requested variables (an OR), latest-agnostic, replicas allowed.
+  **Consequence (accepted):** a parent that exists but publishes *none* of the requested
+  variables comes back empty and so is a `parent_not_found` — the walk cannot tell that
+  apart from a parent that does not exist at all. (This reverses an earlier
+  variable-agnostic existence design; the trade-off was made deliberately.) A parent
+  that publishes *some but not all* of the requested variables resolves, with the absent
+  ones recorded as `VariableGap`s (informational, not chain-breaking);
 - **never silently relax the declared variant** — `branch_time_in_parent` is defined
   against that specific variant, so a different variant is a *different, wrong* parent.
 
@@ -316,15 +339,15 @@ raised listing every broken one (rather than aborting on the first). This applie
 `parent=None` walks too: a declared-but-missing ancestor is a broken chain, so it
 raises — the override below is the escape hatch, not a silent warning.
 
-**Override seam (design room now, not built).** A user who knows a specific child→parent
-link is wrong in the archive's global metadata must be able to **override** it — either
-**up front** (supply corrections before the walk) or **after** a `parent_not_found`
-error (add the correction and re-run). The design keeps room for this by making the
-parent *projection* a replaceable input: an injected `parent_overrides` mapping (child
-simulation → corrected parent simulation) that **takes precedence over the header** when
-present. A future **known-fixes library** (curated overrides for known-bad CMIP6
-metadata) would simply produce such a mapping for a user to opt into. None of this is
-built yet; the Step-4 API just needs the seam.
+**Override seam (built).** A user who knows a specific child→parent link is wrong in the
+archive's global metadata can **override** it — either **up front** (supply corrections
+before the walk) or **after** a `parent_not_found` error (add the correction and
+re-run). The parent *projection* is a replaceable input: the injected `parent_overrides`
+mapping (child simulation → corrected parent simulation) **takes precedence over the
+header** when present (`resolve_parent_chains(..., parent_overrides=...)`, surfaced as an
+editable `PARENT_OVERRIDES` in the uc2/g6solar scripts). A future **known-fixes library**
+(curated overrides for known-bad CMIP6 metadata) would simply produce such a mapping for
+a user to opt into.
 
 **Institution is never assumed between parent and child.** `source_id` must match (the
 parent of a CMIP6 run is the same model, so a missing `parent_source_id` defaults to the
@@ -341,7 +364,7 @@ Step 4 is built; nothing in the code assumes institution today.
 | Step | Today | Target change | Parallelism |
 |---|---|---|---|
 | 1 search | `client.search_many`, `runner.fetch_records/_dedupe`, `repository.record_run` | **DONE (Increment A/B + D6 rework):** group `master_id -> version -> node`; write `Dataset` (master) + `DatasetVersion` + `DatasetNodeSpecificInfo`; version string validated date-parseable; `SearchRun` keyed on spec, `use_case` gone (optional `tag`); membership/diff at version grain; `get_dataset_records(tag)` reconstructs per-node records | thread pool over queries (exists via `map_fn`; scripts must pass `thread_pool_map` — default is `serial_map`) |
-| 2 files | `enrich_headers._lookup_files` **ORs many `dataset_id`s per request**, `_chunk_ids`, `_search_files_for_ids` bisect | **DONE (Increment C):** `search/files.py::add_files` does **one `search_files` per version** through an injected `MapFn`, persisting `File` + `FileAccess` (fsspec URLs, http→https) via `repository.store_files`; `version_has_files` is the cache check. (The old batched `_lookup_files` inside `enrich_headers` has been deleted with the rest of the old header path.) | thread pool over versions (NEW explicit; pass `thread_pool_map`) |
+| 2 files | `enrich_headers._lookup_files` **ORs many `dataset_id`s per request**, `_chunk_ids`, `_search_files_for_ids` bisect | **DONE (Increment C + endpoint-fallback rework):** `search/files.py::add_files` does **one `search_files` per version** through an injected `MapFn`, over a **preference-ordered list of endpoints** (`build_file_search_clients`; today CEDA → ORNL → metagrid-west while west is in maintenance). Per version it escalates on failure — **in-request exponential backoff (default 5 retries) → requeue → fall back to the next endpoint** — and a worker **never raises** (one 500 no longer aborts the pass). **Save-as-you-go**: each version's `File` + `FileAccess` (fsspec URLs, http→https) is committed via `repository.store_files` the instant its search succeeds, DB writes serialised behind a lock (SQLite single-writer; WAL on); `version_has_files` is the cache check. Records `IndexNodeHealthStat` per endpoint and logs every search call (retry/requeue/fallback, `empty` distinct from `success`) to `FileAccessAttempt`; raises `FileSearchIncompleteError` (listing the unresolved versions) only after every endpoint/requeue is exhausted **and** successes are persisted, so a re-run retries just the failures. (The old batched `_lookup_files` was deleted with the rest of the old header path.) | thread pool over versions (`n_workers` via `thread_pool_map`); DB writes serialised |
 | 3 header | `enrich_headers` → `dispatch_reads` → `read_header`; stored in `DatasetHeader` | **DONE (Increment D):** `search/version_headers.py::enrich_version_headers` reads one header per **simulation** from the persisted `FileAccess`, stores it on `File.header_attrs_json`, and promotes the `parent_*` subset onto **every `DatasetVersion`** of the sim (`header_from_file_key`); reuses the existing `dispatch_reads`/health/attempt-log/retry (health **persists**). (The old `enrich_headers`/`DatasetHeader` have been deleted.) | reuses the dispatcher: thread-pool workers, per-read subprocess timeout, per-node concurrency caps |
 | 4 parent | `parent_hop.declared_parent`, `_locate_missing` **`search_many([...])` batch** | **DONE (Increment E):** `search/parent_walk.py::resolve_parent_chains` walks hop-by-hop, reading headers via `enrich_version_headers`, issuing **one search per distinct parent** through the injected `MapFn`, storing found parents and setting `parent_version_key` (child version → same-variable parent version). Existence gate, `ParentNotFound`, `ParentNotAncestor` all **raise** (aggregated); `parent_overrides` seam; institution never assumed; end-of-chain skips the header. Routing controls (`preferred_hosts`, `ignore_hosts`, `timeout`, `node_concurrency`, `max_workers`, `skip_cached`) are threaded through each hop's `enrich_version_headers`. Old `parent_hop`/`enrich_headers`/`DatasetHeader` deleted; the uc2/g6solar scripts are rewired onto `resolve_parent_chains`. | one search per parent through the `MapFn` (pass `thread_pool_map`) |
 
@@ -358,10 +381,11 @@ Step 4 is built; nothing in the code assumes institution today.
    be killed, so those run on a worker pool with a **subprocess per read** (a process
    boundary), never a plain thread.
 3. **Is parallelism already there?** Step 1: yes, but off by default (`serial_map`);
-   callers opt in with `thread_pool_map`. Step 3: yes (the dispatcher). Steps 2 and 4:
-   **no** — today they are *batched* (many datasets/parents folded into one request),
-   which is exactly what we are replacing with one-search-per-dataset + explicit
-   client-side parallelism.
+   callers opt in with `thread_pool_map`. Step 2: **yes** — one search per version fanned
+   out over `n_workers`, with per-version backoff → requeue → endpoint fallback and
+   save-as-you-go (the old batching is gone). Step 3: yes (the dispatcher). Step 4:
+   **still batched** for the parent search (one search per parent is the intent), but it
+   re-uses Step 2's parallel file search per hop.
 4. **"Header" is the wrong word for a dataset.** Agreed. Files have headers; datasets
    do not. Language: a **file** stores its `header_attrs_json`; the **dataset** carries
    promoted **"header-only metadata"** (a.k.a. header-only dataset metadata) with a
@@ -376,8 +400,10 @@ Step 4 is built; nothing in the code assumes institution today.
 - **D3 ✅** `DatasetHeader` (simulation-grain) is retired in favour of
   `File.header_attrs_json` + promoted **`DatasetVersion`** columns, preserving the
   cross-variable reuse optimisation by copying a sibling version's promoted metadata.
-- **D4 ✅** End-of-chain parent gets Step 1 **+ Step 2 (files)** so its data is
-  reachable, but **no header read** and no further hop.
+- **D4 ✅ (revised)** End-of-chain parent gets **Step 1 only** — it is stored by the
+  search, but gets **no files** (files are only the substrate for a header read, and a
+  terminal needs no header), **no header read** and no further hop. (Supersedes the
+  earlier "Step 1 + Step 2 files"; files are no longer a per-dataset deliverable.)
 - **D5 ✅** Stop condition raises **errors, not warnings**: an *existence gate*
   (raise if a user-specified stopping experiment does not exist on the index node)
   and a *not-an-ancestor* check (raise if the walk hits `"no parent"` without passing
@@ -405,19 +431,43 @@ Step 4 is built; nothing in the code assumes institution today.
 
 ## Node health & attempt logging (must persist — do not lose)
 
-The per-node health learning and the append-only attempt log are **first-class and
-must keep persisting** across the restructure. They live in Step 3 (the only step
-that contacts data nodes):
+There are **two independent health stores**, each owned by the step that talks to that
+kind of server: *data-node* health (Step 3, header reads) and *index-node* health
+(Step 2, file searches).
+
+**Data-node health (Step 3 — the only step that contacts data nodes).** The per-node
+health learning and the append-only attempt log are **first-class and must keep
+persisting** across the restructure:
 
 - `Repository.load_node_health()` at the start of a read pass, `recording(...)` onto
   the in-memory `NodeHealth` per read, `save_node_health()` at the end
   (`persist_health=True`).
 - Every attempt (including retries and fully-failed simulations) is written to
   `HeaderReadAttempt` via `record_header_attempts()`.
-- `NodeHealthStat` and `HeaderReadAttempt` tables are **unchanged** by this work.
+- `DataNodeHealthStat` and `HeaderReadAttempt` tables are **unchanged** by this work.
 
-Steps 1, 2 and 4 hit the *search index*, not data nodes, so they do not produce node
-health — health is a Step 3 concept only.
+**Index-node health (Step 2 — the file search).** The Step-2 twin: `search/files.py::
+add_files` records each per-endpoint search call into an in-memory `IndexNodeHealth`
+(`esgf/index_health.py`) and persists it to `IndexNodeHealthStat` via
+`Repository.save_index_health()` (loaded with `load_index_health()`, flushed **as the
+run proceeds**, not only at the end). It tracks per endpoint: attempts, successes,
+failures, **retries**, **server_errors** (HTTP 5xx — e.g. the metagrid-west 500s) and
+**timeouts**, plus latency. Endpoint *ordering* stays the caller's explicit preference;
+health is recorded for observability and future ranking
+(`rank_index_nodes_by_reliability`), not to reorder the preference.
+
+Alongside those aggregates, **every individual search call** is written to the
+append-only `FileAccessAttempt` log via `Repository.record_file_access_attempts()` (the
+Step-2 twin of `record_header_attempts`): one row per call — each backoff retry, each
+requeue and each endpoint fallback — carrying the `endpoint`, `version_key`, `outcome`,
+`files_found`, latency and `attempt_no`. Crucially it records an **`empty`** outcome
+(HTTP 200 with zero files) distinctly from a `success` with files, so the versions behind
+Step 3's `no_files` become directly queryable (`get_file_access_attempts(outcome="empty")`).
+It saves as the run proceeds, under the same write lock as `store_files`.
+
+Step 1 also hits the search index but keeps its own single-endpoint retry and records no
+index-node health; Step 4 re-uses Step 2 per hop (so its file searches feed the same
+`IndexNodeHealthStat` and `FileAccessAttempt`).
 
 ## Testing & observability (visual, per step)
 

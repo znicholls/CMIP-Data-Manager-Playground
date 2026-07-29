@@ -48,13 +48,39 @@ def test_simulation_candidates_ranks_hosts_preferred_first():
     assert cand.urls_by_host["ornl"] == ("https://ornl/f1.nc",)
 
 
-def test_simulation_candidates_keeps_all_urls_of_a_host_best_first():
-    # Two files (e.g. two time-chunks) served by the same host: both kept so a
-    # single unreadable file can fall through to another on the same node.
-    files = [_file("f1", "d1", "nci"), _file("f2", "d1", "nci")]
+def test_simulation_candidates_collapses_a_host_to_one_representative_file():
+    # Many files (variables/time-chunks) served by the same host collapse to just
+    # the first one: one readable file answers the whole simulation, so probing a
+    # dead node once per file would only multiply wasted attempts.
+    files = [
+        _file("tas_2000", "d1", "nci"),
+        _file("tas_2001", "d1", "nci"),
+        _file("pr_2000", "d1", "nci"),
+    ]
     cand = simulation_candidates(("A", "ssp245", "r1"), files, group="A")
     assert cand.hosts == ("nci",)
-    assert cand.urls_by_host["nci"] == ("https://nci/f1.nc", "https://nci/f2.nc")
+    assert cand.urls_by_host["nci"] == ("https://nci/tas_2000.nc",)
+
+
+def test_simulation_candidates_keeps_both_schemes_of_the_representative_file():
+    # The https twin and http original of the *same* file are both kept, so the
+    # collapse still lets a scheme fall through on one node.
+    http_only = FileRecord(
+        id="tas_2000",
+        dataset_id="d1",
+        urls=(
+            "http://nci/tas_2000.nc|application/netcdf|HTTPServer",
+            "http://nci/tas_2001.nc|application/netcdf|HTTPServer",
+        ),
+        raw={},
+    )
+    cand = simulation_candidates(("A", "ssp245", "r1"), [http_only], group="A")
+    assert cand.hosts == ("nci",)
+    # https twin ranked ahead of its http original; the second file is dropped.
+    assert cand.urls_by_host["nci"] == (
+        "https://nci/tas_2000.nc",
+        "http://nci/tas_2000.nc",
+    )
 
 
 def test_simulation_candidates_empty_when_no_httpserver_mirror():

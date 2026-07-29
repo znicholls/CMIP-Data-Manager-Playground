@@ -1,6 +1,13 @@
 """
 Single-model walk-through of use case 1 (monthly `tas`, experiment `ssp245`).
 
+> **Note on scope.**  uc1 is a *simple, no-parent* use case, and a simple use case
+> **stops at Step 1** (the index search is the deliverable — there is no parent lineage
+> to read a header for).  This script deliberately runs Steps 2-3 as well: it is a
+> **machinery demo** of the file + header pipeline (the pipeline the parent-walk use
+> cases uc2/g6solar rely on), kept here so you can watch one simulation flow through
+> the file search and one header read.  It is not the shape of a real simple run.
+
 Configured tiny by default (`SINGLE_MODEL` + `ONE_VARIANT_PER_MODEL`) so you can
 watch **one** simulation flow through the three node-independent steps and inspect
 exactly what each writes.  It runs the live index search, stores the version's
@@ -17,7 +24,7 @@ The three steps, the function each calls, and the tables each writes:
 - **Step 3 — Header.**  `search.enrich_version_headers` reads one header from the
   stored `FileAccess` URLs and `Repository.promote_header` stores it on
   `File.header_attrs_json`, promotes the `parent_*` subset onto `DatasetVersion`
-  (with `header_from_file_key`), and logs `HeaderReadAttempt` + `NodeHealthStat`.
+  (with `header_from_file_key`), and logs `HeaderReadAttempt` + `DataNodeHealthStat`.
 
 Everything lands in `DB_PATH` (a fresh `uc1_walkthrough.sqlite` by default).  To see
 what each step wrote, open it between runs — the tables above are all queryable:
@@ -52,7 +59,7 @@ from cmip_data_manager import (
     build_file_search_clients,
     open_repository,
 )
-from cmip_data_manager.config import DEFAULT_INDEX_ENDPOINTS
+from cmip_data_manager.config import CEDA_BASE_URL, DEFAULT_INDEX_ENDPOINTS
 from cmip_data_manager.esgf.concurrency import exponential_backoff, thread_pool_map
 from cmip_data_manager.esgf.query import FacetQuery
 from cmip_data_manager.search import (
@@ -154,8 +161,10 @@ READ_TIMEOUT_FALLBACK = 90.0
 """Stall timeout used on a cold DB with no learned health yet.  Once health exists,
 the run sizes the timeout from the slowest healthy read observed (see `main`)."""
 
-SETTINGS = Settings()
-"""Endpoint/paging settings for the live file lookups."""
+SETTINGS = Settings(base_url=CEDA_BASE_URL)
+"""Endpoint/paging settings.  `base_url` drives the Step-1 index search only (Step 2's
+file search uses `FILE_SEARCH_ENDPOINTS`).  Pointed at CEDA today because metagrid-west
+is under maintenance; restore to `Settings()` (metagrid-west) when the proxy is back."""
 # -----------------------------------------------------------------------------
 
 

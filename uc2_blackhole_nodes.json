@@ -1,0 +1,111 @@
+{
+  "source_db": "uc2_gregory.sqlite",
+  "generated_at": "2026-07-28T01:55:49.691065+00:00",
+  "note": "Data nodes that failed for this query (0 successes). Without Changes A (collapse each node to one representative file) and B (connect probe, 90s connect / 25s read), these would have been walked across every file x variable x scheme -- the death spiral. urls_available is the HTTPServer URLs the node held for the simulations it was tried on; urls_walked_avoided approximates that x2 (https twins) minus attempts made.",
+  "totals": {
+    "dead_nodes": 9,
+    "attempts_actually_made": 43,
+    "urls_walked_avoided": 6637
+  },
+  "nodes": [
+    {
+      "host": "esgf.bsc.es",
+      "verdict": "collapse_saved",
+      "classification": "fast-error",
+      "reason_sample": "[Errno -67] NetCDF: libcurl failure: 'https://esgf.bsc.es/thredds/fileServer/esg_dataroot/aemet_4xco2-CMIP-r32/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/abrupt-4xCO2/r3i1p1f1/Amon/rlut/gr/v20210523/rlut_Amon_EC-Earth3_abrupt-4xCO2_r3i1p1f1_gr_185001-185012.nc#bytes'",
+      "attempts_made": 12,
+      "urls_available": 1300,
+      "urls_walked_avoided": 2588,
+      "simulations_affected": 2,
+      "retryable_kept": true
+    },
+    {
+      "host": "esg-dn1.nsc.liu.se",
+      "verdict": "stall_short_circuited",
+      "classification": "read-stall",
+      "reason_sample": "Reading 'https://esg-dn1.nsc.liu.se/thredds/fileServer/esg_dataroot6/cmip6data/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3-Veg/abrupt-4xCO2/r1i1p1f1/Amon/rlut/gr/v20200225/rlut_Amon_EC-Earth3-Veg_abrupt-4xCO2_r1i1p1f1_gr_185001-185012.nc' exceeded its 25s deadline; treating the data node as stalled.",
+      "attempts_made": 2,
+      "urls_available": 1208,
+      "urls_walked_avoided": 2414,
+      "simulations_affected": 2,
+      "retryable_kept": false
+    },
+    {
+      "host": "esgf-cnr.hpc.ext.cineca.it",
+      "verdict": "probe_short_circuited",
+      "classification": "black-hole-connect",
+      "reason_sample": "Data node for 'https://esgf-cnr.hpc.ext.cineca.it/thredds/fileServer/cmip6/c4co/CMIP6/CMIP/EC-Earth-Consortium/EC-Earth3/abrupt-4xCO2/r8i1p1f1/Amon/rlut/gr/v20200501/rlut_Amon_EC-Earth3_abrupt-4xCO2_r8i1p1f1_gr_185001-185012.nc' has a connection-level fault: connect timed out after 90.0s",
+      "attempts_made": 1,
+      "urls_available": 660,
+      "urls_walked_avoided": 1319,
+      "simulations_affected": 1,
+      "retryable_kept": false
+    },
+    {
+      "host": "esg-cccr.tropmet.res.in",
+      "verdict": "collapse_saved",
+      "classification": "fast-error",
+      "reason_sample": "[Errno -67] NetCDF: libcurl failure: 'https://esg-cccr.tropmet.res.in/thredds/fileServer/esg_dataroot2/abruptCO2/CMIP6/CMIP/CCCR-IITM/IITM-ESM/abrupt-4xCO2/r1i1p1f1/Amon/rlut/gn/v20191223/rlut_Amon_IITM-ESM_abrupt-4xCO2_r1i1p1f1_gn_185001-185912.nc#bytes'",
+      "attempts_made": 6,
+      "urls_available": 68,
+      "urls_walked_avoided": 130,
+      "simulations_affected": 1,
+      "retryable_kept": true
+    },
+    {
+      "host": "vesg.ipsl.upmc.fr",
+      "verdict": "stall_short_circuited",
+      "classification": "read-stall",
+      "reason_sample": "Reading 'https://vesg.ipsl.upmc.fr/thredds/fileServer/cmip6/CMIP/IPSL/IPSL-CM5A2-INCA/abrupt-4xCO2/r1i1p1f1/Amon/rlut/gr/v20201218/rlut_Amon_IPSL-CM5A2-INCA_abrupt-4xCO2_r1i1p1f1_gr_185001-199912.nc' exceeded its 25s deadline; treating the data node as stalled.",
+      "attempts_made": 4,
+      "urls_available": 56,
+      "urls_walked_avoided": 108,
+      "simulations_affected": 4,
+      "retryable_kept": false
+    },
+    {
+      "host": "esgf.rcec.sinica.edu.tw",
+      "verdict": "collapse_saved",
+      "classification": "fast-error",
+      "reason_sample": "[Errno -74] NetCDF: Malformed URL: 'https://esgf.rcec.sinica.edu.tw/thredds/fileServer/my_cmip6_dataroot/CFMIP/AS-RCEC/TaiESM1/abrupt-2xCO2/r1i1p1f1/Amon/rlut/gn/v20210913/rlut_Amon_TaiESM1_abrupt-2xCO2_r1i1p1f1_gn_000101-012012.nc#bytes'",
+      "attempts_made": 12,
+      "urls_available": 24,
+      "urls_walked_avoided": 36,
+      "simulations_affected": 2,
+      "retryable_kept": true
+    },
+    {
+      "host": "cmip.fio.org.cn",
+      "verdict": "probe_short_circuited",
+      "classification": "black-hole-connect",
+      "reason_sample": "Data node for 'https://cmip.fio.org.cn/thredds/fileServer/esg_dataroot/cmip6/CMIP6/CMIP/FIO-QLNM/FIO-ESM-2-0/abrupt-4xCO2/r1i1p1f1/Amon/rlut/gn/v20200302/rlut_Amon_FIO-ESM-2-0_abrupt-4xCO2_r1i1p1f1_gn_000101-015012.nc' has a connection-level fault: connect timed out after 90.0s",
+      "attempts_made": 2,
+      "urls_available": 8,
+      "urls_walked_avoided": 14,
+      "simulations_affected": 2,
+      "retryable_kept": false
+    },
+    {
+      "host": "esg.camscma.cn",
+      "verdict": "probe_short_circuited",
+      "classification": "ssl",
+      "reason_sample": "Data node for 'https://esg.camscma.cn/thredds/fileServer/cmip6/CMIP6/CMIP/CAMS/CAMS-CSM1-0/abrupt-4xCO2/r1i1p1f1/Amon/rlut/gn/v20190708/rlut_Amon_CAMS-CSM1-0_abrupt-4xCO2_r1i1p1f1_gn_303001-317912.nc' has a connection-level fault: connect error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1006)",
+      "attempts_made": 2,
+      "urls_available": 8,
+      "urls_walked_avoided": 14,
+      "simulations_affected": 2,
+      "retryable_kept": false
+    },
+    {
+      "host": "esg1.umr-cnrm.fr",
+      "verdict": "probe_short_circuited",
+      "classification": "black-hole-connect",
+      "reason_sample": "Data node for 'https://esg1.umr-cnrm.fr/thredds/fileServer/CMIP6_CNRM/CFMIP/CNRM-CERFACS/CNRM-CM6-1/abrupt-0p5xCO2/r1i1p1f2/Amon/rlut/gr/v20190711/rlut_Amon_CNRM-CM6-1_abrupt-0p5xCO2_r1i1p1f2_gr_185001-199912.nc' has a connection-level fault: connect timed out after 90.0s",
+      "attempts_made": 2,
+      "urls_available": 8,
+      "urls_walked_avoided": 14,
+      "simulations_affected": 2,
+      "retryable_kept": false
+    }
+  ]
+}

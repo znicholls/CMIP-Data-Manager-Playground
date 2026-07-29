@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+import pytest
+
 from cmip_data_manager.esgf.dispatch import (
     DispatchResult,
     _Scheduler,
     concurrency_limit,
     dispatch_reads,
 )
-from cmip_data_manager.esgf.headers import HeaderMetadata, HeaderReadBlocked
+from cmip_data_manager.esgf.headers import (
+    HeaderMetadata,
+    HeaderReadBlocked,
+    HeaderReadHostFault,
+    HeaderReadTimeout,
+)
 from cmip_data_manager.esgf.routing import SimulationCandidates
 
 
@@ -278,6 +285,126 @@ def test_dispatch_reads_fails_an_unservable_simulation():
     result = dispatch_reads({s1: _cand(s1, "A", {})}, _reader())
     assert result.headers == {}
     assert result.failed == [s1]
+
+
+def _kill_reader(kill_host):
+    """A reader that raises `KeyboardInterrupt` (a kill) when it hits `kill_host`."""
+
+    def reader(url: str) -> HeaderMetadata:
+        host = urlparse(url).hostname or ""
+        if host == kill_host:
+            raise KeyboardInterrupt("simulated kill")
+        return HeaderMetadata(attrs={"served_by": host}, source_url=url)
+
+    return reader
+
+
+def test_dispatch_reads_invokes_callbacks_per_read():
+    s1, s2 = ("A", "ssp245", "r1"), ("B", "ssp245", "r1")
+    cands = {s1: _cand(s1, "A", _hosts("nci")), s2: _cand(s2, "B", _hosts("nci"))}
+    seen: list[tuple[tuple[str, str, str], str | None]] = []
+    flushes: list[int] = []
+
+    dispatch_reads(
+        cands,
+        _reader(),
+        on_success=lambda sim, md: seen.append((sim, md.get("served_by"))),
+        on_flush=lambda: flushes.append(1),
+    )
+
+    assert sorted(sim for sim, _ in seen) == [s1, s2]  # one callback per success
+    assert all(host == "nci" for _, host in seen)
+    assert flushes  # the per-iteration flush ran at least once
+
+
+def test_dispatch_reads_reports_successes_before_a_kill():
+    # Three sims, processed in order under a single worker; the third host kills the
+    # run. The first two headers must already have been handed to on_success.
+    sims = [("A", "ssp245", "r1"), ("B", "ssp245", "r1"), ("C", "ssp245", "r1")]
+    cands = {
+        sims[0]: _cand(sims[0], "A", _hosts("nci")),
+        sims[1]: _cand(sims[1], "B", _hosts("ornl")),
+        sims[2]: _cand(sims[2], "C", _hosts("boom")),
+    }
+    persisted: list[tuple[str, str, str]] = []
+
+    with pytest.raises(KeyboardInterrupt):
+        dispatch_reads(
+            cands,
+            _kill_reader("boom"),
+            max_workers=1,  # deterministic order: A, then B, then the killer C
+            on_success=lambda sim, _md: persisted.append(sim),
+        )
+
+    assert sims[0] in persisted and sims[1] in persisted
+    assert sims[2] not in persisted  # the kill fired before its header arrived
+
+
+def test_dispatch_stops_a_hosts_urls_after_a_stall():
+    # A host that STALLS (a timeout) is hanging on every read, so trying its other
+    # URLs just burns another full 25s deadline each — the tail that held uc2 open for
+    # ~15 min (4 variables x 2 schemes = up to 8 URLs per host, all stalling). One
+    # stall must short-circuit the host, not walk all of its URLs.
+    s1 = ("A", "ssp245", "r1")
+    cand = SimulationCandidates(
+        simulation=s1,
+        group="A",
+        hosts=("nci",),
+        urls_by_host={"nci": tuple(f"https://nci/{i}.nc" for i in range(4))},
+    )
+    calls: list[str] = []
+
+    def reader(url: str) -> HeaderMetadata:
+        calls.append(url)
+        raise HeaderReadTimeout(url, 25.0)
+
+    result = dispatch_reads({s1: cand}, reader)
+
+    assert s1 in result.failed
+    assert len(calls) == 1  # short-circuited on the first stall, not 4 x 25s
+
+
+def test_dispatch_stops_a_hosts_urls_on_a_host_fault():
+    # A host fault (SSL/cert, DNS, connect-timeout) means the node is unreachable, so —
+    # like a stall — trying its other URLs is wasted; short-circuit to the next mirror.
+    s1 = ("A", "ssp245", "r1")
+    cand = SimulationCandidates(
+        simulation=s1,
+        group="A",
+        hosts=("bad-cert",),
+        urls_by_host={"bad-cert": tuple(f"https://bad-cert/{i}.nc" for i in range(4))},
+    )
+    calls: list[str] = []
+
+    def reader(url: str) -> HeaderMetadata:
+        calls.append(url)
+        raise HeaderReadHostFault(url, "SSL certificate problem")
+
+    result = dispatch_reads({s1: cand}, reader)
+
+    assert s1 in result.failed
+    assert len(calls) == 1  # host-fault short-circuits the node, not all 4 URLs
+
+
+def test_dispatch_still_tries_a_hosts_other_urls_after_a_plain_failure():
+    # A plain failure (e.g. connection refused on the http URL) must still fall through
+    # to the host's next URL (its https twin) — only a stall short-circuits the host.
+    s1 = ("A", "ssp245", "r1")
+    cand = SimulationCandidates(
+        simulation=s1,
+        group="A",
+        hosts=("nci",),
+        urls_by_host={"nci": ("https://nci/bad.nc", "https://nci/good.nc")},
+    )
+
+    def reader(url: str) -> HeaderMetadata:
+        if url.endswith("bad.nc"):
+            raise OSError("connection refused")
+        return HeaderMetadata(attrs={"ok": "1"}, source_url=url)
+
+    result = dispatch_reads({s1: cand}, reader)
+
+    assert result.headers[s1].get("ok") == "1"  # read the 2nd URL after the 1st refused
 
 
 def test_dispatch_reads_backs_off_and_requeues_on_block():

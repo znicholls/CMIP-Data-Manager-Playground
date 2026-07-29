@@ -34,7 +34,7 @@ network/read machinery and **down** to `Repository` for persistence. Nothing but
 ```mermaid
 flowchart TB
     %% ---------- entry ----------
-    subgraph ENTRY["scripts/ — per-use-case wiring (UC-simple: Steps 1-3; UC-chain: 1-4)"]
+    subgraph ENTRY["scripts/ — per-use-case wiring (UC-simple: Step 1 only; UC-chain: 1-4)"]
         SCRIPT["enrich_uc1_headers · enrich_uc2_headers<br/>enrich_g6solar_headers · esgf_search"]
         FAC["factory.build_client(Settings)<br/>config.Settings: base_url · project · page_size · timeout"]
         SCRIPT --> FAC
@@ -58,25 +58,29 @@ flowchart TB
     end
 
     %% ================= STEP 2 =================
-    subgraph ST2["Step 2 — add files (SEARCH API)"]
+    subgraph ST2["Step 2 — add files (SEARCH API, preference-ordered endpoints)"]
         F0{"Repository.version_has_files?<br/>(cache gate)"}
-        F1["files.add_files<br/>ONE search_files per version (no OR-batch)"]
-        C2["client.search_files"]
-        SF["Repository.store_files<br/>File (node-indep) + FileAccess (per-node, https twin)"]
+        F1["files.add_files<br/>ONE search_files per version; n_workers<br/>backoff(5) -> requeue -> next endpoint; worker never raises"]
+        C2["client.search_files<br/>per endpoint: CEDA -> ORNL -> metagrid-west"]
+        SF["Repository.store_files (save-as-you-go, lock-serialised)<br/>File (node-indep) + FileAccess (per-node, https twin)"]
+        IH["Repository.save_index_health · record_file_access_attempts<br/>IndexNodeHealthStat aggregate + FileAccessAttempt per search call"]
+        FX["all endpoints+requeues exhausted -><br/>FileSearchIncompleteError (after successes persisted)"]
         F0 -- "no" --> F1 -->|"FileRecord[]"| C2 --> SF
+        F1 --> IH
+        F1 -- "unresolved" --> FX
         F0 -- "yes" --> SKIP2["skip"]
     end
 
     %% ================= STEP 3 =================
     subgraph ST3["Step 3 — header-only metadata (DATA NODE byte-range)"]
-        H0{"Repository.version_has_header?<br/>(sibling-reuse gate)"}
+        H0{"Repository.simulation_header?<br/>(sim-grain reuse gate: any variable / earlier run)"}
         H1["version_headers.enrich_version_headers<br/>_plan_headers: one file per simulation"]
         DISP["dispatch.dispatch_reads<br/>(see Diagram 2)"]
         PH["Repository.promote_header<br/>header_attrs_json on File; parent_* onto DatasetVersion"]
         NH["Repository.load_node_health / save_node_health<br/>record_header_attempts"]
         H0 -- "no" --> H1 --> DISP --> PH
         DISP --> NH
-        H0 -- "yes" --> REUSE["_reuse_sibling: copy promoted metadata"]
+        H0 -- "yes" --> REUSE["copy stored header onto new versions<br/>(_reuse_sibling / _reuse_simulation; no read)"]
     end
 
     %% ================= STEP 4 =================
@@ -92,10 +96,10 @@ flowchart TB
     MAP -->|"map over parents"| W1
     HR --> DISP
 
-    RR --> VSEL["search.versions.select_target_versions<br/>narrow to target version per dataset (default: latest by version DATE)"]
+    RR -->|"UC-simple: DONE (Step 1 only — no files/header)"| DONE["Dataset + versions (catalog)"]
+    RR -->|"UC-chain: files/header serve lineage"| VSEL["search.versions.select_target_versions<br/>narrow to target version per dataset (default: latest by version DATE)"]
     VSEL --> ST2
     SF --> ST3
-    PH -->|"UC-simple: DONE"| DONE["Dataset + versions + files + header metadata"]
     PH -->|"UC-chain"| ST4
     NH -.-> ST4
     W1 -->|"re-enter for each intermediate parent"| ST2
@@ -108,11 +112,12 @@ flowchart TB
         T1[("SearchRun · RunMembership · DatasetChange")]
         T2[("Dataset · DatasetVersion · DatasetNodeSpecificInfo")]
         T3[("File · FileAccess")]
-        T4[("NodeHealthStat · HeaderReadAttempt")]
+        T4[("DataNodeHealthStat · HeaderReadAttempt<br/>IndexNodeHealthStat · FileAccessAttempt")]
     end
     RR --> T1
     RR --> T2
     SF --> T3
+    IH --> T4
     PH --> T3
     PH --> T2
     W1 --> T2
@@ -120,8 +125,10 @@ flowchart TB
 ```
 
 **Reading it:** every step is the same shape — *cache gate → esgf call (through a
-seam) → `Repository` write → table*. The only step that talks to **data nodes**
-(not the search index) is Step 3, which is why node health lives there alone.
+seam) → `Repository` write → table*. Health is recorded wherever we hit a flaky
+server: **data-node** health in Step 3 (`DataNodeHealthStat`, header reads — the only step
+that talks to data nodes) and **index-node** health in Step 2 (`IndexNodeHealthStat`,
+the file searches, with its own backoff → requeue → endpoint fallback).
 
 ---
 
@@ -161,7 +168,7 @@ flowchart TB
 
     subgraph LEARN["health + audit (persisted)"]
         REC["NodeHealth.recording(host, ok?, latency)"]
-        STAT[("NodeHealthStat — per-host aggregates")]
+        STAT[("DataNodeHealthStat — per-host aggregates")]
         ATT[("HeaderReadAttempt — append-only per-attempt log")]
         REC --> STAT
     end
@@ -205,15 +212,15 @@ flowchart TB
 
     DECL["declared_parent(DatasetVersion.parent_*)<br/>apply parent_overrides if present<br/>source_id assumed same; institution_id NOT"]
     DEDUP["dedupe: many children -> one parent<br/>(DB + visited set: search each parent once)"]
-    FIND["find_parent_datasets<br/>ONE search per parent via MapFn (broad: any variable)"]
+    FIND["find_parent_datasets<br/>ONE search per parent via MapFn (VARIABLE-SCOPED: OR over requested vars)"]
     OUT{"search outcome"}
     PNF["ParentNotFound (terminal)<br/>declared (S,E,V) but zero index results"]
 
-    LINK["Repository.set_parent_version<br/>child.parent_version_key -> parent version<br/>institution_id read from PARENT's own result"]
+    LINK["Repository.set_parent_version<br/>child.parent_version_key -> parent version (same variable)<br/>parent lacks the requested variable -> VariableGap (informational)"]
     STOP{"parent.experiment_id == stopping_experiment?"}
-    ENDCHAIN["end-of-chain parent: Step 2 (files) only<br/>NO header, NO further hop"]
+    ENDCHAIN["end-of-chain parent: Step 1 only (stored by the search)<br/>NO files (only header substrate), NO header, NO further hop"]
 
-    NEEDHDR["need its parent -> Step 2 (add_files) + Step 3 (enrich_version_headers)<br/>to read THIS parent's header"]
+    NEEDHDR["header cache miss -> collapse to ONE representative dataset per parent sim<br/>Step 2 (add_files, that one file) + Step 3 to read THIS parent's header;<br/>cache hit (any variable/earlier run) -> copy, skip files+read"]
     TOP{"header declares 'no parent' sentinel?"}
     NOTANC["ParentNotAncestor (terminal)<br/>hit top without the specified parent"]
     HOPGUARD{"hops < _MAX_PARENT_HOPS (5)?"}
@@ -238,15 +245,31 @@ flowchart TB
     PNF --> COLLECT
     NOTANC --> COLLECT
     COLLECT --> FINAL{"any terminal was an error?"}
-    FINAL -- "no" --> OKDONE["ParentWalkResult: links + terminals + hops"]
+    FINAL -- "no" --> OKDONE["ParentWalkResult: links + terminals + hops + variable_gaps"]
     FINAL -- "yes" --> AGGERR["raise ParentResolutionError<br/>(lists EVERY broken chain, after all attempted)"]
 ```
 
-This is exactly where the open **`parent_walk.py:27` question** bites: `FIND`
-currently searches `(source_id, experiment_id, variant_label)` broadly across *any*
-variable. The **Gregory / uc2** case pulls multiple variables, so we need to decide
-whether the parent search should carry `variable_id` / `table_id` scope — worth
-settling before that live test.
+The **`parent_walk.py` variable question** is now settled as **fully variable-scoped**
+(this reverses an earlier "variable-agnostic existence" design; the trade-off was taken
+deliberately):
+
+- **Existence / lineage** (`FIND`) is **variable-scoped**: it searches
+  `(source_id, experiment_id, variant_label)` constrained to the requested variables (an
+  OR). *Consequence:* a parent that publishes **none** of them comes back empty and so
+  is a `ParentNotFound` — the walk cannot tell that apart from a parent that does not
+  exist at all. (With a multi-variable request the OR is forgiving: the parent resolves
+  as long as it publishes *at least one* requested variable.)
+- **Files / header** (`NEEDHDR`) is **collapsed** to a single representative dataset per
+  parent simulation (`_read_representative`) — a header describes the *run*, so any one
+  file carries the same `parent_*` attributes and is enough to climb. This gate is what
+  avoids the >50k file-access blow-up, and it is skipped entirely when the simulation's
+  header is already stored (any variable, including an earlier run — `simulation_header`).
+
+Each requested variable's child→parent version link is still made when the parent
+publishes it; a requested variable the parent does *not* publish (while publishing
+others) is reported as a `VariableGap` (the lineage resolved, that one variable's
+lineage just has a hole at that ancestor) rather than failing the walk. The
+**Gregory / uc2** multi-variable case therefore needs no special casing.
 
 ---
 
@@ -304,6 +327,6 @@ observability" section of `search-workflow.md`).
 
 
 1. End-to-end call graph (all 4 steps) — every step shown as the same shape: cache gate → esgf call through a seam → Repository write → table, with the concrete function names (runner.fetch_records, client.search_many, files.add_files, store_files, enrich_version_headers, promote_header, resolve_parent_chains, etc.) and which of the 4 table groups each write hits.
-2. Step-3 read dispatcher internals — the real parallelism: routing/affinity/health ordering → the two-level throttle (DEFAULT_MAX_WORKERS=12 shared budget vs per-host concurrency_limit AIMD) → per-read subprocess timeout + block/transient classification + retry → persisted NodeHealthStat / HeaderReadAttempt.
+2. Step-3 read dispatcher internals — the real parallelism: routing/affinity/health ordering → the two-level throttle (DEFAULT_MAX_WORKERS=12 shared budget vs per-host concurrency_limit AIMD) → per-read subprocess timeout + block/transient classification + retry → persisted DataNodeHealthStat / HeaderReadAttempt.
 3. Step-4 parent-walk loop at function level — resolve_parent_chains → declared_parent → existence gate → find_parent_datasets (one search per parent) → set_parent_version, re-using Steps 2/3 each hop, with all three terminals and the aggregated error.
 4. Dependency-injection seam map — how Settings/factory build the client and how the four seams (Fetch, MapFn, HeaderReader, Repository) are handed to each step, making "how parallel" a one-argument choice.

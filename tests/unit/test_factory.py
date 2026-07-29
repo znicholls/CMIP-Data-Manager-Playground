@@ -20,7 +20,6 @@ def test_build_client_uses_settings():
 def test_build_file_search_clients_defaults_to_preference_order():
     clients = build_file_search_clients()
     assert [c.base_url for c in clients] == list(DEFAULT_INDEX_ENDPOINTS)
-    assert len(clients) == 2  # metagrid-west, then CEDA
 
 
 def test_build_file_search_clients_honours_a_custom_endpoint_list():

@@ -29,6 +29,10 @@ Two properties matter:
 
 Index-node health (attempts, successes, failures, retries, 5xx, timeouts, latency) is
 recorded per endpoint into `IndexNodeHealth` and persisted to `IndexNodeHealthStat`.
+Alongside those aggregates, **every individual search call** — each backoff retry,
+requeue and endpoint fallback — is logged as a `FileAccessAttempt` row (endpoint,
+version, outcome, latency), so a version's whole search history can be reconstructed;
+an `empty` outcome (HTTP 200 with zero files) is recorded distinctly from a `success`.
 Endpoint *ordering* stays the caller's explicit preference; health is recorded for
 observability, not to reorder the preference.
 """
@@ -44,7 +48,7 @@ from threading import Lock
 
 import httpx
 
-from cmip_data_manager.db.repository import Repository
+from cmip_data_manager.db.repository import FileSearchAttempt, Repository
 from cmip_data_manager.esgf.client import (
     DeepPaginationError,
     ESGFResponseError,
@@ -159,8 +163,9 @@ def add_files(  # noqa: PLR0913 - a DI seam; every parameter has a default
         version, each searched by its own node-specific dataset ids).
 
     clients
-        Search clients in **preference order** (e.g. metagrid-west, then CEDA), one
-        per endpoint.  Build them with `no_retry` — retry is owned here so it can be
+        Search clients in **preference order** (e.g. CEDA, then ORNL, then
+        metagrid-west), one per endpoint.  Build them with `no_retry` — retry is owned
+        here so it can be
         counted and drive the fallback.  A version is tried on the next endpoint only
         after the current one's retries and requeues are exhausted.
 
@@ -319,30 +324,47 @@ def _worker(  # noqa: PLR0913 - a bound closure builder; all args are internal
 
     def run(item: _Todo) -> _Outcome:
         version_key, dataset_ids = item
+        attempts: list[FileSearchAttempt] = []
         try:
             files, status = _search_with_backoff(
                 client,
                 endpoint,
+                version_key,
                 FacetQuery(type="File", dataset_id=dataset_ids),
                 health,
+                attempts,
                 retries=retries,
                 base=base,
                 cap=cap,
                 jitter=jitter,
                 sleep=sleep,
             )
-            if status != _OK:
-                return _Outcome(version_key, status)
-            # Serialise the write (SQLite is single-writer) and persist immediately,
-            # flushing health alongside so a crash keeps this dataset's progress.
-            with write_lock:
-                stored = repository.store_files({version_key: files})
-                repository.save_index_health(health)
-            return _Outcome(version_key, _OK, stored)
-        except Exception:
+        except Exception as exc:
             # A worker must never abort the whole pass: any unexpected error becomes
             # a recorded failure that requeues / falls back like an ordinary one.
+            attempts.append(
+                FileSearchAttempt(
+                    endpoint=endpoint,
+                    version_key=version_key,
+                    outcome=SearchOutcome.ERROR.value,
+                    detail=str(exc),
+                    attempt_no=len(attempts) + 1,
+                )
+            )
+            with write_lock:
+                repository.record_file_access_attempts(attempts)
             return _Outcome(version_key, _FAILED)
+
+        # Serialise the write (SQLite is single-writer) and persist immediately,
+        # flushing health and the attempt log alongside so a crash keeps this
+        # dataset's progress and every search call it made.
+        stored = 0
+        with write_lock:
+            if status == _OK:
+                stored = repository.store_files({version_key: files})
+                repository.save_index_health(health)
+            repository.record_file_access_attempts(attempts)
+        return _Outcome(version_key, status, stored)
 
     return run
 
@@ -350,8 +372,10 @@ def _worker(  # noqa: PLR0913 - a bound closure builder; all args are internal
 def _search_with_backoff(  # noqa: PLR0913 - bound internal helper
     client: ESGFSearchClient,
     endpoint: str,
+    version_key: str,
     query: FacetQuery,
     health: IndexNodeHealth,
+    attempts: list[FileSearchAttempt],
     *,
     retries: int,
     base: float,
@@ -364,30 +388,54 @@ def _search_with_backoff(  # noqa: PLR0913 - bound internal helper
     Returns `(files, "ok")` on success, `([], "overflow")` if the single-version
     result exceeds the retrieval cap (retrying/falling back cannot help), or
     `([], "failed")` once the retries are exhausted.  Every call is recorded to
-    `health` against `endpoint` (including retries and 5xx/timeout classification).
+    `health` against `endpoint` (including retries and 5xx/timeout classification) and
+    appended to `attempts` as a `FileSearchAttempt` (an `empty` outcome, HTTP 200 with
+    zero files, is recorded distinctly from a `success` with files).
     """
     for attempt in range(retries + 1):
         started = time.perf_counter()
         try:
             files = client.search_files(query)
         except DeepPaginationError:
+            attempts.append(
+                FileSearchAttempt(
+                    endpoint=endpoint,
+                    version_key=version_key,
+                    outcome=_OVERFLOW,
+                    seconds=time.perf_counter() - started,
+                    attempt_no=attempt + 1,
+                )
+            )
             return [], _OVERFLOW  # a query-shape problem, not an endpoint fault
         except (httpx.HTTPError, ESGFResponseError) as exc:
-            health.record(
-                endpoint,
-                classify_search_error(exc),
-                time.perf_counter() - started,
-                retry=attempt > 0,
+            outcome = classify_search_error(exc)
+            elapsed = time.perf_counter() - started
+            health.record(endpoint, outcome, elapsed, retry=attempt > 0)
+            attempts.append(
+                FileSearchAttempt(
+                    endpoint=endpoint,
+                    version_key=version_key,
+                    outcome=outcome.value,
+                    detail=str(exc),
+                    seconds=elapsed,
+                    attempt_no=attempt + 1,
+                )
             )
             if attempt >= retries:
                 return [], _FAILED
             sleep(_backoff_delay(attempt, base, cap, jitter))
         else:
-            health.record(
-                endpoint,
-                SearchOutcome.SUCCESS,
-                time.perf_counter() - started,
-                retry=attempt > 0,
+            elapsed = time.perf_counter() - started
+            health.record(endpoint, SearchOutcome.SUCCESS, elapsed, retry=attempt > 0)
+            attempts.append(
+                FileSearchAttempt(
+                    endpoint=endpoint,
+                    version_key=version_key,
+                    outcome="success" if files else "empty",
+                    files_found=len(files),
+                    seconds=elapsed,
+                    attempt_no=attempt + 1,
+                )
             )
             return files, _OK
     return [], _FAILED  # unreachable, but keeps the return type total

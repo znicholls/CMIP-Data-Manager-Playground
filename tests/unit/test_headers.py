@@ -2,27 +2,35 @@
 
 from __future__ import annotations
 
+import multiprocessing as real_multiprocessing
 import os
+import threading
 import time
 
 import numpy as np
 import pytest
 
+from cmip_data_manager.esgf import headers
 from cmip_data_manager.esgf.headers import (
     HeaderReadBlocked,
     HeaderReadCrashed,
+    HeaderReadHostFault,
     HeaderReadTimeout,
     _coerce_attr,
+    _probe_host_fault,
     candidate_urls_for_files,
     header_key,
     http_download_url,
     http_download_urls,
     https_twin,
     is_block_signal,
+    is_host_fault,
     order_candidates,
     promote_blocks,
+    promote_host_faults,
     read_first_readable,
     simulation_key,
+    with_connect_probe,
     with_retry,
     with_timeout,
 )
@@ -234,6 +242,86 @@ def test_with_timeout_raises_crashed_when_worker_dies():
         read("https://corrupt/f.nc")
 
 
+class _UnreapableProcess:
+    """A spawned child that never dies: SIGTERM/SIGKILL do nothing and `join()` blocks.
+
+    Models a real netCDF/libcurl read wedged in an uninterruptible kernel network state
+    (a black-holed data node) that does not reap promptly even on SIGKILL — the exact
+    condition `time.sleep` children never hit, which is why synthetic spawn/kill stress
+    tests could not reproduce the live deadlock.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.exitcode: int | None = None
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True  # never reaps
+
+    def terminate(self) -> None:
+        pass  # SIGTERM ignored
+
+    def kill(self) -> None:
+        pass  # even SIGKILL does not take (D-state child)
+
+    def join(self, timeout: float | None = None) -> None:
+        if timeout is None:  # the final, UNBOUNDED join in _terminate — the defect
+            time.sleep(3600)
+
+
+class _WedgingContext:
+    """A spawn context with real pipes but processes that never reap."""
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+
+    def Pipe(self, duplex: bool = True) -> object:
+        return self._real.Pipe(duplex=duplex)
+
+    def Process(self, *args: object, **kwargs: object) -> _UnreapableProcess:
+        return _UnreapableProcess(*args, **kwargs)
+
+
+class _WedgingMp:
+    """Stand-in for the `multiprocessing` module whose children never reap."""
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+
+    def get_context(self, method: str) -> _WedgingContext:
+        return _WedgingContext(self._real.get_context(method))
+
+
+def test_with_timeout_does_not_hang_on_an_unreapable_child(monkeypatch):
+    """A child that cannot be reaped must not wedge the calling thread.
+
+    Reproduces the deadlock's root cause: `_terminate`'s final `proc.join()` has no
+    timeout, so a child stuck in the kernel blocks the worker thread forever.  On a
+    thread pool (as in `dispatch_reads`) every worker blocks here at once and the whole
+    header step deadlocks — which is what the live uc2 run hit.  This test currently
+    FAILS (hangs) and passes once the final join is bounded.
+    """
+    monkeypatch.setattr(headers, "mp", _WedgingMp(real_multiprocessing))
+
+    read = with_timeout(_echo_reader, seconds=0.1, grace=0.05)
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            read("https://black-hole/f.nc")
+        except OSError:
+            pass  # expected: HeaderReadTimeout / HeaderReadCrashed
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert finished.wait(timeout=5.0), (
+        "with_timeout hung on an un-reapable child — the deadlock root cause "
+        "(the final proc.join() in _terminate has no timeout)"
+    )
+
+
 def test_with_timeout_timeout_is_an_oserror_so_fallback_skips_it():
     # read_first_readable catches OSError; a stall must be caught the same way.
     slow = with_timeout(_slow_reader, seconds=0.3, grace=0.5)
@@ -352,6 +440,147 @@ def test_with_retry_does_not_retry_a_crash():
     with pytest.raises(HeaderReadCrashed):
         read("https://corrupt/f.nc")
     assert calls["n"] == 1
+
+
+def test_with_retry_does_not_retry_a_host_fault():
+    calls = {"n": 0}
+
+    def faulter(url: str) -> str:
+        calls["n"] += 1
+        raise HeaderReadHostFault(url, "SSL certificate problem")
+
+    read = with_retry(faulter, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(HeaderReadHostFault):
+        read("https://bad-cert/f.nc")
+    assert calls["n"] == 1  # a node-level fault is given up on immediately
+
+
+def test_with_retry_still_retries_connection_refused():
+    # The requirement: a plain connection refused KEEPS its retries (it can be a
+    # momentary overload) — only unmistakable host faults are given up on.
+    calls = {"n": 0}
+
+    def refused(url: str) -> str:
+        calls["n"] += 1
+        raise OSError("Failed to connect: Connection refused")
+
+    read = with_retry(refused, max_attempts=3, base=0.0, jitter=0.0)
+    with pytest.raises(OSError):
+        read("https://refusing/f.nc")
+    assert calls["n"] == 3  # refused is retried the full 3x — good-node retries kept
+
+
+def test_is_host_fault_flags_ssl_dns_timeout_not_refused():
+    assert is_host_fault(OSError("curl (60) SSL certificate problem: self-signed"))
+    assert is_host_fault(OSError("Could not resolve host: esgf.example.org"))
+    assert is_host_fault(OSError("Timeout was reached: Failed to connect after 14s"))
+    # the deliberately-excluded cases stay retryable:
+    assert not is_host_fault(OSError("Failed to connect: Connection refused"))
+    assert not is_host_fault(OSError("Could not connect to server"))
+
+
+def test_promote_host_faults_only_promotes_host_faults():
+    def ssl(url: str) -> str:
+        raise OSError("SSL certificate problem: self-signed certificate")
+
+    with pytest.raises(HeaderReadHostFault):
+        promote_host_faults(ssl)("https://bad-cert/f.nc")
+
+    def refused(url: str) -> str:
+        raise OSError("Connection refused")
+
+    # connection refused must stay a plain OSError, NOT become a host fault:
+    with pytest.raises(OSError) as excinfo:
+        promote_host_faults(refused)("https://refusing/f.nc")
+    assert not isinstance(excinfo.value, HeaderReadHostFault)
+
+
+class _FakeStream:
+    """Stand-in for the context manager `httpx.stream` returns on a live response."""
+
+    def __enter__(self) -> object:
+        return object()
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def _patch_stream(monkeypatch, outcome):
+    """Make `httpx.stream` return a live response, or raise `outcome` if it is one."""
+
+    def fake_stream(*_args, **_kwargs):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return _FakeStream()
+
+    monkeypatch.setattr(headers.httpx, "stream", fake_stream)
+
+
+def test_probe_returns_none_when_the_node_answers(monkeypatch):
+    # Any response (even a 404/500 the real read will handle) means "reachable".
+    _patch_stream(monkeypatch, None)
+    assert (
+        _probe_host_fault("https://n/f.nc", connect_timeout=90, read_timeout=25) is None
+    )
+
+
+def test_probe_flags_a_connect_timeout(monkeypatch):
+    _patch_stream(monkeypatch, headers.httpx.ConnectTimeout("connect timed out"))
+    reason = _probe_host_fault("https://n/f.nc", connect_timeout=90, read_timeout=25)
+    assert reason is not None and "connect" in reason
+
+
+def test_probe_flags_a_read_stall(monkeypatch):
+    _patch_stream(monkeypatch, headers.httpx.ReadTimeout("read timed out"))
+    reason = _probe_host_fault("https://n/f.nc", connect_timeout=90, read_timeout=25)
+    assert reason is not None and "read" in reason
+
+
+def test_probe_flags_a_dns_or_ssl_connect_error(monkeypatch):
+    _patch_stream(
+        monkeypatch,
+        headers.httpx.ConnectError("[Errno 8] nodename nor servname provided"),
+    )
+    reason = _probe_host_fault("https://n/f.nc", connect_timeout=90, read_timeout=25)
+    assert reason is not None  # DNS/TLS failure -> node unreachable
+
+
+def test_probe_keeps_connection_refused_retryable(monkeypatch):
+    # A refusal is NOT a host fault: probe returns None so the real (retryable) read
+    # runs — the deliberate carve-out that keeps good-node retries.
+    _patch_stream(
+        monkeypatch, headers.httpx.ConnectError("[Errno 61] Connection refused")
+    )
+    assert (
+        _probe_host_fault("https://n/f.nc", connect_timeout=90, read_timeout=25) is None
+    )
+
+
+def test_with_connect_probe_short_circuits_a_dead_node(monkeypatch):
+    _patch_stream(monkeypatch, headers.httpx.ConnectTimeout("connect timed out"))
+    called = {"n": 0}
+
+    def reader(url: str) -> str:
+        called["n"] += 1
+        return url
+
+    gated = with_connect_probe(reader, connect_timeout=90, read_timeout=25)
+    with pytest.raises(HeaderReadHostFault):
+        gated("https://dead/f.nc")
+    assert called["n"] == 0  # the expensive read never ran on a dead node
+
+
+def test_with_connect_probe_reads_when_the_node_answers(monkeypatch):
+    _patch_stream(monkeypatch, None)
+    called = {"n": 0}
+
+    def reader(url: str) -> str:
+        called["n"] += 1
+        return "header"
+
+    gated = with_connect_probe(reader, connect_timeout=90, read_timeout=25)
+    assert gated("https://live/f.nc") == "header"
+    assert called["n"] == 1
 
 
 def test_with_retry_backoff_sleeps_between_attempts():
