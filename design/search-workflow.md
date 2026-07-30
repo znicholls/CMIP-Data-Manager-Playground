@@ -1,7 +1,10 @@
 # Search / dataset / file / header workflow (CMIP6)
 
 Status: **living document** — decisions D1-D8 confirmed 2026-07. Scope: CMIP6
-only, before any MIP-generation or ESGF1/ESGF-NG integration. **Keep this file and
+only, before any MIP-generation integration. **The ESGF1/ESGF-NG integration is
+built** — the workflow below is now dialect-agnostic; see
+[Backends: ESGF1 vs ESGF-NG](#backends-esgf1-vs-esgf-ng) and the full design in
+[`esgf-ng-backend-adapter.md`](./esgf-ng-backend-adapter.md). **Keep this file and
 its diagrams updated as the build proceeds** (any schema, step, or parallelism
 change lands here in the same commit).
 
@@ -26,6 +29,43 @@ file. Steps 2-3 therefore run *only* for the parent-walk use case: a simulation 
 header is already known (from any variable, including an earlier run) is copied over,
 skipping both its file search and its read. So UC-simple stops at Step 1; UC-chain runs
 Steps 1-4 (files/header for lineage only) and loops.
+
+## Backends: ESGF1 vs ESGF-NG
+
+The steps below are described in ESGF1 (esg-search / Solr) terms, but the workflow is
+now **dialect-agnostic**: a `SearchBackend` (`cmip_data_manager.esgf.backends`) does the
+per-dialect work behind `ESGFSearchClient`, and the dialect is resolved **from the
+endpoint URL** (`backends.detect`), so a caller passes only URLs — never "ESGF1" or
+"ESGF-NG". The two dialects, and how each step changes, in one place:
+
+| Step | ESGF1 (esg-search / Solr) | ESGF-NG (STAC / CQL2) |
+|---|---|---|
+| **1 search** | flat facet params, Solr `docs`, offset paging | CQL2 filter, GeoJSON `features`, token paging (`EsgfNgBackend`) |
+| **2 files** | network **file search** per version (backoff→requeue→endpoint fallback, `IndexNodeHealth`) | **assets transform**, in-process, no network (`search.files_ng`) — files are the item's `assets` |
+| **3 header** | byte-range read of a file-search URL, host-ranked | **unchanged** — byte-range read of an **asset href**, host-ranked |
+| **4 parent walk** | header → facet parent search → link | header → **CQL2** parent search → link (same shape) |
+
+Key consequences (full rationale in the design doc):
+
+- **The node/replica dimension moves from the dataset to the file.** ESGF1 fans one
+  `instance_id` into N node-specific `DatasetRecord`s; ESGF-NG returns **one
+  node-independent item** (its `id` *is* the `instance_id`, `data_node`/`replica` are
+  `None`), and the per-file hosts live on each asset (primary href + alternate-asset
+  hrefs). `DatasetRecord.from_stac` populates the same columns while keeping the STAC
+  feature verbatim in `raw`.
+- **Step 2 collapses to a transform on ESGF-NG.** `add_files_auto` dispatches on record
+  shape (`is_stac_record`): STAC ⇒ `add_files_from_assets` (reuses the unchanged
+  `store_files`); else the ESGF1 network search. The whole Step-2 resilience apparatus
+  (endpoint fallback, `IndexNodeHealth`, `FileSearchAttempt`) is ESGF1-only.
+- **User-visible leaks (do not silently drop).** On the ESGF-NG backend, free-text
+  Lucene `query`, the `replica`/`distrib` flags, `type="File"` search and
+  `facet_values` enumeration raise **`UnsupportedOnBackend`** — they have no STAC/CQL2
+  equivalent. (Experiment prefix-matching still works, via CQL2 `LIKE`.) These are the
+  only search-input differences a user can hit; everything else (variable_id,
+  experiment_id, source_id, …) is shared vocabulary.
+- **east ≠ west.** They are separate `Flavour`s (`ESGF_NG_EAST`/`ESGF_NG_WEST`): west
+  lower-cases collection ids and uses `numMatched`/`numReturned` envelope keys (east
+  uses `numberMatched`/`numberReturned`). Both are handled; west currently has no data.
 
 ## Data model (reconciled)
 

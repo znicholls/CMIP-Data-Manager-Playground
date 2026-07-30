@@ -7,24 +7,38 @@ calls these to obtain a ready-to-use client and repository.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from cmip_data_manager.config import DEFAULT_INDEX_ENDPOINTS, Settings
 from cmip_data_manager.db.engine import create_db_engine, init_db
 from cmip_data_manager.db.repository import Repository
+from cmip_data_manager.esgf.backends import (
+    DetectionCache,
+    Flavour,
+    SearchBackend,
+    resolve_backend,
+)
 from cmip_data_manager.esgf.client import ESGFSearchClient
 from cmip_data_manager.esgf.concurrency import MapFn, RetryPolicy, no_retry, serial_map
 
 
-def build_client(
+def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
     settings: Settings | None = None,
     *,
     retry: RetryPolicy = no_retry,
     map_fn: MapFn = serial_map,
+    backend: SearchBackend | None = None,
+    flavour_overrides: Mapping[str, Flavour] | None = None,
+    detection_cache: DetectionCache | None = None,
 ) -> ESGFSearchClient:
     """
-    Build a search client from settings
+    Build a search client from settings, resolving the dialect from the endpoint
+
+    The endpoint URL decides whether the client speaks ESGF1 (esg-search / Solr) or
+    ESGF-NG (STAC / CQL2) — the caller never states it.  Every endpoint we ship is in
+    the known-host registry, so this stays network-free for them; only an unknown host
+    triggers a one-off probe (see `cmip_data_manager.esgf.backends.detect`).
 
     Parameters
     ----------
@@ -37,14 +51,35 @@ def build_client(
     map_fn
         Concurrency strategy for multi-query searches (e.g. `thread_pool_map(...)`).
 
+    backend
+        Force a specific backend, bypassing detection (e.g. a pre-tuned NG backend).
+
+    flavour_overrides
+        Optional `{url_or_host: Flavour}` map that pins an endpoint's dialect, winning
+        over the registry/probe (handy for a new endpoint or offline tests).
+
+    detection_cache
+        Shared detection memo, so an endpoint is probed at most once across calls.
+
     Returns
     -------
     :
-        A configured client.
+        A configured client whose backend matches its endpoint's dialect.
     """
     settings = settings or Settings()
+    resolved = (
+        backend
+        if backend is not None
+        else resolve_backend(
+            settings.base_url,
+            overrides=flavour_overrides,
+            cache=detection_cache,
+            probe_timeout=settings.timeout,
+        )
+    )
     return ESGFSearchClient(
         settings.base_url,
+        backend=resolved,
         retry=retry,
         map_fn=map_fn,
         page_size=settings.page_size,
@@ -58,6 +93,8 @@ def build_file_search_clients(
     *,
     settings: Settings | None = None,
     map_fn: MapFn = serial_map,
+    flavour_overrides: Mapping[str, Flavour] | None = None,
+    detection_cache: DetectionCache | None = None,
 ) -> list[ESGFSearchClient]:
     """
     Build one search client per endpoint, in preference order, for Step 2
@@ -66,6 +103,10 @@ def build_file_search_clients(
     search is owned by `search.files.add_files`, so it can count retries in index-node
     health and drive the endpoint fallback.  A version is tried on the next endpoint
     only after the current one's retries and requeues are exhausted.
+
+    Each endpoint's dialect is resolved from its URL (ESGF1 vs ESGF-NG), so a ranked
+    list may mix both; a shared detection cache means each endpoint is probed at most
+    once (and every endpoint we ship is in the registry, so no probe is needed).
 
     Parameters
     ----------
@@ -82,15 +123,29 @@ def build_file_search_clients(
         Concurrency strategy handed to each client (only used for multi-query
         searches, not the single-query file lookups Step 2 makes).
 
+    flavour_overrides
+        Optional `{url_or_host: Flavour}` map pinning an endpoint's dialect.
+
+    detection_cache
+        Shared detection memo; a fresh one (shared across these endpoints) is used when
+        omitted.
+
     Returns
     -------
     :
         One configured, non-retrying client per endpoint, in the given order.
     """
     settings = settings or Settings()
+    cache = detection_cache if detection_cache is not None else DetectionCache()
     return [
         ESGFSearchClient(
             endpoint,
+            backend=resolve_backend(
+                endpoint,
+                overrides=flavour_overrides,
+                cache=cache,
+                probe_timeout=settings.timeout,
+            ),
             retry=no_retry,
             map_fn=map_fn,
             page_size=settings.page_size,

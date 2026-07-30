@@ -927,3 +927,27 @@ serially (grouping on source/variant/experimt) -> multiple variables.
 
 CLAUDE PROMPT Data node health.
  I would like to add a node-health test to my workflow pipeline. When we implement a search and populate the datanode, we obtain information on every potential data node for that search. If we need to do multiple parent hops (where we will need to connect to a node to access header information), I want to perform a test where, for every single node (can choose a random dataset to trial this on), we attempt to download a single chunk of data. If unsuccessful, consider this node dead for that session and put it in ignore_host. The user should be able to overrride this if they want, but otherwise assume it is dead. Otherwise, if a single chunk of data works for that node we should assume for that session it is alive. I would take recommendations on if we say a node is alive but still then 'fails' in header read (for example is our stall time too short, not enough retries, etc). Please make a plan of how this fits into our workflow, and how to implement this. Also offer your suggestions for if there are multiple parent hops and additional nodes become available through parents.
+
+### Day 4 (30/7)
+
+Phase 4 of EGSF-integration implementation
+
+One thing worth noting for future runs: the header reader uses a subprocess (the stall-timeout design needs a __main__ guard), so a live walk must run from a real .py file, not a python - <<heredoc — otherwise multiprocessing spawn fails and the walk misreads it as "no parent."
+
+Integration complete — all 6 phases done
+
+┌───────┬────────────────────────────────────────┬─────────────────────────────────────────────────┐
+│ Phase │                  What                  │                      Proof                      │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 1     │ Backend seam, ESGF1 extracted          │ live CEDA round-trip, ESGF1 frozen              │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 2     │ ESGF-NG STAC/CQL2 search backend       │ live east search → tables                       │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 3     │ URL-based dialect detection + override │ mixed ranked list, dialect never stated         │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 4     │ Step-2 assets→files transform          │ live: read_header works on asset URL            │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 5     │ Parent walk on ESGF-NG                 │ live UC-chain historical→piControl through east │
+├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
+│ 6     │ Docs + west validation                 │ west resolves & handles empty catalog           │
+└───────┴────────────────────────────────────────┴─────────────────────────────────────────────────┘

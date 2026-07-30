@@ -1,6 +1,6 @@
 # ESGF1 / ESGF-NG backend adapter — design
 
-Status: **proposal, pre-implementation** — companion to
+Status: **BUILT (Phases 1–6 done, 2026-07-30)** — companion to
 [`search-workflow.md`](./search-workflow.md) (the workflow this must slot into)
 and [`repository-layering.md`](./repository-layering.md) (layer rules the adapter
 must respect). Scope: **CMIP6 only, search Step 1 only** (files, data nodes and
@@ -203,6 +203,52 @@ STAC returns as one-element lists (e.g. `cmip6:activity_id`).
   `AND latest=true` (⚠ confirm bare vs prefixed for `latest`/`retracted`).
 - **value escaping**: single-quotes in values must be escaped per CQL2-text; CMIP6
   facet values don't contain quotes, but the renderer must handle it defensively.
+
+### 4.2b Directives (user, 2026-07-30) that shape the NG backend
+
+- **Translate NG → the ESGF1 `DatasetRecord` language for the *tables*, but keep the
+  NG-native document in `raw`.** The normalised columns (`source_id`, `version`,
+  `instance_id`, …) are populated by the NG parser exactly as ESGF1 does, so the DB
+  schema and every downstream reader stay unchanged; but `DatasetRecord.raw` must
+  retain the **STAC/CQL2 feature verbatim** (not a Solr-shaped translation), so no
+  NG information is lost and the raw payload always reflects what the NG API actually
+  returned. (`DatasetRecord.raw` already stores the source doc — the NG parser keeps
+  the STAC feature there.)
+- **The user never states ESGF1 vs ESGF-NG.** They (or we) supply a **ranked list of
+  endpoint links** — today `(CEDA, ORNL, metagrid-west)` — which we extend with the
+  NG endpoints. The endpoint *identity* determines the flavour (via detection/override,
+  §7), and a user may name an endpoint they want to hit; that choice alone tells us
+  whether it is ESGF1 or NG. Flavour never appears in user input.
+- **East and west are separate `Flavour`s** (`ESGF_NG_EAST`/`ESGF_NG_WEST`) from the
+  outset — they already diverge (§12) — but may share one implementation until west
+  serves data and the divergence is pinned down.
+
+### 4.3 Design principle: the collection/project is a **parameter, never a constant**
+
+We build and test against **CMIP6 only** for now, but `"CMIP6"` (and the `cmip6:`
+prefix) must appear **nowhere** as a literal in the render/parse logic — only ever as
+a **default value**, exactly as `project` already is a `FacetQuery`/`Settings` default
+today (and as `query.py`'s TODO and the `no-hardcoded-frequency` convention require).
+Concretely:
+
+- **Collection is the query's `project`.** The renderer emits `collections={project}`
+  and derives the CQL2 prefix from it (`project.lower()` → `cmip6`, `cordex-cmip6`,
+  `cmip7`…). The parser derives the prefix from `feature.collection`. No branch keys
+  off the string `"CMIP6"`.
+- **The prefix is computed, not tabled per-known-collection.** `CMIP6` → `cmip6:`,
+  `CORDEX-CMIP6` → `cordex-cmip6:` both fall out of `collection.lower() + ":"`, so a
+  new collection needs no code change to *render/parse* its facets.
+- **Field-name vocabulary is the one CMIP6-shaped thing that remains** — `DatasetRecord`
+  uses `source_id`/`experiment_id`/… which are CMIP/CMIP6 vocabulary (CMIP5 says
+  `model`, etc.). That mapping is **not** ours to solve here: it is the separate
+  *MIP-generation* step flagged in `query.py`. So we keep the CMIP6 field set,
+  **parameterise the collection/prefix around it**, and leave a clean seam
+  (a per-collection field map, defaulting to the CMIP6 identity map) for that later
+  work — rather than hard-coding `cmip6:` into the mapping. Where the field map does
+  not know a collection, fall back to the identity/prefix rule so CMIP6Plus/CMIP7
+  (which share the CMIP6 vocabulary) already work untested.
+- **`project="CMIP6"` stays a default, not a floor.** Nothing rejects a non-CMIP6
+  collection; it is simply the only one we exercise until the MIP-generation step.
 
 ## 5. Pagination: two different contracts
 
@@ -441,7 +487,21 @@ ESGF1 path byte-for-byte unchanged until the backend seam is proven. Coverage st
 One probe each: `latest`/`retracted` bare-vs-prefixed in CQL2; token-depth cap;
 asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
 
-### Phase 1 — the backend seam (search only, ESGF1 behaviour frozen)
+### Phase 1 — the backend seam (search only, ESGF1 behaviour frozen) — ✅ DONE (2026-07-30)
+
+Built: `esgf/backends/base.py` (`SearchBackend` Protocol, `Flavour` enum with
+**`ESGF1`/`ESGF_NG_EAST`/`ESGF_NG_WEST`** separated per the east/west finding, `Page`,
+`Cursor`, `UnsupportedOnBackend`, and the `ESGFResponseError`/`DeepPaginationError`
+contract errors); `esgf/backends/esgf1.py` (`Esgf1Backend` + the Solr helpers moved
+verbatim). `ESGFSearchClient` now delegates request/page/parse to an injected
+`backend` (defaulting to `Esgf1Backend`), walks pages via the opaque cursor, and
+exposes a `flavour` property; `esgf.client` re-exports the errors + Solr helpers so
+`async_client`/`files`/`parent_walk`/tests need no change. Verified: 312 unit tests +
+all doctests green, `mypy --strict` clean, `ruff` clean, and a **live** CEDA search
+round-trips (`count=37`, 37 `DatasetRecord`s, `data_node`/`version` intact) — ESGF1
+behaviour unchanged. Original plan below.
+
+
 - Add `esgf/backends/base.py`: `SearchBackend` `Protocol` + a `Flavour` enum
   (`ESGF1`, `ESGF_NG`) + `UnsupportedOnBackend(feature, flavour)`.
 - Extract today's logic into `esgf/backends/esgf1.py` (`FacetQuery.to_params` +
@@ -453,15 +513,40 @@ asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
 - **Exit test:** existing suite green unchanged; a client built with an explicit
   `Esgf1Backend` produces identical requests/records (golden-file the params).
 
-### Phase 2 — the ESGF-NG search backend (Step 1 round-trip on real east data)
-- `esgf/backends/esgf_ng.py`:
-  - **renderer** `FacetQuery → (collections param, CQL2 filter)` — prefix from
-    `project`, `=` for one value, `IN (...)` for many, ` AND ` join, value-escaping;
-    raise `UnsupportedOnBackend` for `query` (free-text), `replica`, `distrib`.
+### Phase 2 — the ESGF-NG search backend (Step 1 round-trip on real east data) — ✅ DONE (2026-07-30)
+
+Built: `esgf/backends/esgf_ng.py` (`EsgfNgBackend`) + `DatasetRecord.from_stac` in
+`models.py`. The renderer turns a `FacetQuery` into `collections=` + a **CQL2-text
+filter** (prefix derived from `project`, `=`/`IN (...)`, **bare** `latest`, quote-
+escaping), pages on the opaque `token` from the `rel="next"` link, counts with
+`limit=1` (NG rejects `limit=0`), reads **both** `numberMatched`/`numMatched`
+envelope keys (east/west), and raises `UnsupportedOnBackend` for free-text `query`,
+`replica`/`distrib`, `dataset_id`, non-Dataset (File) search and facet enumeration.
+`from_stac` populates the ESGF1 columns while keeping the **STAC feature verbatim in
+`raw`** (`data_node`/`replica` = `None`, `number_of_files` from data assets). East↔west
+share one impl; `lowercase_collection` is the only knob so far (west collections are
+lower-case). §9 open questions 1 & 7 answered inline (latest/retracted **bare**;
+`limit=0` rejected). Verified: 23 new offline unit tests (renderer strings, token
+paging, both envelope keys, parser, guards) + full suite **363 green**, doctests,
+`mypy --strict` + `ruff` clean, NG backend **96%** / total **95%** coverage; and a
+**live east** round-trip through `ESGFSearchClient` — `count=74`, 74 records
+token-paged with no dupes, **all 74 stored into the existing ESGF1 tables via
+`record_run`** unchanged. Original plan below.
+
+
+- `esgf/backends/esgf_ng.py` (**collection derived from the query/feature, never the
+  literal `"CMIP6"` — see §4.3**):
+  - **renderer** `FacetQuery → (collections param, CQL2 filter)` — prefix computed
+    from `project` (`project.lower()+":"`), `=` for one value, `IN (...)` for many,
+    ` AND ` join, value-escaping; raise `UnsupportedOnBackend` for `query`
+    (free-text), `replica`, `distrib`.
   - **paging** on the opaque `token` from `rel=next` (cursor abstraction from §5);
     soft `max_results` ceiling reusing the "narrow the query" error.
-  - **parser** STAC feature → `DatasetRecord` (mapping table §4.1); `data_node`/
-    `replica` = `None`.
+  - **parser** STAC feature → `DatasetRecord` (mapping table §4.1); prefix from
+    `feature.collection`; facet field-map defaults to the CMIP6 identity map with an
+    identity/prefix fallback for unknown collections (§4.3); `data_node`/`replica` =
+    `None`.
+  - **count** via `limit=1` + `numberMatched` (ESGF-NG rejects `limit=0`; §6 item 7).
 - Config: add flavour to the endpoint model; `Settings`/`factory` accept east URLs.
 - **Tests:** offline unit on recorded east fixtures (renderer string + parser +
   two-page token paging); opt-in live smoke (`numberMatched` sane, page → records,
@@ -469,7 +554,27 @@ asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
 - **Exit:** `build_client(east).search(FacetQuery(...))` returns `DatasetRecord`s
   from live east into the existing DB via the unchanged repository.
 
-### Phase 3 — backend auto-detection (+ explicit override)
+### Phase 3 — backend auto-detection (+ explicit override) — ✅ DONE (2026-07-30)
+
+Built: `esgf/backends/detect.py` — `detect_flavour` resolves a base URL to a `Flavour`
+by **override → known-host registry → root probe** precedence, memoised in a
+`DetectionCache`; `backend_for`/`resolve_backend` return a ready `SearchBackend`
+(west ⇒ `lowercase_collection=True`). The registry maps every endpoint we ship
+(CEDA/ORNL/metagrid = ESGF1; search.east/api.stac.ceda = east; search.west/
+esgf-west.org = west), so the ranked links resolve **with no probe**; only an unknown
+host is probed once (STAC `Catalog` + CQL2/OGC-Features ⇒ NG, `west` in host ⇒ west,
+else default ESGF1). `config.py` gained `EAST_BASE_URL`/`WEST_BASE_URL`.
+`factory.build_client` and `build_file_search_clients` now auto-resolve the backend
+per endpoint (a shared cache across a ranked list), accept `flavour_overrides` and an
+explicit `backend`, and default unchanged for ESGF1. Verified: 20 new offline tests
+(registry-no-probe, override-wins, STAC/Solr/failure probe, cache short-circuit,
+east/west, factory wiring) + full suite **383 green**, doctests, `mypy --strict` +
+`ruff` clean, detect.py **95%** / total **95%**; and a **live** mixed ranked list —
+`build_client(CEDA)` ⇒ `esgf1` (count 37) and `build_client(EAST)` ⇒ `esgf-ng-east`
+(count 19) from the **same `FacetQuery`, URLs only, dialect never stated**. Original
+plan below.
+
+
 - `esgf/backends/detect.py`: probe endpoint root once, cache per-endpoint
   (`ProbeCache`-style); STAC `Catalog`+`conformsTo` ⇒ `ESGF_NG`, esg-search ⇒
   `ESGF1`. Config map pins/overrides a flavour (deterministic offline).
@@ -479,10 +584,32 @@ asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
   short-circuits the probe.
 - **Exit:** user passes only URLs (east and CEDA mixed); each is handled correctly.
 
-### Phase 4 — Step 2 as an assets transform on ESGF-NG
+### Phase 4 — Step 2 as an assets transform on ESGF-NG — ✅ DONE (2026-07-30)
+
+**No schema change needed** — the schema is already node-independent: `File` has no
+`data_node` and `FileAccess.data_node` is already nullable. Built `search/files_ng.py`:
+`file_records_from_dataset` turns a STAC item's data-role `assets` into `FileRecord`s
+(one per file; primary `href` + alternate-asset hrefs → the `url|mime|service` access
+entries, host = URL host; `file:size`/`file:checksum`/`{prefix}:tracking_id` derived,
+prefix from the item's collection; non-http/Globus-only and non-data assets skipped);
+`add_files_from_assets` groups by version, transforms and persists via the **unchanged**
+`Repository.store_files`, returning the same `AddFilesResult` (no failure/overflow mode
+— files are already in hand, no network, no `IndexNodeHealth`). `is_stac_record` lets a
+caller route ESGF1-search vs NG-transform. Verified: 6 offline tests incl. the
+**alternate-assets multi-host** (replica) case east can't yet show + non-data/Globus
+skipping + cache-skip + store round-trip; full suite **389 green**, doctests,
+`mypy --strict` + `ruff` clean, files_ng **100%** / total **95%**. And a **live east**
+end-to-end: search → `add_files_from_assets` (stored 2 files, 0 failures, no network) →
+`get_version_files` returns byte-range URLs (host `dap.ceda.ac.uk`, `HTTPServer`) →
+**`read_header` on the asset URL succeeds**, returning real parentage
+(`parent_experiment_id=piControl`) — Step 3 runs unchanged and Phase 5 is unblocked.
+Original plan below.
+
+
 - Add `search/files_ng.py` (or a backend branch in `add_files`): STAC item `assets`
   → `File` + `FileAccess` rows (`href`+`alternate` hosts, `file:size`,
-  `file:checksum`, `cmip6:tracking_id`), **no network, no `IndexNodeHealth`**.
+  `file:checksum`, `{prefix}:tracking_id` — prefix derived from the item's
+  `collection`, not the literal `cmip6:`; §4.3), **no network, no `IndexNodeHealth`**.
 - The workflow runner picks the transform when the Step-1 backend is `ESGF_NG`,
   the searching `add_files` when `ESGF1`. `FileSearchAttempt`/health untouched on
   the ESGF1 path.
@@ -491,7 +618,25 @@ asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
 - **Exit:** after a Step-1 ESGF-NG search, `get_version_files` returns the files
   with byte-range-ready URLs — **Step 3 can run with zero changes.**
 
-### Phase 5 — parent walk on ESGF-NG (Steps 3–4 end to end)
+### Phase 5 — parent walk on ESGF-NG (Steps 3–4 end to end) — ✅ DONE (2026-07-30)
+
+Built: `add_files_auto` in `search/files_ng.py` — a Step-2 dispatch seam that routes to
+the assets transform when records are STAC (`is_stac_record`) and to the ESGF1 network
+`add_files` otherwise. `parent_walk._read_headers` now calls `add_files_auto` (so each
+hop's file step is dialect-correct); `enrich_version_headers` is **unchanged** (it reads
+the asset URLs the transform stored, host-ranked). `find_parent_datasets` already renders
+its per-parent search to CQL2 through the backend seam; its ESGF1-only `replica=False`
+deep-page fallback is now guarded (`UnsupportedOnBackend` ⇒ empty) so it can't crash an
+NG walk. Verified: a new offline NG one-hop walk test (STAC records, files-from-assets, no
+`search_files`) + the **24 existing ESGF1 walk tests unchanged** + full suite **390 green**,
+doctests, `mypy --strict` + `ruff` clean, files_ng **100%** / total **95%**. And a **live
+east UC-chain**: child `historical r15i1p1f2` (NIMS-KMA) → **1 hop** → parent `piControl
+r1i1p1f2` (MOHC — parent institution *discovered from the netCDF header*, not assumed),
+terminating at the `piControl` stopping experiment — Step 1 (CQL2) → Step 2 (assets, no
+file search) → Step 3 (header read off an asset URL) → Step 4 (CQL2 parent search + link),
+entirely through ESGF-NG. Original plan below.
+
+
 - Verify `enrich_version_headers` reads headers from asset-sourced `FileAccess`
   unchanged (it should — it is URL/host-driven).
 - Point `resolve_parent_chains` per-hop file step at the Phase-4 transform when the
@@ -502,7 +647,23 @@ asset roles beyond `data` (globus/HTTPServer/reference). Record answers in §9.
   the ESGF1 walk on equivalent data. Opt-in live mini-walk on east.
 - **Exit:** a UC-chain use case resolves a parent chain entirely through east.
 
-### Phase 6 — docs, deferrals, west
+### Phase 6 — docs, deferrals, west — ✅ DONE (2026-07-30)
+
+Done: `search-workflow.md` gained a **Backends: ESGF1 vs ESGF-NG** section (per-step
+table, node-moves-to-file, Step-2-transform, the `UnsupportedOnBackend` user-visible
+leaks, east≠west) and its scope line now says the integration is built;
+`detailed-workflow.md` gained a backend-seam callout on the call graph
+(`add_files`→`add_files_auto`, CQL2 rendering, Steps 3–4 unchanged). **west validated
+live** behind the registry/override even with no data: `build_client(WEST_BASE_URL)`
+resolves to `esgf-ng-west` (`lowercase_collection=True`), and `count`/`search` return
+`0` gracefully via the `numMatched` envelope key — so the west path (lowercase
+collection + west envelope) is exercised and correct ahead of data landing.
+**Deferred (unchanged):** `facet_values` on ESGF-NG (STAC `/aggregate`) — raises
+`UnsupportedOnBackend` for now; MIP-generation search (CMIP5/CMIP7/CORDEX) is a
+separate step. **Re-verify against west** (item/property/asset shape, alternate
+assets) the moment it serves CMIP6 data. Original plan below.
+
+
 - Update `search-workflow.md` / `detailed-workflow.md` with the backend seam and
   the Step-2-collapses-to-a-transform branch; document the **user-visible
   leak**: free-text `query` and `replica`/`distrib` are ESGF1-only
@@ -549,9 +710,29 @@ maps to both. CQL2 is strictly more expressive; we translate *into* the small co
 of it we need. (The expressiveness is upside, not obligation: `LIKE` cleanly solves
 the experiment-prefix problem Solr forced us to work around — §6 item 4.)
 
-**East vs west — how they might differ, and why the standard helps.** West has no
-data yet, so any specific claim is unconfirmed; the user's "similar but not
-identical" intuition is right, and the reason is architectural. ESGF1 mirrors
+**East vs west — CONFIRMED already different (probed 2026-07-30).** Live endpoints:
+`search.east.esgf.io` → `api.stac.esgf.ceda.ac.uk` (CEDA-hosted), `search.west.esgf.io`
+→ `discovery.production.esgf-west.org`. Both are `stac-fastapi`, but they are **not
+byte-identical**, so we separate them from day one:
+
+| | EAST | WEST |
+|---|---|---|
+| Root title | `ESGF EAST STAC API` | generic `stac-fastapi` |
+| Collection ids | `CMIP6`, `CMIP6Plus`, `CMIP7`, `CORDEX-CMIP6`, `obs4REF` | **lower-case** `cmip6`, `cmip6plus`, `cmip7`, `cordex-cmip6`, `obs4ref` |
+| Result envelope | `numberMatched` / `numberReturned` | **`numMatched` / `numReturned`** (+ a `context` block) |
+| Conformance classes | superset (adds `collection-search`, `item-search#query/#sort/#fields`, `simple-query`) | subset (core CQL2 + features only) |
+| Data | CMIP6 populated (e.g. tas/historical = 149) | **empty** (queryables empty, 0 matches) |
+
+So the count/paging **parser field name differs** (`numberMatched` vs `numMatched`),
+the **collection id casing differs**, and the **capability profile differs** — three
+concrete reasons east and west need separate handling even though they share the STAC
+protocol. West's *item/property/asset* shape is still unconfirmed (no data), so its
+prefix and alternate-assets behaviour remain **⚠ west-unknown**. This vindicates the
+plan's decision to model east and west as **separate `Flavour`s** (§4.3 / Phase 1),
+even while we let them share code until west diverges further.
+
+The user's "similar but not identical" intuition is right, and the reason is
+architectural. ESGF1 mirrors
 (CEDA/ORNL/metagrid) all speak the *same* Solr param dialect, so they are
 interchangeable. ESGF-NG deployments instead speak **self-describing standards**,
 and each deployment advertises its own **capability profile** — so east and west are

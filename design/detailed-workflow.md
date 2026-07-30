@@ -12,6 +12,18 @@ All Mermaid below is plain text (diff-able); GitHub renders it, or paste into
 <https://mermaid.live>. Keep this file updated in the same commit as any change to
 the call graph, seams, or parallelism.
 
+> **Backend seam (ESGF1 / ESGF-NG).** The call graph below is drawn for ESGF1
+> (esg-search / Solr). A fifth injected seam now sits under `ESGFSearchClient`: a
+> **`SearchBackend`** (`esgf.backends`) resolved from the endpoint URL
+> (`backends.detect`), so the same graph serves ESGF-NG (STAC / CQL2) with two
+> substitutions — **Step 2** `files.add_files` becomes `files_ng.add_files_auto`,
+> which for STAC records runs `add_files_from_assets` (an in-process transform of the
+> item's `assets`, **no `search_files`, no `IndexNodeHealth`**) then the *unchanged*
+> `store_files`; and every `client.search`/`count` renders to CQL2 instead of Solr
+> params. Steps 3–4 (`enrich_version_headers`, `resolve_parent_chains`) are unchanged.
+> See [`search-workflow.md`](./search-workflow.md#backends-esgf1-vs-esgf-ng) and
+> [`esgf-ng-backend-adapter.md`](./esgf-ng-backend-adapter.md).
+
 Legend for every diagram:
 
 - **rounded box** = a function/callable you can grep for.

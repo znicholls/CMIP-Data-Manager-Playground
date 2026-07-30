@@ -208,6 +208,67 @@ class DatasetRecord(BaseModel):
             raw=doc,
         )
 
+    @classmethod
+    def from_stac(cls, feature: dict[str, Any]) -> DatasetRecord:
+        """
+        Build a `DatasetRecord` from a raw ESGF-NG STAC feature
+
+        The normalised columns are populated in the **same ESGF1 vocabulary** as
+        `from_solr`, so the database schema and every downstream reader are unchanged
+        — but `raw` keeps the **STAC feature verbatim** (not a Solr-shaped
+        translation), so nothing the STAC/CQL2 API returned is lost.
+
+        The collection-facet prefix (`cmip6:`, `cordex-cmip6:`, …) is **derived** from
+        `feature["collection"]` (lower-cased), never hard-coded, so the same parser
+        serves every collection.  A STAC item is a single, node-independent dataset
+        version, so its `id` is the `instance_id`; there is no data node or replica
+        dimension (`data_node`/`replica` are `None` — files/hosts live in `assets`).
+
+        Parameters
+        ----------
+        feature
+            One GeoJSON `Feature` from a STAC `FeatureCollection.features` array.
+
+        Returns
+        -------
+        :
+            The normalised record, with the raw STAC feature retained in `raw`.
+        """
+        collection = str(feature.get("collection", "") or "")
+        prefix = f"{collection.lower()}:" if collection else ""
+        props: dict[str, Any] = feature.get("properties", {}) or {}
+
+        def facet(name: str) -> str | None:
+            return _single_str(props, f"{prefix}{name}")
+
+        assets = feature.get("assets", {}) or {}
+        data_assets = sum(
+            1 for a in assets.values() if "data" in (a.get("roles") or [])
+        )
+        return cls(
+            id=str(feature["id"]),
+            master_id=_single_str(props, "base_id"),
+            instance_id=str(feature["id"]),
+            project=collection or None,
+            source_id=facet("source_id"),
+            institution_id=facet("institution_id"),
+            experiment_id=facet("experiment_id"),
+            variant_label=facet("variant_label"),
+            variable_id=facet("variable_id"),
+            frequency=facet("frequency"),
+            table_id=facet("table_id"),
+            grid_label=facet("grid_label"),
+            nominal_resolution=facet("nominal_resolution"),
+            version=_single_str(props, "version"),
+            data_node=None,
+            replica=None,
+            latest=_single(props, "latest"),
+            number_of_files=data_assets or None,
+            size=_single(props, "size"),
+            esgf_timestamp=_single_str(props, "updated"),
+            raw=feature,
+        )
+
 
 class FileRecord(BaseModel):
     """

@@ -3,11 +3,20 @@ Synchronous client for the ESGF search API
 
 The client is transport-agnostic: it is handed a `Fetch`, a `RetryPolicy` and a
 `MapFn` (see `cmip_data_manager.esgf.concurrency`) so that retry/backoff and
-parallelism are entirely the caller's choice.  Its jobs are:
+parallelism are entirely the caller's choice.  It is also **dialect-agnostic**: a
+`SearchBackend` (see `cmip_data_manager.esgf.backends`) does the dialect-specific
+work of building requests, walking pages and parsing responses, so the same client
+serves ESGF1 (esg-search / Solr) and, in future, ESGF-NG (STAC / CQL2).  Its jobs
+are:
 
-- turn a `FacetQuery` into paged requests and stitch the pages back together;
-- guard against the API silently truncating deep result sets;
+- drive the injected backend to turn a `FacetQuery` into paged requests and stitch
+  the pages back together;
+- guard (via the backend) against the API silently truncating deep result sets;
 - fan several queries out through the injected `MapFn`.
+
+`ESGFResponseError`, `DeepPaginationError` and the Solr JSON helpers
+(`_response`, `_num_found`, `_docs`, `_facet_values`) are re-exported here for the
+callers (and the async client) that import them from this module.
 """
 
 from __future__ import annotations
@@ -15,6 +24,20 @@ from __future__ import annotations
 from typing import Any
 
 from cmip_data_manager.config import MAX_PAGE_SIZE, MAX_RETRIEVABLE
+from cmip_data_manager.esgf.backends.base import (
+    Cursor,
+    DeepPaginationError,
+    ESGFResponseError,
+    Flavour,
+    SearchBackend,
+)
+from cmip_data_manager.esgf.backends.esgf1 import (
+    Esgf1Backend,
+    _docs,
+    _facet_values,
+    _num_found,
+    _response,
+)
 from cmip_data_manager.esgf.concurrency import (
     Fetch,
     MapFn,
@@ -26,32 +49,15 @@ from cmip_data_manager.esgf.concurrency import (
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.query import FacetQuery
 
-
-# QUESTION: does the response have to be a Solr result, or do we just need to
-#  make it look like a Solr result?
-# Issue for project/esgf integration?
-class ESGFResponseError(RuntimeError):
-    """Raised when a search response is not shaped like a Solr result."""
-
-
-class DeepPaginationError(RuntimeError):
-    """
-    Raised when a result set is too large to page through safely
-
-    ESGF/Globus Search reject or silently truncate very deep pagination, so
-    rather than return a partial answer we stop and ask the caller to narrow the
-    query.
-    """
-
-    def __init__(self, num_found: int, max_results: int) -> None:
-        self.num_found = num_found
-        self.max_results = max_results
-        super().__init__(
-            f"Search matched {num_found} results, which exceeds the maximum "
-            f"retrievable for a single query ({max_results}); the API cannot page "
-            f"beyond this. Narrow the query, e.g. split it by experiment_id or "
-            f"source_id."
-        )
+__all__ = [
+    "DeepPaginationError",
+    "ESGFResponseError",
+    "ESGFSearchClient",
+    "_docs",
+    "_facet_values",
+    "_num_found",
+    "_response",
+]
 
 
 class ESGFSearchClient:
@@ -74,6 +80,7 @@ class ESGFSearchClient:
         self,
         base_url: str,
         *,
+        backend: SearchBackend | None = None,
         fetch: Fetch | None = None,
         retry: RetryPolicy = no_retry,
         map_fn: MapFn = serial_map,
@@ -88,6 +95,11 @@ class ESGFSearchClient:
         ----------
         base_url
             Search endpoint (e.g. the metagrid proxy or another mirror).
+
+        backend
+            The search dialect to speak (request building, paging, parsing).
+            Defaults to `Esgf1Backend` (esg-search / Solr), preserving the historical
+            behaviour; pass an ESGF-NG backend to talk to a STAC/CQL2 endpoint.
 
         fetch
             Transport used for a single request.  Defaults to an httpx-backed
@@ -111,6 +123,9 @@ class ESGFSearchClient:
             Timeout used only when `fetch` is not supplied.
         """
         self._base_url = base_url
+        self._backend: SearchBackend = (
+            backend if backend is not None else Esgf1Backend()
+        )
         base_fetch = fetch if fetch is not None else httpx_fetch(timeout=timeout)
         self._fetch = retry(base_fetch)
         self._map = map_fn
@@ -121,6 +136,11 @@ class ESGFSearchClient:
     def base_url(self) -> str:
         """Search endpoint this client talks to."""
         return self._base_url
+
+    @property
+    def flavour(self) -> Flavour:
+        """The search dialect (`Flavour`) this client's backend speaks."""
+        return self._backend.flavour
 
     def count(self, query: FacetQuery) -> int:
         """
@@ -136,8 +156,9 @@ class ESGFSearchClient:
         :
             The `numFound` reported by the API.
         """
-        payload = self._fetch(self._base_url, query.to_params(offset=0, limit=0))
-        return _num_found(payload)
+        url, params = self._backend.count_request(self._base_url, query)
+        payload = self._fetch(url, params)
+        return self._backend.parse_count(payload)
 
     def facet_values(self, query: FacetQuery, facet_field: str) -> dict[str, int]:
         """
@@ -161,38 +182,24 @@ class ESGFSearchClient:
         :
             Mapping of facet value to its count.
         """
-        params = dict(query.to_params(offset=0, limit=0))
-        params["facets"] = facet_field
-        payload = self._fetch(self._base_url, params)
-        return _facet_values(payload, facet_field)
+        url, params = self._backend.facets_request(self._base_url, query, facet_field)
+        payload = self._fetch(url, params)
+        return self._backend.parse_facets(payload, facet_field)
 
     def _iter_docs(self, query: FacetQuery) -> list[dict[str, Any]]:
-        """Page through `query` and return every raw document."""
+        """Page through `query` (via the backend's cursor) and return every raw doc."""
         docs: list[dict[str, Any]] = []
-        offset = 0
-        num_found: int | None = None
-        while True:
-            payload = self._fetch(
-                self._base_url, query.to_params(offset=offset, limit=self._page_size)
+        cursor: Cursor | None = self._backend.start_cursor()
+        while cursor is not None:
+            url, params = self._backend.page_request(
+                self._base_url, query, cursor=cursor, page_size=self._page_size
             )
-            page = _docs(payload)
-            if num_found is None:
-                num_found = _num_found(payload)
-                if num_found > self._max_results:
-                    raise DeepPaginationError(num_found, self._max_results)
-            docs.extend(page)
-            offset += len(page)
-            if offset >= num_found:
-                break
-            if not page:
-                # The backend stopped returning results before we reached
-                # num_found: this is the silent-truncation case we must surface.
-                msg = (
-                    f"Pagination stalled at offset {offset} with "
-                    f"{num_found} results expected; the backend appears to have "
-                    f"truncated the result set. Narrow the query."
-                )
-                raise ESGFResponseError(msg)
+            payload = self._fetch(url, params)
+            page = self._backend.parse_page(
+                payload, cursor=cursor, max_results=self._max_results
+            )
+            docs.extend(page.docs)
+            cursor = page.next_cursor
         return docs
 
     def search(self, query: FacetQuery) -> list[DatasetRecord]:
@@ -209,7 +216,7 @@ class ESGFSearchClient:
         :
             All matching datasets, across every page.
         """
-        return [DatasetRecord.from_solr(doc) for doc in self._iter_docs(query)]
+        return [self._backend.parse_dataset(doc) for doc in self._iter_docs(query)]
 
     def search_files(self, query: FacetQuery) -> list[FileRecord]:
         """
@@ -225,7 +232,7 @@ class ESGFSearchClient:
         :
             All matching files, across every page.
         """
-        return [FileRecord.from_solr(doc) for doc in self._iter_docs(query)]
+        return [self._backend.parse_file(doc) for doc in self._iter_docs(query)]
 
     def search_many(self, queries: list[FacetQuery]) -> list[list[DatasetRecord]]:
         """
@@ -242,36 +249,3 @@ class ESGFSearchClient:
             One result list per query, in the same order as `queries`.
         """
         return list(self._map(self.search, queries))
-
-
-def _response(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return the `response` block, raising if the payload is not a result."""
-    response = payload.get("response")
-    if not isinstance(response, dict):
-        msg = (
-            "Unexpected search response: missing 'response' block. "
-            f"Got keys: {sorted(payload)}"
-        )
-        raise ESGFResponseError(msg)
-    return response
-
-
-def _num_found(payload: dict[str, Any]) -> int:
-    """Extract `numFound` from a search payload."""
-    return int(_response(payload)["numFound"])
-
-
-def _docs(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract the `docs` list from a search payload."""
-    docs = _response(payload).get("docs", [])
-    if not isinstance(docs, list):
-        msg = f"Unexpected 'docs' type in response: {type(docs)!r}"
-        raise ESGFResponseError(msg)
-    return docs
-
-
-def _facet_values(payload: dict[str, Any], facet_field: str) -> dict[str, int]:
-    """Parse a Solr `facet_counts` block (`[value, count, value, count, ...]`)."""
-    facet_fields = payload.get("facet_counts", {}).get("facet_fields", {})
-    flat = facet_fields.get(facet_field, [])
-    return {str(value): int(count) for value, count in zip(flat[0::2], flat[1::2])}

@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from cmip_data_manager.db.repository import Repository
+from cmip_data_manager.esgf.backends import UnsupportedOnBackend
 from cmip_data_manager.esgf.client import (
     DeepPaginationError,
     ESGFResponseError,
@@ -69,7 +70,7 @@ from cmip_data_manager.esgf.health import NodeHealth
 from cmip_data_manager.esgf.models import DatasetRecord
 from cmip_data_manager.esgf.preflight import DEFAULT_PROBE_READ_TIMEOUT, ProbeCache
 from cmip_data_manager.esgf.query import FacetQuery
-from cmip_data_manager.search.files import add_files
+from cmip_data_manager.search.files_ng import add_files_auto
 from cmip_data_manager.search.version_headers import (
     HeaderReader,
     enrich_version_headers,
@@ -326,7 +327,13 @@ def find_parent_datasets(
         try:
             return client.search(query)
         except DeepPaginationError:
-            return client.search(primary_only)
+            # The primary-only retry drops replicas to fit the page — an ESGF1 notion.
+            # ESGF-NG has no replica facet (and no offset wall), so it rejects the flag;
+            # there the deep-page case is effectively unreachable, so treat it as empty.
+            try:
+                return client.search(primary_only)
+            except UnsupportedOnBackend:
+                return []
 
     for client in clients:
         try:
@@ -586,7 +593,7 @@ class _WalkState:
             # fallback resilience uc1's file step has.  A failed file search must not
             # hard-raise mid-walk (the read below handles a parent with no stored
             # files).
-            add_files(
+            add_files_auto(
                 to_search,
                 clients=self.search_clients,
                 repository=self.repository,

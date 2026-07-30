@@ -22,6 +22,18 @@ ORNL_BASE_URL = "https://esgf-node.ornl.gov/proxy/search"
 """ORNL's MetaGrid search proxy — another fast, independent index (the `/esg-search/`
 path on that host is only the web UI; the API lives at `/proxy/search`)."""
 
+EAST_BASE_URL = "https://search.east.esgf.io/search"
+"""ESGF-NG **east** STAC search endpoint (served by `api.stac.esgf.ceda.ac.uk`).
+
+A STAC/CQL2 API, **not** esg-search — the flavour is resolved automatically from the
+endpoint (see `cmip_data_manager.esgf.backends.detect`), so callers never state it."""
+
+WEST_BASE_URL = "https://search.west.esgf.io/search"
+"""ESGF-NG **west** STAC endpoint (served by `discovery.production.esgf-west.org`).
+
+Currently has no CMIP6 data; kept separate from east because the two already differ
+(collection-id casing, result-envelope keys, capability profile)."""
+
 DEFAULT_INDEX_ENDPOINTS = (CEDA_BASE_URL, ORNL_BASE_URL, DEFAULT_BASE_URL)
 """Preference-ordered search-index endpoints for the Step-2 file search.
 
