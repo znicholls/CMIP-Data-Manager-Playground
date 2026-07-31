@@ -159,45 +159,71 @@ def add_files_auto(  # noqa: PLR0913 - a dispatch seam mirroring add_files' sign
     """
     Add each version's files, dispatching on dialect: assets transform vs file search
 
-    A single Step-2 entry point that works for both backends.  When the records came
-    from an ESGF-NG search (STAC), files are read from their `assets` in-process (no
-    network, `clients` unused); otherwise the ESGF1 network file search runs with the
-    given `clients` and its full backoff/requeue/endpoint-fallback resilience.  This
-    lets the parent walk (and any caller) do Step 2 without knowing the dialect.
+    A single Step-2 entry point that works for both backends.  The records are
+    **partitioned by dialect**: STAC records (from an ESGF-NG search) have their files
+    read from their `assets` in-process (no network, `clients` unused), while the rest
+    run through the ESGF1 network file search with the given `clients` and its full
+    backoff/requeue/endpoint-fallback resilience.  Both partitions are served and their
+    summaries combined, so a **mixed** batch — as the parent walk produces once its
+    frontier spans both dialects — is handled correctly (an earlier all-or-nothing check
+    starved the STAC records whenever one ESGF1 record shared the batch).  This lets the
+    parent walk (and any caller) do Step 2 without knowing the dialect.
 
     Parameters
     ----------
     records
-        The Step-1 dataset records to add files for.
+        The Step-1 dataset records to add files for (may mix dialects).
 
     repository
         Cache to check for already-stored files and to write results into.
 
     clients
-        Preference-ordered ESGF1 file-search clients (ignored on the ESGF-NG path).
+        Preference-ordered ESGF1 file-search clients (used only for the non-STAC
+        partition; the STAC partition needs none).
 
     map_fn, raise_on_incomplete
-        Forwarded to `search.files.add_files` on the ESGF1 path.
+        Forwarded to `search.files.add_files` for the non-STAC partition.
 
     skip_cached
-        Skip versions whose files are already stored (both paths).
+        Skip versions whose files are already stored (both partitions).
 
     Returns
     -------
     :
-        The `AddFilesResult` from whichever path ran.
+        The combined `AddFilesResult` across both partitions.
     """
-    if records and all(is_stac_record(record) for record in records):
-        return add_files_from_assets(
-            records, repository=repository, skip_cached=skip_cached
+    stac = [record for record in records if is_stac_record(record)]
+    other = [record for record in records if not is_stac_record(record)]
+
+    result = AddFilesResult()
+    if stac:
+        result = _merge_results(
+            result,
+            add_files_from_assets(stac, repository=repository, skip_cached=skip_cached),
         )
-    return add_files(
-        records,
-        clients=clients,
-        repository=repository,
-        map_fn=map_fn,
-        raise_on_incomplete=raise_on_incomplete,
-        skip_cached=skip_cached,
+    if other:
+        result = _merge_results(
+            result,
+            add_files(
+                other,
+                clients=clients,
+                repository=repository,
+                map_fn=map_fn,
+                raise_on_incomplete=raise_on_incomplete,
+                skip_cached=skip_cached,
+            ),
+        )
+    return result
+
+
+def _merge_results(a: AddFilesResult, b: AddFilesResult) -> AddFilesResult:
+    """Combine two `AddFilesResult`s (the STAC and ESGF1 partitions of one Step 2)."""
+    return AddFilesResult(
+        searched=a.searched + b.searched,
+        skipped_cached=a.skipped_cached + b.skipped_cached,
+        files_stored=a.files_stored + b.files_stored,
+        overflowed=[*a.overflowed, *b.overflowed],
+        failed=[*a.failed, *b.failed],
     )
 
 

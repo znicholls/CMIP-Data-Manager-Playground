@@ -104,6 +104,10 @@ class EsgfNgBackend:
     lowercase_collection: bool = False
     """Lower-case the `collections=` value (west's collection ids are lower-case)."""
 
+    supports_file_search: bool = False
+    """No file search: a STAC item carries its files as `assets` (see `search_files`,
+    which raises `UnsupportedOnBackend`).  Left `False`; not meant to be overridden."""
+
     def start_cursor(self) -> Cursor:
         """Return the first-page cursor (an empty token)."""
         return _START_CURSOR

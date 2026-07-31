@@ -119,6 +119,15 @@ class SearchBackend(Protocol):
     flavour: Flavour
     """The dialect this backend speaks."""
 
+    supports_file_search: bool
+    """Whether this backend can run a Step-2 file search (`search_files`).
+
+    ESGF1 (Solr) searches files by a `type=File` query; ESGF-NG carries a dataset's
+    files as STAC `assets`, so it has **no** file search (`search_files` raises
+    `UnsupportedOnBackend`).  Callers that hand a *ranked, mixed-dialect* client list to
+    `search.files.add_files` use this to **skip** the clients that cannot file-search,
+    rather than crash on them — the same way the parent search tolerates them."""
+
     def start_cursor(self) -> Cursor:
         """Return the cursor for the first page (e.g. offset `0`)."""
         ...

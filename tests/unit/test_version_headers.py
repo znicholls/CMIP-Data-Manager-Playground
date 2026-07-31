@@ -53,6 +53,8 @@ def _file(dataset_id, filename):
 
 
 class _FileClient:
+    supports_file_search = True
+
     def __init__(self, files_by_dataset_id):
         self._files = files_by_dataset_id
 

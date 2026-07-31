@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from cmip_data_manager.esgf.backends import EsgfNgBackend
-from cmip_data_manager.esgf.models import DatasetRecord
+from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.search.files_ng import (
+    add_files_auto,
     add_files_from_assets,
     file_records_from_dataset,
     is_stac_record,
@@ -128,6 +129,51 @@ def test_add_files_from_assets_persists_and_is_readable(repository):
     assert "https://dap.ceda.ac.uk/data/a.nc" in urls
     hosts = {a.data_node for f in stored for a in f.accesses}
     assert hosts == {"dap.ceda.ac.uk"}
+
+
+class _FakeEsgf1Client:
+    """An ESGF1 file-search client that returns one canned file per version."""
+
+    base_url = "https://esgf1/search"
+    supports_file_search = True
+
+    def __init__(self, dataset_id: str) -> None:
+        self._dataset_id = dataset_id
+        self.calls = 0
+
+    def search_files(self, _query: Any) -> list[FileRecord]:
+        self.calls += 1
+        return [
+            FileRecord(
+                id="e",
+                dataset_id=self._dataset_id,
+                title="e.nc",
+                urls=("https://node.example/e.nc|application/netcdf|HTTPServer",),
+                raw={},
+            )
+        ]
+
+
+def test_add_files_auto_partitions_a_mixed_dialect_batch(repository):
+    # The parent-walk case: a STAC (ESGF-NG) record and an ESGF1 record in ONE batch.
+    # Both must get files — the STAC one via its assets, the ESGF1 one via file search.
+    # (An earlier all-or-nothing check starved the STAC record here.)
+    stac = _record(_feature({"a.nc": _data_asset("a.nc", "dap.ceda.ac.uk")}))
+    esgf1_id = "CMIP6.CMIP.Y.MODEL2.historical.r1i1p1f1.Amon.tas.gn.v20200101"
+    esgf1 = DatasetRecord(id=f"{esgf1_id}|node.example", instance_id=esgf1_id, raw={})
+    repository.record_run([stac, esgf1], endpoint_url="https://x/search", spec={})
+    client = _FakeEsgf1Client(f"{esgf1_id}|node.example")
+
+    result = add_files_auto([stac, esgf1], repository=repository, clients=[client])
+
+    assert client.calls == 1  # the ESGF1 partition was file-searched
+    assert result.files_stored == 2  # 1 from assets (STAC) + 1 from file search (ESGF1)
+    assert {f.filename for f in repository.get_version_files(stac.instance_key)} == {
+        "a.nc"
+    }
+    assert {f.filename for f in repository.get_version_files(esgf1.instance_key)} == {
+        "e.nc"
+    }
 
 
 def test_add_files_from_assets_skips_cached(repository):

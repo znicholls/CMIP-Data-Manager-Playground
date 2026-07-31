@@ -55,6 +55,8 @@ class Esgf1Backend:
     """
 
     flavour: Flavour = Flavour.ESGF1
+    supports_file_search: bool = True
+    """Solr searches files by a `type=File` query — file search is supported."""
 
     def start_cursor(self) -> Cursor:
         """Return the first-page offset (`0`)."""

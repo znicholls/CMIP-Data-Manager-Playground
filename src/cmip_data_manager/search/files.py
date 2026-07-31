@@ -239,6 +239,11 @@ def add_files(  # noqa: PLR0913 - a DI seam; every parameter has a default
     for client in clients:
         if not remaining:
             break
+        if not client.supports_file_search:
+            # A mixed-dialect ranked list may include an ESGF-NG client (files live on
+            # STAC assets, not a file search); it cannot serve this step, so skip it —
+            # the same tolerance the parent search already has for such a client.
+            continue
         worker = _worker(
             client,
             repository,

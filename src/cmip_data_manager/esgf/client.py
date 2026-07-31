@@ -142,6 +142,16 @@ class ESGFSearchClient:
         """The search dialect (`Flavour`) this client's backend speaks."""
         return self._backend.flavour
 
+    @property
+    def supports_file_search(self) -> bool:
+        """Whether this client can run a Step-2 file search (`search_files`).
+
+        `False` for ESGF-NG (files come from STAC `assets`, not a file search).  Lets
+        `search.files.add_files` skip a mixed-dialect client that cannot file-search
+        instead of crashing on it.
+        """
+        return self._backend.supports_file_search
+
     def count(self, query: FacetQuery) -> int:
         """
         Return the number of results a query matches without fetching them

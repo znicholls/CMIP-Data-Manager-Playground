@@ -57,6 +57,7 @@ class _World:
     """A fake index + data node driven by a `{sim: [records]}` world and headers."""
 
     base_url = "http://index/search"
+    supports_file_search = True
 
     def __init__(self, records_by_sim, headers, existing_experiments):
         self._world = records_by_sim

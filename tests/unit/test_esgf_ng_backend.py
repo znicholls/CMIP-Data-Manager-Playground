@@ -9,6 +9,7 @@ import pytest
 
 from cmip_data_manager.esgf.backends import (
     DeepPaginationError,
+    Esgf1Backend,
     EsgfNgBackend,
     ESGFResponseError,
     Flavour,
@@ -162,6 +163,17 @@ def test_search_files_raises_unsupported():
     )
     with pytest.raises(UnsupportedOnBackend, match="file search"):
         one.search_files(FacetQuery(type="Dataset"))
+
+
+def test_supports_file_search_capability_is_advertised():
+    # The capability the client forwards so add_files can skip a client that cannot
+    # file-search (ESGF-NG) instead of crashing on it.
+    assert Esgf1Backend().supports_file_search is True
+    assert EsgfNgBackend().supports_file_search is False
+    ng = ESGFSearchClient(EAST, backend=EsgfNgBackend(), fetch=stac_fetch([]))
+    assert ng.supports_file_search is False
+    esgf1 = ESGFSearchClient(EAST, backend=Esgf1Backend(), fetch=stac_fetch([]))
+    assert esgf1.supports_file_search is True
 
 
 def test_facet_values_raises_unsupported():

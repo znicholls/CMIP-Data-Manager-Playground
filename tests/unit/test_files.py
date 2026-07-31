@@ -71,7 +71,7 @@ class _FakeClient:
     - `fail_ids`: raise only when the query targets one of these dataset ids.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - a test fake; each flag drives one add_files case
         self,
         files_by_dataset_id=None,
         *,
@@ -79,12 +79,14 @@ class _FakeClient:
         raises=None,
         raise_first=None,
         fail_ids=None,
+        supports_file_search=True,
     ):
         self._files = files_by_dataset_id or {}
         self._base_url = base_url
         self._raises = raises
         self._raise_first = raise_first
         self._fail_ids = fail_ids
+        self.supports_file_search = supports_file_search
         self.queries: list[FacetQuery] = []
         self.calls = 0
 
@@ -127,6 +129,24 @@ def test_one_search_per_version_stores_files_and_access(repository):
     assert result.files_stored == 2
     assert not result.failed
     assert {q.dataset_id for q in client.queries} == {(a.id,), (b.id,)}
+
+
+def test_client_that_cannot_file_search_is_skipped(repository):
+    # A ranked, mixed-dialect list: an ESGF-NG client (no file search) leads a real
+    # ESGF1 one.  add_files must skip the NG client, not call it, and let ESGF1 serve.
+    a = _rec("a")
+    _store_versions(repository, [a])
+    ng = _FakeClient(
+        base_url="https://search.east.esgf.io/search", supports_file_search=False
+    )
+    esgf1 = _FakeClient({a.id: [_file("f", a.id, "a.nc")]})
+
+    result = add_files([a], clients=[ng, esgf1], repository=repository)
+
+    assert ng.calls == 0  # the NG client was skipped, never searched
+    assert esgf1.calls == 1
+    assert result.files_stored == 1
+    assert not result.failed
 
 
 def test_replicas_of_a_file_collapse_to_one_file_many_accesses(repository):
