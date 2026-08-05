@@ -951,3 +951,125 @@ Integration complete — all 6 phases done
 ├───────┼────────────────────────────────────────┼─────────────────────────────────────────────────┤
 │ 6     │ Docs + west validation                 │ west resolves & handles empty catalog           │
 └───────┴────────────────────────────────────────┴─────────────────────────────────────────────────┘
+Note from Gregory use case
+
+I found and fixed a real bug along the way
+
+The ng models were initially failing (falsely "no parent"). Root cause: in the walk, _read_headers accumulates one representative per simulation into a mixed ng+esgf-1 batch, and add_files_auto used all-or-nothing dialect detection — so a single esgf-1 record routed the whole batch to the esgf-1 file search, starving the ng records of their assets transform → no files → no header → "no parent." (UC1 never hit this — its batch was pure ng.)
+
+Fix (add_files_auto now partitions by dialect): assets-transform the STAC records, file-search the rest, combine results. Plus a supports_file_search capability so add_files skips an ng client in a ranked list instead of crashing on it (UnsupportedOnBackend isn't an ESGFResponseError, so it was previously uncaught). Both changes tested; mypy strict + ruff clean, 367 tests, 95% coverage.
+
+One residual, fully diagnosed (not a bug)
+
+HadGEM3 abrupt-2xCO2/0p5xCO2 (CFMIP) still showed "no parent." The files transformed and stored fine; the concurrent header read hit a transient NetCDF: Unknown file format under 12 workers. I verified the files serve valid HDF5 and, read single-threaded, they declare parent_experiment_id=piControl. The reason it wasn't recovered: esgf-ng east publishes only one href per file (no alternate replica populated yet), so a transient read has no fallback mirror — unlike esgf-1's many nodes. Mitigations: retry, lower concurrency, or wait for east to populate alternate assets.
+
+---
+Net: the ng-preferred Gregory hop works end-to-end, plus a genuine cross-dialect walk bug is fixed and committed to the test suite. Want me to (a) re-run just the CFMIP variants to confirm they resolve on retry, (b) commit these fixes, or (c) stop here?
+ # Maybe want to make sure if parent isn't found in esgf-ng can fall back to other esgf-1
+
+ ### DAY 5 (31/7)
+CMIP-Integration day
+Questions:
+-  What should the single "common vocabulary" the high-level class speaks actually be? This is the root decision — it determines whether translation is even needed and where it lives. → We think number 1, having a common vocabulary. We still have not decided if the common vocabulary would be for CMIP6 or CMIP7, and we have to be aware that even between CMIP6/7 there are differences (such as no table_id). CMIP5 is the large odd one out. REgardless of the common vocabulary, we will want to save the raw json file to retain the MIP-specifiic facets
+- Which era's names anchor the canonical vocabulary? Remember this only really matters for the divergent fields (table_id vs branding_suffix, plus CMIP7-only fields); the stable majority are identical across 6 and 7 either way. → We will do cmip6 anchored, however that may change if cmip7 data becomes live.
+- How should MIP-era vocabulary translation relate to the existing Flavour/SearchBackend seam (ESGF1 Solr vs ESGF-NG STAC)? → Fold era into Flavour (orthogonal to ESGF-integration)
+- Given the era-aware backend is the unit, where does the era come from when that backend is constructed (since the endpoint URL can't tell you)?
+
+❯ 1. User supplies mip_era per search
+     The script/high-level query states the era (e.g. mip_era='CMIP5'). The backend is built from transport dialect (auto-detected from the endpoint URL, as today) + era (given by the user). This keeps the endpoint->dialect detection you already have, and adds era as an explicit user input. In practice: transport auto-detected, era user-declared, the two combined into the concrete backend.
+
+ 1. raw_json now, promote on demand
+     Keep ONE shared schema with the CMIP6-anchored canonical columns. Add a single mip_era discriminator column to Dataset/DatasetVersion. Any era-specific facet with no canonical column (branding_suffix, region, temporal_label, CMIP5 oddities) lives only in the always-retained raw_json for now; promote a facet to a real indexed column later, only if a use case needs to filter/join on it. Matches your 'retain raw JSON' principle and adds the least schema surface now.
+     - We will go with number 1, with a question with how to implement: Does it make more sense to just store the raw information in a raw_json column, or is it better to link each dataset
+     to a MIP-era specific table (e.g. each CMIP5 dataset has a link to a row in a CMIP5 specific table, and the CMIP5 specific metadata is stored in that table instead and can be looked
+     up as needed)? Also probably important context for claude: we're going to end up with 1000s, maybe 10 000 or 100 000 dataset entries. Will this raw_json storage idea scale to that
+     size?
+
+
+Real numbers from your biggest cache (uc1_full_ranked.sqlite, 562 datasets):
+
+- raw_json averages 2.9 KB per node-location row (max 3.4 KB), totaling 4 MB — only ~8% of the 48 MB database.
+- The size is dominated by fileaccess (61,687 rows) and file (10,150), not raw JSON.
+- Crucially, raw_json already lives in the DatasetNodeSpecificInfo side table, not on the hot Dataset/DatasetVersion tables you filter and scan on.
+
+Scaling answer: Yes, it scales. At ~2.5 node-locations/dataset, 100,000 datasets → ~250k location rows × 2.9 KB ≈ ~725 MB of raw JSON, inside a total DB of roughly 8–9 GB (driven mostly by fileaccess, ~11M rows). SQLite is completely comfortable here (its hard limit is ~281 TB; multi-GB is routine). And because the blob is already isolated in a side table, scans over your canonical facet columns never pay for it — the classic "keep BLOBs out of the hot table" pattern is already in place.
+
+So your two ideas aren't either/or — they're complementary, and both are partly already true:
+
+- The raw blob already sits in a side table (DatasetNodeSpecificInfo) you only join to when you actually need it. Keep it there; no change needed.
+- Promoting an era-specific facet to something queryable is the open sub-decision.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Promotion target
+
+When an era-specific facet needs to become queryable (promoted out of raw_json), where should the promoted columns live?
+
+❯ 1. Per-era 1:1 side table
+     Your instinct: a dedicated table per era (e.g. Cmip7VersionExtra) keyed 1:1 to DatasetVersion.instance_id, holding that era's promoted fields; joined only when needed. Keeps DatasetVersion era-agnostic and lean (no cross-era NULL columns), isolates each era's schema, and scales cleanly. Raw blob stays in the existing DatasetNodeSpecificInfo side table. Promote lazily, only when a use case filters on the field.
+
+Now the branch the prompt foregrounds: parent handling across eras. What I found on how the eras actually differ:
+
+- CMIP6 (today): search records carry no parent info → you read netCDF file headers to get parent_experiment_id/parent_variant_label/etc., then search for the parent. This machinery exists and works.
+- CMIP7: parent_* are global attributes and CMIP7 retains them (parent_experiment_id, parent_variant_label, parent_source_id, branch_time_in_parent, plus new parent_mip_era). The open hope from query.py is that ESGF-NG's STAC search response surfaces them in properties — so you'd skip header reads. Unverifiable until data is live.
+- CMIP5: parent attributes (parent_experiment_id, parent_experiment_rip, branch_time) do exist in file headers but are notoriously inconsistent/often "N/A" — so automation is unreliable and you flagged it may need to be user-specified. (Genuine verify-item; I'm not asserting it's always absent.)
+
+You already have two of the three needed mechanisms: the header-read path (CMIP6) and the user-declared chain / known-fixes override path (from parent_walk.py / the fixes-table plan).
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Parent strategy
+
+How should parent resolution handle the era differences? The three sources are: (a) parent_* already on the search record, (b) file-header read, (c) user-declared chain / known-fixes override.
+
+❯ 1. Per-era resolver with fallback chain
+     A pluggable ParentResolver selected by era, trying an ordered chain: (1) parent_* on the search record -> (2) file-header read -> (3) user-declared/known-fixes override. Each era enables/orders the layers it needs: CMIP6 = header (+override); CMIP7 = record-first, header fallback (+override) so it's robust whether or not STAC surfaces parent_*; CMIP5 = user-declared/override primary, with an optional best-effort header attempt. Reuses the existing header + fixes machinery; confines era differences to config; degrades gracefully under the CMIP7/CMIP5 uncertainties.
+
+
+Now the user-facing entry point — the "one high-level class using a common vocabulary" from your query.py note. Today FacetQuery is the neutral vocabulary, but its field names are CMIP6 (variable_id, source_id, …) and it hardcodes project="CMIP6". Since we folded era into the backend and the user supplies mip_era, the translation of canonical→era-native facet names happens at request-build time inside the era-aware backend.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Query carrier
+
+What carries the user's canonical (CMIP6-vocab) query, and where does mip_era attach?
+
+❯ 1. Reuse FacetQuery + add mip_era
+     Keep FacetQuery as the single canonical carrier (user always writes CMIP6-vocab facets). Add an explicit mip_era field (and stop hardcoding project='CMIP6' — derive project from mip_era). The era-aware backend translates canonical facet NAMES to era-native params at page_request time and back at parse time; extra_facets handles anything unmapped. Minimal new surface: FacetQuery already IS the neutral vocabulary.
+
+- User answered Claude's questions:
+· Should the canonical layer translate facet VALUES across eras, or only facet NAMES (with the user supplying era-native values)? → Names only; values era-native
+i.e. never translate rcp45 into ssp245. User will always specifies.
+
+### Week 3 ###
+
+## DAY 1 (3/8)
+
+NOTES
+
+Read through production
+- Ask about pull requests
+- Make update to data model (add table_id as processing_id)
+- IMportantn for CMIP5 and CMIp6
+- If read through all production then can branch off of my branch and  implement the search - just to search API
+-  Important then ask claude to look through and see if it can find any dataset duplicates if excluding id column
+
+- CMIP5 playgroudn
+  - implement CMIP5 - include table_id, populate grid as 'gn'
+  - Despite this being meaningless for CMIP5
+  - Then start to download
+  - Will need to think about nodes, parallelisation, connections, workers... etc
+
+
+## DAY 2 (Tuesday 4th August)
+
+We will retain the table_id column, and for grid, can you please populate it with 'gn'. We do not want a null in a column. Additionally, how would you recommend filling master_id for cmip5? Will we have to manually create a master_id that fits with the CMIP6 drs?
+
+### Day 3
+Our repository currently handles searches for CMIP6 data via the ESGF-1 (and ESGF-NG) API. We want to implement a strategy to be able to search for CMIP5 and CMIP7 data (for MIP-equivalent searches as for our successful CMIP6 use cases).
+
+Our repository is currently set up specifically for CMIP6, with CMIP6-specific language down to the schema.py level (with default project defined as 'CMIP6'). In schema.py, after querying an ESGF API, the main dataset is populated with columns using CMIP6 specific language. For example, in CMIP6 we have source_id, which is called 'model' in CMIP5. The CMIP5 directory structure is found here (https://pcmdi.llnl.gov/mips/cmip5/docs/cmip5_data_reference_syntax.pdf) and CMIP6 directory structure is found here (https://wcrp-cmip.github.io/WGCM_Infrastructure_Panel/Papers/CMIP6_global_attributes_filenames_CVs_v6.2.7.pdf). The CMIP7 global attributes structure is here https://wcrp-cmip.github.io/cmip7-guidance/docs/CMIP7/Global_Attributes. There are still some uncertainties around CMIP7 because no data is yet published.  Look at the guidance pages ([https://wcrp-cmip.github.io/cmip7-guidance](https://wcrp-cmip.github.io/cmip7-guidance)) and the links therein to find more information about the CMIP7 structure.
+
+One challenge with integrating the workflow across MIP-generations is how we handle parent information (as we successfully do with the CMIP6 search). CMIP7 global attrs may include parent information (meaning we may not need to load headers), and CMIP5 may need to be user-specified (potentially not included in global attributes - although we would need to verify this, whether there is a way to automate parent searches.
+
+In our search tool, to be able to integrate across CMIP5, 6, and 7, we wonder if the best way to implement this would be to have one high level class which uses a common vocabulary, then just translates out into the specific vocabulary expected by MIP era (with this also having to talk to ESGF-1 and ESGF-NG). How would you recommend we approach this now that our CMIP6 workflow is successful. You may see query.py under TO DOs, which has some notes about ESGF1/NG integration, and MIP-era integration, which may be useful as a starting point with some of our additional questions.
+
+Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
+Ask the questions one at a time, waiting for feedback on each question before continuing. Asking multiple questions at once is bewildering.
+If a fact can be found by exploring the codebase, look it up rather than asking me. The decisions, though, are mine — put each one to me and wait for my answer.
+Write a plan based on the outcome of this process.
+Do not enact the plan.
