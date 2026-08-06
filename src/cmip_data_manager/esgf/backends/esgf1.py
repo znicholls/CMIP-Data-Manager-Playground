@@ -26,6 +26,7 @@ from cmip_data_manager.esgf.backends.base import (
     Flavour,
     Page,
 )
+from cmip_data_manager.esgf.eras import CMIP6_PROFILE, EraProfile
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.query import FacetQuery
 
@@ -33,6 +34,14 @@ from cmip_data_manager.esgf.query import FacetQuery
 class Esgf1Backend:
     """
     esg-search / Solr dialect (the default backend)
+
+    The backend carries an `EraProfile` (default `CMIP6_PROFILE`, the identity
+    translation).  It is the one place the MIP era's facet **names** are applied:
+    outbound param keys are renamed to the era's native names (`source_id` → `model`
+    for CMIP5) and the raw response document is renamed back to canonical names before
+    it becomes a `DatasetRecord`, with the original document retained verbatim as
+    `raw`.  With the default CMIP6 profile every rename is the identity, so behaviour
+    is unchanged.
 
     Examples
     --------
@@ -58,6 +67,16 @@ class Esgf1Backend:
     supports_file_search: bool = True
     """Solr searches files by a `type=File` query — file search is supported."""
 
+    def __init__(self, era: EraProfile = CMIP6_PROFILE) -> None:
+        """Build the backend, optionally for a non-CMIP6 era."""
+        self.era = era
+
+    def _native_params(
+        self, query: FacetQuery, *, offset: int, limit: int
+    ) -> dict[str, str]:
+        """Render `query` to params and rename facet keys to the era's native names."""
+        return self.era.to_native_params(query.to_params(offset=offset, limit=limit))
+
     def start_cursor(self) -> Cursor:
         """Return the first-page offset (`0`)."""
         return 0
@@ -67,7 +86,7 @@ class Esgf1Backend:
     ) -> tuple[str, dict[str, str]]:
         """Render the page at `offset=cursor` as `(base_url, esg-search params)`."""
         offset = _as_offset(cursor)
-        return base_url, query.to_params(offset=offset, limit=page_size)
+        return base_url, self._native_params(query, offset=offset, limit=page_size)
 
     def parse_page(
         self, payload: dict[str, Any], *, cursor: Cursor, max_results: int
@@ -96,19 +115,41 @@ class Esgf1Backend:
             raise ESGFResponseError(msg)
         return Page(docs=docs, num_found=num_found, next_cursor=next_offset)
 
+    def expand_dataset_doc(
+        self, doc: dict[str, Any], requested_variables: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """
+        Expand one Solr dataset document into one document per requested variable
+
+        Identity for a single-variable era (CMIP6); for CMIP5's table-grained datasets
+        it projects the document onto the requested variables (see `EraProfile.expand`),
+        so `parse_dataset` always receives a single-variable document.
+        """
+        return self.era.expand(doc, requested_variables)
+
     def parse_dataset(self, doc: dict[str, Any]) -> DatasetRecord:
-        """Build a `DatasetRecord` from a raw Solr dataset document."""
-        return DatasetRecord.from_solr(doc)
+        """
+        Build a `DatasetRecord` from a raw Solr dataset document
+
+        Era-native keys are renamed to canonical names so `from_solr` reads them, while
+        `raw` is restored to the **original** document so no era-specific facet is lost.
+        """
+        record = DatasetRecord.from_solr(self.era.to_canonical_doc(doc))
+        record = record.model_copy(update={"raw": doc, "mip_era": self.era.mip_era})
+        if self.era.reconstruct is not None:
+            record = self.era.reconstruct(record)
+        return record
 
     def parse_file(self, doc: dict[str, Any]) -> FileRecord:
-        """Build a `FileRecord` from a raw Solr file document."""
-        return FileRecord.from_solr(doc)
+        """Build a `FileRecord` from a Solr file document (era keys canonicalised)."""
+        record = FileRecord.from_solr(self.era.to_canonical_doc(doc))
+        return record.model_copy(update={"raw": doc})
 
     def count_request(
         self, base_url: str, query: FacetQuery
     ) -> tuple[str, dict[str, str]]:
         """Render a count-only request (`limit=0`, read `numFound`)."""
-        return base_url, query.to_params(offset=0, limit=0)
+        return base_url, self._native_params(query, offset=0, limit=0)
 
     def parse_count(self, payload: dict[str, Any]) -> int:
         """Read `numFound` from a count-request payload."""
@@ -117,14 +158,14 @@ class Esgf1Backend:
     def facets_request(
         self, base_url: str, query: FacetQuery, facet_field: str
     ) -> tuple[str, dict[str, str]]:
-        """Render a facet-enumeration request for `facet_field`."""
-        params = dict(query.to_params(offset=0, limit=0))
-        params["facets"] = facet_field
+        """Render a facet-enumeration request for `facet_field` (renamed per era)."""
+        params = self._native_params(query, offset=0, limit=0)
+        params["facets"] = self.era.native_facet(facet_field)
         return base_url, params
 
     def parse_facets(self, payload: dict[str, Any], facet_field: str) -> dict[str, int]:
-        """Parse the Solr `facet_counts` block for `facet_field`."""
-        return _facet_values(payload, facet_field)
+        """Parse the Solr `facet_counts` block for `facet_field` (era-native key)."""
+        return _facet_values(payload, self.era.native_facet(facet_field))
 
 
 def _as_offset(cursor: Cursor) -> int:

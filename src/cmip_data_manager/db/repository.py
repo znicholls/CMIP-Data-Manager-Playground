@@ -35,6 +35,7 @@ from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
 from cmip_data_manager.db.schema import (
+    Cmip5VersionExtra,
     DataNodeHealthStat,
     Dataset,
     DatasetChange,
@@ -47,8 +48,10 @@ from cmip_data_manager.db.schema import (
     IndexNodeHealthStat,
     RunMembership,
     SearchRun,
-    parse_version_date,
+    version_ordinal,
 )
+from cmip_data_manager.esgf.cmip5 import cmip5_extra_fields
+from cmip_data_manager.esgf.eras import get_profile
 from cmip_data_manager.esgf.headers import (
     HTTP_SERVICE,
     HeaderMetadata,
@@ -61,6 +64,7 @@ from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 # QUESTION: Is this an area that we may need to specify
 # shared/re-written facets for project/esgf integration?
 _DATASET_FACETS = (
+    "mip_era",
     "project",
     "source_id",
     "institution_id",
@@ -106,6 +110,27 @@ class RunResult:
     def has_changes(self) -> bool:
         """Whether the run added, removed or modified anything."""
         return bool(self.added or self.removed or self.modified)
+
+
+@dataclass(frozen=True)
+class DisambiguationChoice:
+    """
+    Datasets that share a reconstructed base id but differ by an extra facet
+
+    Some eras have facets outside the canonical `Dataset` columns that can make two
+    otherwise-identical datasets distinct (CMIP5 `product`: `output1` vs `output2`).
+    Those collide on one reconstructed base id and are disambiguated with a `.N` suffix.
+    This groups the variants so a caller can see what differs and pick which to use
+    (`Repository.cmip5_distinguishing_conflicts`).
+    """
+
+    base_master_id: str
+    """The shared, suffix-free base master id (e.g. `CMIP5.…atmos`)."""
+
+    options: list[tuple[str, str]]
+    """`(distinguishing_json, master_id)` pairs, sorted, e.g.
+    `[('{"product": "output1"}', 'CMIP5.…atmos'),
+    ('{"product": "output2"}', 'CMIP5.…atmos.1')]`.  Always has at least two entries."""
 
 
 @dataclass(frozen=True)
@@ -217,13 +242,17 @@ class Repository:
             Summary of the run, including added/removed/modified version ids.
         """
         spec_json = json.dumps(spec, sort_keys=True)
-        # master_id -> instance_id (version) -> the records on each data node
-        structure: dict[str, dict[str, list[DatasetRecord]]] = {}
-        for record in records:
-            versions = structure.setdefault(record.master_key, {})
-            versions.setdefault(record.instance_key, []).append(record)
 
         with Session(self._engine) as session:
+            # Apply any era-specific collision suffix (CMIP5 product) *before* grouping,
+            # so datasets that differ only by a distinguishing facet don't collapse.
+            records = _disambiguate_records(session, records)
+            # master_id -> instance_id (version) -> the records on each data node
+            structure: dict[str, dict[str, list[DatasetRecord]]] = {}
+            for record in records:
+                versions = structure.setdefault(record.master_key, {})
+                versions.setdefault(record.instance_key, []).append(record)
+
             run = SearchRun(
                 endpoint_url=endpoint_url,
                 spec_json=spec_json,
@@ -343,6 +372,48 @@ class Repository:
             for row in session.exec(select(DataNodeHealthStat)).all():
                 health.restore(_stat_from_row(row))
         return health
+
+    def cmip5_distinguishing_conflicts(self) -> list[DisambiguationChoice]:
+        """
+        Find CMIP5 datasets sharing a base id but split by an extra facet
+
+        Groups the CMIP5 side-table rows by `base_master_id` and returns only the groups
+        with **more than one** distinct `distinguishing_json` — the cases where the
+        reconstructed `master_id` was disambiguated with a `.N` suffix and a user must
+        choose (e.g. `product` `output1` vs `output2`).  Each option's concrete
+        `master_id` is the owning version's `dataset_key`, so the caller sees exactly
+        which key each choice maps to.
+
+        Returns
+        -------
+        :
+            One `DisambiguationChoice` per conflicted simulation, ordered by
+            `base_master_id`; empty when no CMIP5 collisions exist.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(
+                select(
+                    Cmip5VersionExtra.base_master_id,
+                    Cmip5VersionExtra.distinguishing_json,
+                    DatasetVersion.dataset_key,
+                )
+                .join(
+                    DatasetVersion,
+                    col(DatasetVersion.instance_id)
+                    == col(Cmip5VersionExtra.version_key),
+                )
+                .where(col(Cmip5VersionExtra.base_master_id).is_not(None))
+            ).all()
+        by_base: dict[str, dict[str, str]] = {}
+        for base, distinguishing, master_id in rows:
+            if base is None or distinguishing is None:
+                continue
+            by_base.setdefault(base, {})[distinguishing] = master_id
+        return [
+            DisambiguationChoice(base_master_id=base, options=sorted(options.items()))
+            for base, options in sorted(by_base.items())
+            if len(options) > 1
+        ]
 
     def rank_nodes_by_reliability(self) -> list[DataNodeHealthStat]:
         """
@@ -1074,7 +1145,8 @@ class Repository:
         stored = 0
         with Session(self._engine) as session:
             for version_key, records in files_by_version.items():
-                if session.get(DatasetVersion, version_key) is None:
+                version = session.get(DatasetVersion, version_key)
+                if version is None:
                     continue
                 by_filename: dict[str, list[FileRecord]] = {}
                 for record in records:
@@ -1082,6 +1154,11 @@ class Repository:
                 for filename, frecs in by_filename.items():
                     self._upsert_file(session, version_key, filename, frecs)
                     stored += 1
+                # Correct the file count to what was actually found for THIS version.
+                # For CMIP5 the Step-1 count is the whole-table total (~57); the
+                # variable-scoped Step-2 search narrows it to this variable's files.
+                version.number_of_files = len(by_filename)
+                session.add(version)
             session.commit()
         return stored
 
@@ -1181,8 +1258,9 @@ class Repository:
     ) -> None:
         """Upsert one dataset version (validating its version string is a date)."""
         version = _version_of(records[0])
-        parse_version_date(version)  # raises ValueError on a non-date version
+        version_ordinal(version)  # raises ValueError on a non-numeric version
         columns = {
+            "mip_era": records[0].mip_era,
             "version": version,
             "is_latest": records[0].latest,
             "size": records[0].size,
@@ -1199,10 +1277,29 @@ class Repository:
                     **columns,
                 )
             )
+        else:
+            for key, value in columns.items():
+                setattr(existing, key, value)
+            existing.last_seen_run_id = run_id
+            session.add(existing)
+        if records[0].mip_era == "CMIP5":
+            self._upsert_cmip5_extra(session, version_id, records[0])
+
+    def _upsert_cmip5_extra(
+        self, session: Session, version_id: str, record: DatasetRecord
+    ) -> None:
+        """Upsert the CMIP5-only side row (base id, native ids, realm, what differs)."""
+        fields = cmip5_extra_fields(record)
+        profile = get_profile("CMIP5")
+        fields["distinguishing_json"] = _distinguishing_json(
+            record.raw, profile.distinguishing_facets
+        )
+        existing = session.get(Cmip5VersionExtra, version_id)
+        if existing is None:
+            session.add(Cmip5VersionExtra(version_key=version_id, **fields))
             return
-        for key, value in columns.items():
+        for key, value in fields.items():
             setattr(existing, key, value)
-        existing.last_seen_run_id = run_id
         session.add(existing)
 
     def _upsert_location(
@@ -1235,6 +1332,109 @@ class Repository:
             setattr(existing, key, value)
         existing.last_seen_run_id = run_id
         session.add(existing)
+
+
+def _distinguishing_json(raw: Mapping[str, Any], facets: tuple[str, ...]) -> str | None:
+    """
+    Render an era's distinguishing facet values from a raw doc as canonical JSON
+
+    Returns `None` when the era declares no distinguishing facets (the CMIP6 case), so
+    disambiguation never runs.  Otherwise a stable, sorted-key JSON string of
+    `{facet: value}` (each value the sole entry of the raw list), which serves as both
+    the collision key and the human-facing "what differs" record.
+    """
+    if not facets:
+        return None
+    values: dict[str, str | None] = {}
+    for facet in facets:
+        value = raw.get(facet)
+        if isinstance(value, list):
+            values[facet] = None if not value else str(value[0])
+        else:
+            values[facet] = None if value is None else str(value)
+    return json.dumps(values, sort_keys=True)
+
+
+class _Disambiguator:
+    """
+    Assigns a stable `.N` collision suffix per `(base_master_id, distinguishing_json)`
+
+    Seeds each base's assignments from what is already stored (so re-runs are stable),
+    then hands the first-seen variant the bare id (`""`) and each new variant the next
+    ordinal.  Encounter-order, not a fixed priority: first seen keeps the bare id.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._assigned: dict[str, dict[str, str]] = {}
+
+    def resolve(self, base_master_id: str, distinguishing_json: str) -> str:
+        """Return the suffix (`""`, `".1"`, …) for this base + distinguishing value."""
+        assigned = self._assigned.get(base_master_id)
+        if assigned is None:
+            assigned = self._load(base_master_id)
+            self._assigned[base_master_id] = assigned
+        if distinguishing_json in assigned:
+            return assigned[distinguishing_json]
+        suffix = "" if not assigned else f".{len(assigned)}"
+        assigned[distinguishing_json] = suffix
+        return suffix
+
+    def _load(self, base_master_id: str) -> dict[str, str]:
+        """Load `{distinguishing_json: suffix}` already persisted for this base."""
+        rows = self._session.exec(
+            select(Cmip5VersionExtra.distinguishing_json, DatasetVersion.dataset_key)
+            .join(
+                DatasetVersion,
+                col(DatasetVersion.instance_id) == col(Cmip5VersionExtra.version_key),
+            )
+            .where(col(Cmip5VersionExtra.base_master_id) == base_master_id)
+        ).all()
+        assigned: dict[str, str] = {}
+        for distinguishing, master_id in rows:
+            if distinguishing is None:
+                continue
+            # The suffix is whatever the stored master id carries beyond the base.
+            assigned[distinguishing] = master_id[len(base_master_id) :]
+        return assigned
+
+
+def _disambiguate_records(
+    session: Session, records: list[DatasetRecord]
+) -> list[DatasetRecord]:
+    """
+    Apply era collision suffixes to records before they are grouped into datasets
+
+    For each record whose era declares `distinguishing_facets`, the record's `master_id`
+    (set by reconstruction to the suffix-free base) and `instance_id` gain the resolved
+    `.N` suffix, so two datasets identical on their columns but differing by e.g.
+    `product` stay distinct.  Records of eras without distinguishing facets (CMIP6) pass
+    through untouched.
+    """
+    disambiguator = _Disambiguator(session)
+    out: list[DatasetRecord] = []
+    for record in records:
+        era = get_profile(record.mip_era) if record.mip_era else None
+        base = record.master_id
+        if era is None or not era.distinguishing_facets or base is None:
+            out.append(record)
+            continue
+        distinguishing = _distinguishing_json(record.raw, era.distinguishing_facets)
+        if distinguishing is None:
+            out.append(record)
+            continue
+        suffix = disambiguator.resolve(base, distinguishing)
+        if not suffix:
+            out.append(record)
+            continue
+        master_id = base + suffix
+        instance_id = f"{master_id}.{record.version}" if record.version else master_id
+        out.append(
+            record.model_copy(
+                update={"master_id": master_id, "instance_id": instance_id}
+            )
+        )
+    return out
 
 
 def _version_of(record: DatasetRecord) -> str:

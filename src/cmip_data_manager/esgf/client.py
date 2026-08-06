@@ -224,9 +224,16 @@ class ESGFSearchClient:
         Returns
         -------
         :
-            All matching datasets, across every page.
+            All matching datasets, across every page.  For a table-grained era (CMIP5)
+            each document is expanded into one record per requested variable before
+            parsing (see `SearchBackend.expand_dataset_doc`); single-variable eras are
+            unaffected.
         """
-        return [self._backend.parse_dataset(doc) for doc in self._iter_docs(query)]
+        return [
+            self._backend.parse_dataset(sub)
+            for doc in self._iter_docs(query)
+            for sub in self._backend.expand_dataset_doc(doc, query.variable_id)
+        ]
 
     def search_files(self, query: FacetQuery) -> list[FileRecord]:
         """

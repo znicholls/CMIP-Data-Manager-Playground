@@ -144,6 +144,17 @@ class SearchBackend(Protocol):
         """Parse a page payload into a `Page`, guarding against unsafe pagination."""
         ...
 
+    def expand_dataset_doc(
+        self, doc: dict[str, Any], requested_variables: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """Expand one raw dataset document into one document per requested variable.
+
+        Identity for single-variable eras (CMIP6, ESGF-NG); for CMIP5's table-grained
+        datasets it projects a many-variable table document onto the requested variables
+        so `parse_dataset` always receives a single-variable document.
+        """
+        ...
+
     def parse_dataset(self, doc: dict[str, Any]) -> DatasetRecord:
         """Turn one raw dataset document into a `DatasetRecord`."""
         ...

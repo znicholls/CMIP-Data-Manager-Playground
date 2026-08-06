@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from cmip_data_manager.db.schema import parse_version_date
+from cmip_data_manager.db.schema import version_ordinal
 from cmip_data_manager.esgf.models import DatasetRecord
 
 VersionSelection = str | Mapping[str, str]
@@ -32,11 +32,11 @@ VersionSelection = str | Mapping[str, str]
 
 def latest_version(versions: Sequence[str]) -> str | None:
     """
-    Return the newest version string by date, or `None` if none is date-parseable
+    Return the newest version string by ordinal, or `None` if none is numeric
 
-    "Newest" is decided by `parse_version_date` (CMIP6 versions are `vYYYYMMDD`
-    dates), so it is robust to a mixed `v` prefix — unlike a plain string sort.
-    Versions that do not parse as a date are ignored.
+    "Newest" is decided by `version_ordinal` (versions are `[v]YYYYMMDD` dates or, for
+    some CMIP5 datasets, plain integers), so it is robust to a mixed `v` prefix and to
+    integer versions — unlike a plain string sort.  Non-numeric versions are ignored.
 
     Parameters
     ----------
@@ -46,24 +46,26 @@ def latest_version(versions: Sequence[str]) -> str | None:
     Returns
     -------
     :
-        The version with the latest date, or `None` if no candidate parses.
+        The version with the highest ordinal, or `None` if no candidate is numeric.
 
     Examples
     --------
     >>> latest_version(["v20200225", "20221112", "v20191115"])
     '20221112'
+    >>> latest_version(["1", "2", "10"])
+    '10'
     >>> latest_version(["not-a-date"]) is None
     True
     """
-    dated: list[tuple[object, str]] = []
+    ordinals: list[tuple[int, str]] = []
     for version in versions:
         try:
-            dated.append((parse_version_date(version), version))
+            ordinals.append((version_ordinal(version), version))
         except ValueError:
             continue
-    if not dated:
+    if not ordinals:
         return None
-    return max(dated, key=lambda pair: pair[0])[1]  # type: ignore[arg-type,return-value]
+    return max(ordinals, key=lambda pair: pair[0])[1]
 
 
 def select_target_versions(

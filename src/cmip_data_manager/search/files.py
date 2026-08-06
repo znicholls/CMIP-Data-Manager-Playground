@@ -55,6 +55,7 @@ from cmip_data_manager.esgf.client import (
     ESGFSearchClient,
 )
 from cmip_data_manager.esgf.concurrency import MapFn, serial_map
+from cmip_data_manager.esgf.eras import get_profile
 from cmip_data_manager.esgf.index_health import (
     IndexNodeHealth,
     SearchOutcome,
@@ -82,8 +83,23 @@ _OK = "ok"
 _FAILED = "failed"
 _OVERFLOW = "overflow"
 
-_Todo = tuple[str, tuple[str, ...]]
-"""One unit of work: a version key and the node-specific dataset ids to search by."""
+_Todo = tuple[str, tuple[str, ...], tuple[str, ...]]
+"""One unit of work: a version key, the node-specific dataset ids to search by, and a
+variable filter (a single `variable_id` for a table-grained era like CMIP5, else empty).
+
+The variable filter is what makes a CMIP5 file search variable-scoped: a CMIP5
+`dataset_id` is *table*-grained (its files span every variable in the table), so the
+search must add `variable_id` to return only this version's variable's files.  For
+single-variable eras (CMIP6) the filter is empty and the search is unchanged."""
+
+
+def _variable_filter(record: DatasetRecord) -> tuple[str, ...]:
+    """Return a record's file-search variable filter (empty unless table-grained)."""
+    if record.mip_era is None or record.variable_id is None:
+        return ()
+    if not get_profile(record.mip_era).multi_variable:
+        return ()
+    return (record.variable_id,)
 
 
 @dataclass(frozen=True)
@@ -220,8 +236,10 @@ def add_files(  # noqa: PLR0913 - a DI seam; every parameter has a default
     health = repository.load_index_health() if health is None else health
 
     ids_by_version: dict[str, list[str]] = defaultdict(list)
+    variable_by_version: dict[str, tuple[str, ...]] = {}
     for record in records:
         ids_by_version[record.instance_key].append(record.id)
+        variable_by_version[record.instance_key] = _variable_filter(record)
 
     todo: list[_Todo] = []
     skipped = 0
@@ -229,7 +247,7 @@ def add_files(  # noqa: PLR0913 - a DI seam; every parameter has a default
         if skip_cached and repository.version_has_files(version_key):
             skipped += 1
             continue
-        todo.append((version_key, tuple(ids)))
+        todo.append((version_key, tuple(ids), variable_by_version[version_key]))
 
     write_lock = Lock()
     files_stored = 0
@@ -271,7 +289,7 @@ def add_files(  # noqa: PLR0913 - a DI seam; every parameter has a default
         skipped_cached=skipped,
         files_stored=files_stored,
         overflowed=overflowed,
-        failed=[version_key for version_key, _ in remaining],
+        failed=[version_key for version_key, _, _ in remaining],
     )
     if result.failed and raise_on_incomplete:
         raise FileSearchIncompleteError(result, [client.base_url for client in clients])
@@ -328,14 +346,18 @@ def _worker(  # noqa: PLR0913 - a bound closure builder; all args are internal
     endpoint = client.base_url
 
     def run(item: _Todo) -> _Outcome:
-        version_key, dataset_ids = item
+        version_key, dataset_ids, variable_filter = item
         attempts: list[FileSearchAttempt] = []
         try:
             files, status = _search_with_backoff(
                 client,
                 endpoint,
                 version_key,
-                FacetQuery(type="File", dataset_id=dataset_ids),
+                FacetQuery(
+                    type="File",
+                    dataset_id=dataset_ids,
+                    variable_id=variable_filter,
+                ),
                 health,
                 attempts,
                 retries=retries,

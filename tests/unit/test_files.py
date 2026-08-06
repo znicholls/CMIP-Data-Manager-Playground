@@ -6,12 +6,43 @@ import httpx
 import pytest
 
 from cmip_data_manager.esgf.client import DeepPaginationError
+from cmip_data_manager.esgf.cmip5 import reconstruct_ids
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.query import FacetQuery
 from cmip_data_manager.search.files import (
     FileSearchIncompleteError,
     add_files,
 )
+
+_C5_NATIVE = "cmip5.output1.INST.M.rcp45.mon.atmos.Amon.r1i1p1"
+
+
+def _cmip5_rec(variable, *, node="esgf.nci.org.au", version="20120101"):
+    """A reconstructed CMIP5 record; its id is the native (table-grained) dataset id."""
+    raw = {
+        "id": f"{_C5_NATIVE}.v{version}|{node}",
+        "product": ["output1"],
+        "realm": ["atmos"],
+        "master_id": [_C5_NATIVE],
+        "instance_id": [f"{_C5_NATIVE}.v{version}"],
+    }
+    rec = DatasetRecord(
+        id=raw["id"],
+        project="CMIP5",
+        mip_era="CMIP5",
+        source_id="M",
+        institution_id="INST",
+        experiment_id="rcp45",
+        variant_label="r1i1p1",
+        variable_id=variable,
+        frequency="mon",
+        table_id="Amon",
+        version=version,
+        data_node=node,
+        raw=raw,
+    )
+    return reconstruct_ids(rec)
+
 
 _V = "v20240101"
 WEST = "https://metagrid.esgf-west.org/proxy/search"
@@ -129,6 +160,28 @@ def test_one_search_per_version_stores_files_and_access(repository):
     assert result.files_stored == 2
     assert not result.failed
     assert {q.dataset_id for q in client.queries} == {(a.id,), (b.id,)}
+    # No era set -> no variable filter (CMIP6/legacy behaviour is unchanged).
+    assert all(q.variable_id == () for q in client.queries)
+
+
+def test_cmip5_file_search_is_variable_scoped(repository):
+    # A CMIP5 dataset_id is table-grained (all variables); the file search must add the
+    # variable so only this version's variable's files come back.
+    tas = _cmip5_rec("tas")
+    _store_versions(repository, [tas])
+    table_id = tas.id  # native table id, carries no variable
+    client = _FakeClient({table_id: [_file("f", table_id, "tas_Amon_M_rcp45.nc")]})
+
+    result = add_files([tas], clients=[client], repository=repository)
+
+    assert len(client.queries) == 1
+    query = client.queries[0]
+    assert query.dataset_id == (table_id,)  # searched by the native table id...
+    assert query.variable_id == ("tas",)  # ...narrowed to this variable
+    assert result.files_stored == 1
+    # number_of_files is corrected to the variable-scoped count, not the table total.
+    records = repository.get_dataset_records("uc")
+    assert records[0].number_of_files == 1
 
 
 def test_client_that_cannot_file_search_is_skipped(repository):

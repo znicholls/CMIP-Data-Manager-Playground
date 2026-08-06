@@ -21,6 +21,7 @@ from cmip_data_manager.esgf.backends import (
 )
 from cmip_data_manager.esgf.client import ESGFSearchClient
 from cmip_data_manager.esgf.concurrency import MapFn, RetryPolicy, no_retry, serial_map
+from cmip_data_manager.esgf.eras import get_profile
 
 
 def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
@@ -31,6 +32,7 @@ def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
     backend: SearchBackend | None = None,
     flavour_overrides: Mapping[str, Flavour] | None = None,
     detection_cache: DetectionCache | None = None,
+    mip_era: str = "CMIP6",
 ) -> ESGFSearchClient:
     """
     Build a search client from settings, resolving the dialect from the endpoint
@@ -53,6 +55,7 @@ def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
 
     backend
         Force a specific backend, bypassing detection (e.g. a pre-tuned NG backend).
+        When given, `mip_era` is ignored (the caller's backend carries its own era).
 
     flavour_overrides
         Optional `{url_or_host: Flavour}` map that pins an endpoint's dialect, winning
@@ -61,10 +64,15 @@ def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
     detection_cache
         Shared detection memo, so an endpoint is probed at most once across calls.
 
+    mip_era
+        The MIP era to bind to the backend (`"CMIP6"` default, `"CMIP5"`, …), selecting
+        the facet-name vocabulary.  A transport-and-era mismatch (e.g. CMIP5 on an
+        ESGF-NG endpoint) raises `UnsupportedOnBackend`.
+
     Returns
     -------
     :
-        A configured client whose backend matches its endpoint's dialect.
+        A configured client whose backend matches its endpoint's dialect and era.
     """
     settings = settings or Settings()
     resolved = (
@@ -75,6 +83,7 @@ def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
             overrides=flavour_overrides,
             cache=detection_cache,
             probe_timeout=settings.timeout,
+            era=get_profile(mip_era),
         )
     )
     return ESGFSearchClient(
@@ -88,13 +97,14 @@ def build_client(  # noqa: PLR0913 - a DI seam; every parameter has a default
     )
 
 
-def build_file_search_clients(
+def build_file_search_clients(  # noqa: PLR0913 - a DI seam; every parameter has a default
     endpoints: Sequence[str] = DEFAULT_INDEX_ENDPOINTS,
     *,
     settings: Settings | None = None,
     map_fn: MapFn = serial_map,
     flavour_overrides: Mapping[str, Flavour] | None = None,
     detection_cache: DetectionCache | None = None,
+    mip_era: str = "CMIP6",
 ) -> list[ESGFSearchClient]:
     """
     Build one search client per endpoint, in preference order, for Step 2
@@ -130,6 +140,10 @@ def build_file_search_clients(
         Shared detection memo; a fresh one (shared across these endpoints) is used when
         omitted.
 
+    mip_era
+        The MIP era to bind to every endpoint's backend (`"CMIP6"` default), selecting
+        the facet-name vocabulary for the file search.
+
     Returns
     -------
     :
@@ -137,6 +151,7 @@ def build_file_search_clients(
     """
     settings = settings or Settings()
     cache = detection_cache if detection_cache is not None else DetectionCache()
+    era = get_profile(mip_era)
     return [
         ESGFSearchClient(
             endpoint,
@@ -145,6 +160,7 @@ def build_file_search_clients(
                 overrides=flavour_overrides,
                 cache=cache,
                 probe_timeout=settings.timeout,
+                era=era,
             ),
             retry=no_retry,
             map_fn=map_fn,

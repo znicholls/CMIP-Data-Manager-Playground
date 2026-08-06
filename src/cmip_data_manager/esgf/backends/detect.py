@@ -23,10 +23,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from cmip_data_manager.esgf.backends.base import Flavour, SearchBackend
+from cmip_data_manager.esgf.backends.base import (
+    Flavour,
+    SearchBackend,
+    UnsupportedOnBackend,
+)
 from cmip_data_manager.esgf.backends.esgf1 import Esgf1Backend
 from cmip_data_manager.esgf.backends.esgf_ng import EsgfNgBackend
 from cmip_data_manager.esgf.concurrency import Fetch, httpx_fetch
+from cmip_data_manager.esgf.eras import CMIP6_PROFILE, EraProfile
 
 _KNOWN_HOSTS: dict[str, Flavour] = {
     # ESGF1 (esg-search / Solr) — the current ranked file-search endpoints.
@@ -161,37 +166,50 @@ def _is_stac_root(payload: object) -> bool:
     )
 
 
-def backend_for(flavour: Flavour) -> SearchBackend:
+def backend_for(flavour: Flavour, *, era: EraProfile = CMIP6_PROFILE) -> SearchBackend:
     """
-    Build the `SearchBackend` for a resolved `Flavour`
+    Build the `SearchBackend` for a resolved `Flavour` and MIP era
 
     Parameters
     ----------
     flavour
         The dialect an endpoint speaks.
 
+    era
+        The MIP-era profile to bind to the backend (defaults to `CMIP6_PROFILE`).  Only
+        the ESGF1 backend is era-aware; the ESGF-NG backends take their collection from
+        the query's `project`.
+
     Returns
     -------
     :
-        A backend instance: `Esgf1Backend` for ESGF1, an `EsgfNgBackend` tuned for the
-        east/west deployment otherwise (west lower-cases collection ids).
+        A backend instance: an era-aware `Esgf1Backend` for ESGF1, an `EsgfNgBackend`
+        tuned for the east/west deployment otherwise (west lower-cases collection ids).
+
+    Raises
+    ------
+    UnsupportedOnBackend
+        If `flavour` is not one the era can be served over (e.g. CMIP5 on ESGF-NG).
     """
+    if flavour not in era.supported_flavours:
+        raise UnsupportedOnBackend(f"mip_era={era.mip_era}", flavour)
     if flavour is Flavour.ESGF1:
-        return Esgf1Backend()
+        return Esgf1Backend(era=era)
     if flavour is Flavour.ESGF_NG_WEST:
         return EsgfNgBackend(flavour=flavour, lowercase_collection=True)
     return EsgfNgBackend(flavour=Flavour.ESGF_NG_EAST)
 
 
-def resolve_backend(
+def resolve_backend(  # noqa: PLR0913 - a DI seam; every parameter has a default
     base_url: str,
     *,
     overrides: Mapping[str, Flavour] | None = None,
     fetch: Fetch | None = None,
     cache: DetectionCache | None = None,
     probe_timeout: float = DEFAULT_PROBE_TIMEOUT,
+    era: EraProfile = CMIP6_PROFILE,
 ) -> SearchBackend:
-    """Resolve an endpoint's dialect and return a ready `SearchBackend` for it."""
+    """Resolve an endpoint's dialect and return a ready `SearchBackend` for `era`."""
     flavour = detect_flavour(
         base_url,
         overrides=overrides,
@@ -199,4 +217,4 @@ def resolve_backend(
         cache=cache,
         probe_timeout=probe_timeout,
     )
-    return backend_for(flavour)
+    return backend_for(flavour, era=era)

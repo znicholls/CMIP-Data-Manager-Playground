@@ -95,6 +95,50 @@ def parse_version_date(version: str) -> date:
     return datetime.strptime(text, "%Y%m%d").replace(tzinfo=timezone.utc).date()
 
 
+def version_ordinal(version: str) -> int:
+    """
+    Parse a dataset version string into a sortable integer, for chronological ordering
+
+    Versions are published as digit strings with an optional leading `v`: a `YYYYMMDD`
+    date (CMIP6, most of CMIP5) **or** a plain incrementing integer (some CMIP5, e.g.
+    `"1"`).  Both are ordered correctly by their integer value — `20120510` sorts after
+    `20110101`, and a plain `1` sorts before any date — so this is the version validator
+    and the "latest version" sort key.  It is looser than `parse_version_date` (it does
+    not require a valid calendar date), which is what lets CMIP5's integer versions
+    through; anything non-numeric still raises.
+
+    Parameters
+    ----------
+    version
+        The version string to parse (optionally `v`-prefixed).
+
+    Returns
+    -------
+    :
+        The version as an integer ordinal.
+
+    Raises
+    ------
+    ValueError
+        If `version` is not `[v]` followed by digits.
+
+    Examples
+    --------
+    >>> version_ordinal("v20191115")
+    20191115
+    >>> version_ordinal("1")
+    1
+    """
+    text = version[1:] if version[:1].lower() == "v" else version
+    if not text.isdigit():
+        msg = (
+            f"version {version!r} is not numeric; expected a [v]YYYYMMDD date or an "
+            f"integer version"
+        )
+        raise ValueError(msg)
+    return int(text)
+
+
 class SearchRun(SQLModel, table=True):
     """
     One execution of a search against the index node
@@ -157,6 +201,10 @@ class Dataset(SQLModel, table=True):
     master_id: str = Field(primary_key=True)
     """Version- and node-independent identifier (the primary key)."""
 
+    mip_era: str | None = Field(default=None, index=True)
+    """The MIP era discriminator (`"CMIP5"`, `"CMIP6"`); indexed so any use case can
+    filter by era.  Distinct from `project` (an ESGF-NG collection may differ)."""
+
     project: str | None = None
     source_id: str | None = Field(default=None, index=True)
     institution_id: str | None = None
@@ -193,6 +241,10 @@ class DatasetVersion(SQLModel, table=True):
 
     dataset_key: str = Field(foreign_key="dataset.master_id", index=True)
     """Foreign key to the owning `Dataset.master_id`."""
+
+    mip_era: str | None = Field(default=None, index=True)
+    """The MIP era discriminator, mirrored from the owning `Dataset` for
+    version-scoped era filtering."""
 
     version: str
     """The version string (e.g. `"v20191115"`); validated parseable to a date."""
@@ -270,6 +322,49 @@ class DatasetNodeSpecificInfo(SQLModel, table=True):
     last_seen_run_id: int | None = Field(default=None, foreign_key="searchrun.id")
 
     version: DatasetVersion | None = Relationship(back_populates="locations")
+
+
+class Cmip5VersionExtra(SQLModel, table=True):
+    """
+    CMIP5-only facets promoted from raw JSON, one row per CMIP5 `DatasetVersion`
+
+    A per-era 1:1 side table (the pattern from `design/multi-mip-era-search-plan.md`
+    §6): the canonical `Dataset`/`DatasetVersion` stay era-agnostic, and CMIP5's extra
+    facets that have no canonical column live here, keyed on the version's id.  Only
+    written for `mip_era == "CMIP5"`.
+
+    Two jobs.  **Provenance:** it keeps the native CMIP5-DRS ids (which are *table*-
+    grained — no variable — because a CMIP5 dataset holds many variables) and the
+    `realm` that was folded into `grid_label`.  **Disambiguation:** `base_master_id` is
+    the reconstructed master id *without* any collision suffix, while
+    `distinguishing_json` records the facet(s) that split this version (`product`).
+    Grouping by `base_master_id` and reading each row's `distinguishing_json` is how the
+    repository both assigns the `.N` suffix at write time and surfaces the user's choice
+    (see `Repository.cmip5_distinguishing_conflicts`) — no mapping table needed.
+    """
+
+    version_key: str = Field(foreign_key="datasetversion.instance_id", primary_key=True)
+    """Foreign key to the owning `DatasetVersion.instance_id` (1:1)."""
+
+    base_master_id: str | None = Field(default=None, index=True)
+    """The reconstructed `master_id` **without** any collision suffix; groups the
+    variants (e.g. products) of one simulation so a `.N` suffix can be assigned and the
+    choice surfaced."""
+
+    distinguishing_json: str | None = None
+    """JSON `{facet: value}` of the facet(s), outside the `Dataset` columns, that made
+    this version distinct from a same-`base_master_id` sibling (e.g.
+    `{"product": "output2"}`).  Generic, so a future era's facet needs no new column."""
+
+    realm: str | None = None
+    """The CMIP5 `realm` (`atmos`/`ocean`/…); folded into `grid_label` in the id."""
+
+    native_master_id: str | None = None
+    """The raw CMIP5-DRS `master_id` (table-grained, no variable), for provenance."""
+
+    native_dataset_id: str | None = None
+    """The raw CMIP5-DRS `instance_id` (table-grained, versioned), for provenance and to
+    drive the variable-filtered Step-2 file search."""
 
 
 class File(SQLModel, table=True):

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SOLR_JSON_FORMAT = "application/solr+json"
 """Value of the `format` parameter that makes the proxy return Solr JSON."""
@@ -129,12 +129,42 @@ class FacetQuery(BaseModel):
     ...     "experiment_id"
     ... ]
     'ssp245,historical'
+
+    The MIP era selects the vocabulary; unless `project` is set explicitly it is
+    derived from `mip_era` (so a CMIP5 search sends `project=CMIP5`):
+
+    >>> FacetQuery(mip_era="CMIP5").to_params(0, 10)["project"]
+    'CMIP5'
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    mip_era: str = "CMIP6"
+    """
+    The MIP era whose vocabulary this query is written against (`"CMIP5"`,
+    `"CMIP6"`).
+
+    The era-aware backend uses it to translate canonical (CMIP6) facet *names* to the
+    era's native names.  When `project` is not set explicitly it defaults to this
+    value, so a caller states the era once.  Facet *values* stay era-native — the era
+    is never used to cross-walk values (`rcp45` is never rewritten to `ssp245`).
+    """
+
     project: str = "CMIP6"
-    """Project facet (AND-ed with everything else)."""
+    """
+    Project facet (AND-ed with everything else).
+
+    Defaults to `mip_era` when not set explicitly.  Set it directly only to select a
+    non-era collection on ESGF-NG (e.g. `"CORDEX-CMIP6"`).
+    """
+
+    @model_validator(mode="after")
+    def _default_project_from_era(self) -> FacetQuery:
+        """Derive `project` from `mip_era` when the caller did not set it explicitly."""
+        fields_set = self.model_fields_set
+        if "project" not in fields_set and "mip_era" in fields_set:
+            object.__setattr__(self, "project", self.mip_era)
+        return self
 
     type: str = "Dataset"
     """Record type to search for: `"Dataset"` or `"File"`."""

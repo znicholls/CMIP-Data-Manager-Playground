@@ -140,6 +140,12 @@ class EsgfNgBackend:
         next_cursor = _next_token(payload) if features else None
         return Page(docs=features, num_found=num_found, next_cursor=next_cursor)
 
+    def expand_dataset_doc(
+        self, doc: dict[str, Any], requested_variables: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """Identity: an ESGF-NG (STAC) item is already a single-variable dataset."""
+        return [doc]
+
     def parse_dataset(self, doc: dict[str, Any]) -> DatasetRecord:
         """Turn one STAC feature into a `DatasetRecord` (raw kept verbatim)."""
         return DatasetRecord.from_stac(doc)

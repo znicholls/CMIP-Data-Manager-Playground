@@ -1073,3 +1073,6 @@ Ask the questions one at a time, waiting for feedback on each question before co
 If a fact can be found by exploring the codebase, look it up rather than asking me. The decisions, though, are mine — put each one to me and wait for my answer.
 Write a plan based on the outcome of this process.
 Do not enact the plan.
+
+Please re-create the master_id in dataset for cmip5 based on all of the columns in dataset. This is now the id (key) used to link across other table for each unique dataset. For cmip5specifictable, we will need to include an 'id' column as the primary key to link to the unique dataset, then the master_id (or dataset_id) columns will be native to cmip5 (i.e the one that doesn't include variables, etc).
+Additionally, please instead of being deterministic for outputs (products) please just add the .1,.2.3 if outputs differ for otherwise unique datasets. We will want this to be as flexible as possible so that if there end up being other facets in cmip5/6/7 that may mean a dataset is not unique despite our dataset columns, then we will have definitions and provide users with a choice rather than this being specific to outputs. However, my question for you is, will this method work given there is the model that has .1 in the name? bcc____.1 ?

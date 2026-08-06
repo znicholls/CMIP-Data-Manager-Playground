@@ -5,6 +5,16 @@ This mirrors `ESGFSearchClient` but uses `asyncio`, which is the natural fit whe
 many queries should be in flight at once.  Concurrency is bounded by a semaphore,
 and the transport is injected as an `AsyncFetch` so tests (and alternative HTTP
 stacks) need not touch the network.
+
+**ESGF1 / CMIP6 only — not MIP-era aware.**  This client predates the
+`SearchBackend` seam and bypasses it: it builds requests with `FacetQuery.to_params`
+directly (so it emits **canonical CMIP6 facet names**, never renaming `source_id` →
+`model` etc.) and parses with `DatasetRecord.from_solr` directly (so it does **no**
+CMIP5 doc-expansion, name-canonicalisation or id reconstruction).  Pointed at CMIP5 it
+would send wrong facet names and raise `AmbiguousFieldError` on a multi-variable table
+doc.  Use the synchronous `ESGFSearchClient` (which routes everything through an
+era-aware backend) for anything other than CMIP6; migrating this client onto the
+backend seam is a separate, deferred task.
 """
 
 from __future__ import annotations

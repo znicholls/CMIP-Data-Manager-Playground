@@ -68,3 +68,26 @@ def test_as_spec_round_trip():
     spec = query.as_spec()
     assert spec["variable_id"] == ("tas",)
     assert spec["experiment_id"] == ("ssp245",)
+
+
+def test_mip_era_defaults_project():
+    # Stating the era once sets the project facet.
+    assert FacetQuery(mip_era="CMIP5").to_params(0, 10)["project"] == "CMIP5"
+    # Default era is CMIP6, unchanged.
+    assert FacetQuery().to_params(0, 10)["project"] == "CMIP6"
+
+
+def test_explicit_project_wins_over_era():
+    # An explicit project (e.g. an ESGF-NG collection) is never overridden by mip_era.
+    query = FacetQuery(project="CORDEX-CMIP6", mip_era="CMIP6")
+    assert query.to_params(0, 10)["project"] == "CORDEX-CMIP6"
+
+
+def test_cmip6_spec_identity_unchanged_by_era_field():
+    # A default-era CMIP6 query must not gain new keys in its diff-series spec.
+    spec = FacetQuery(variable_id=("tas",)).as_spec()
+    assert "mip_era" not in spec
+    assert "project" not in spec
+    # A CMIP5 query's era is part of its identity.
+    cmip5_spec = FacetQuery(variable_id=("tas",), mip_era="CMIP5").as_spec()
+    assert cmip5_spec["mip_era"] == "CMIP5"

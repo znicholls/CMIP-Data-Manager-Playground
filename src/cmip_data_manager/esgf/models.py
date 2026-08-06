@@ -108,6 +108,13 @@ class DatasetRecord(BaseModel):
     instance_id: str | None = None
     """Version-specific, node-independent identifier."""
 
+    mip_era: str | None = None
+    """
+    The MIP era this record was searched under (`"CMIP5"`, `"CMIP6"`), stamped by the
+    era-aware backend.  Distinct from `project`: for an ESGF-NG collection the two
+    differ (`project="CORDEX-CMIP6"`, `mip_era="CMIP6"`).
+    """
+
     project: str | None = None
     source_id: str | None = None
     institution_id: str | None = None

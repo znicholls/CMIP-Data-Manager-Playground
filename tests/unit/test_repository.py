@@ -3,12 +3,45 @@
 from __future__ import annotations
 
 import pytest
+from sqlmodel import Session, select
 
 from cmip_data_manager.db.repository import FileSearchAttempt, HeaderAttempt
+from cmip_data_manager.db.schema import Cmip5VersionExtra
+from cmip_data_manager.esgf.cmip5 import reconstruct_ids
 from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
 from cmip_data_manager.esgf.models import DatasetRecord
 
 _V = "v20240101"
+
+
+_C5_NATIVE = "cmip5.output1.INST.M.rcp45.mon.atmos.Amon.r1i1p1"
+
+
+def _cmip5_rec(product, *, node="node1.org", version="20120101"):
+    """A reconstructed CMIP5 record (as the era-aware backend would hand it in)."""
+    raw = {
+        "id": f"{_C5_NATIVE}.v{version}|{node}",
+        "product": [product],
+        "realm": ["atmos"],
+        "master_id": [_C5_NATIVE],
+        "instance_id": [f"{_C5_NATIVE}.v{version}"],
+    }
+    rec = DatasetRecord(
+        id=raw["id"],
+        project="CMIP5",
+        mip_era="CMIP5",
+        source_id="M",
+        institution_id="INST",
+        experiment_id="rcp45",
+        variant_label="r1i1p1",
+        variable_id="tas",
+        frequency="mon",
+        table_id="Amon",
+        version=version,
+        data_node=node,
+        raw=raw,
+    )
+    return reconstruct_ids(rec)
 
 
 def _inst(master, version=_V):
@@ -26,6 +59,7 @@ def _rec(  # noqa: PLR0913 - a test builder; every field has a default
     variant="r1",
     experiment="ssp245",
     variable="tas",
+    mip_era=None,
 ):
     """Build a node-specific record for dataset `master` at `version`, on `node`."""
     instance = f"{master}.{version}"
@@ -35,6 +69,7 @@ def _rec(  # noqa: PLR0913 - a test builder; every field has a default
         instance_id=instance,
         master_id=master,
         version=version,
+        mip_era=mip_era,
         data_node=node,
         source_id=source_id,
         variant_label=variant,
@@ -91,6 +126,92 @@ def test_replicas_collapse_to_one_dataset_with_many_locations(repository):
     assert {r.node_key for r in records} == {"nci", "llnl"}  # both nodes reconstructed
 
 
+def test_mip_era_persists_and_round_trips(repository):
+    # The era discriminator survives a store -> reconstruct cycle at the record grain.
+    repository.record_run(
+        [_rec("a", mip_era="CMIP5"), _rec("b", mip_era="CMIP6")],
+        endpoint_url="u",
+        spec={},
+        tag="uc",
+    )
+    records = repository.get_dataset_records("uc")
+    eras = {r.master_key: r.mip_era for r in records}
+    assert eras == {"a": "CMIP5", "b": "CMIP6"}
+
+
+def test_cmip5_extra_row_is_stored_with_base_realm_and_native_ids(repository):
+    rec = _cmip5_rec("output1")
+    repository.record_run([rec], endpoint_url="u", spec={}, tag="uc")
+    with Session(repository._engine) as session:
+        extras = session.exec(select(Cmip5VersionExtra)).all()
+    assert len(extras) == 1
+    extra = extras[0]
+    assert extra.version_key == rec.instance_id  # output1 seen first -> no suffix
+    assert extra.base_master_id == rec.master_id
+    assert extra.distinguishing_json == '{"product": "output1"}'
+    assert extra.realm == "atmos"
+    assert extra.native_master_id == _C5_NATIVE  # table-grained, no variable
+    assert extra.native_dataset_id == f"{_C5_NATIVE}.v20120101"
+
+
+def test_product_collision_gets_suffix_and_is_surfaced(repository):
+    base_rec = _cmip5_rec("output1")
+    repository.record_run(
+        [base_rec, _cmip5_rec("output2")],
+        endpoint_url="u",
+        spec={},
+        tag="uc",
+    )
+    # output1 (first seen) keeps the bare master id; output2 gets .1.
+    records = repository.get_dataset_records("uc")
+    masters = sorted(r.master_key for r in records)
+    assert masters == [base_rec.master_id, base_rec.master_id + ".1"]
+
+    choices = repository.cmip5_distinguishing_conflicts()
+    assert len(choices) == 1
+    choice = choices[0]
+    assert choice.base_master_id == base_rec.master_id
+    assert choice.options == [
+        ('{"product": "output1"}', base_rec.master_id),
+        ('{"product": "output2"}', base_rec.master_id + ".1"),
+    ]
+
+
+def test_product_suffix_is_stable_across_runs(repository):
+    repository.record_run(
+        [_cmip5_rec("output1"), _cmip5_rec("output2")],
+        endpoint_url="u",
+        spec={},
+        tag="uc",
+    )
+    # A later run that sees output2 first must NOT rekey it to the bare id.
+    repository.record_run(
+        [_cmip5_rec("output2"), _cmip5_rec("output1")],
+        endpoint_url="u",
+        spec={},
+        tag="uc",
+    )
+    with Session(repository._engine) as session:
+        rows = session.exec(
+            select(Cmip5VersionExtra.distinguishing_json, Cmip5VersionExtra.version_key)
+        ).all()
+    by_product = {d: v for d, v in rows}
+    assert by_product['{"product": "output1"}'].endswith("atmos.v20120101")
+    assert by_product['{"product": "output2"}'].endswith("atmos.1.v20120101")
+
+
+def test_single_product_is_not_a_conflict(repository):
+    repository.record_run([_cmip5_rec("output1")], endpoint_url="u", spec={}, tag="uc")
+    assert repository.cmip5_distinguishing_conflicts() == []
+
+
+def test_cmip6_records_create_no_cmip5_extra(repository):
+    repository.record_run([_rec("a")], endpoint_url="u", spec={}, tag="uc")
+    with Session(repository._engine) as session:
+        assert session.exec(select(Cmip5VersionExtra)).all() == []
+    assert repository.cmip5_distinguishing_conflicts() == []
+
+
 def test_versions_of_one_dataset_are_one_master_many_versions(repository):
     # Two versions of the same dataset: one master, two DatasetVersion rows.
     result = repository.record_run(
@@ -106,11 +227,18 @@ def test_versions_of_one_dataset_are_one_master_many_versions(repository):
     assert {r.version for r in records} == {"v20240101", "v20240202"}  # two versions
 
 
-def test_non_date_version_is_rejected(repository):
-    with pytest.raises(ValueError, match="does not match format"):
+def test_non_numeric_version_is_rejected(repository):
+    with pytest.raises(ValueError, match="is not numeric"):
         repository.record_run(
             [_rec("a", version="not-a-date")], endpoint_url="u", spec={}, tag="uc"
         )
+
+
+def test_integer_version_is_accepted(repository):
+    # CMIP5 datasets sometimes carry a plain integer version (e.g. "1"), not a date.
+    repository.record_run([_rec("a", version="1")], endpoint_url="u", spec={}, tag="uc")
+    records = repository.get_dataset_records("uc")
+    assert [r.version for r in records] == ["1"]
 
 
 def test_diffing_is_keyed_on_spec_not_tag(repository):
