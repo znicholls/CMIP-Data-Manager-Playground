@@ -45,19 +45,18 @@ MIP_ERA = "CMIP5"
 ENDPOINT = ORNL_BASE_URL
 SETTINGS = Settings(base_url=ENDPOINT)
 
-VARIABLE = "ta"
-"""Air temperature on pressure levels (a real CMIP5 monthly variable)."""
+VARIABLE = "tas"
+"""Near-surface air temperature (a real CMIP5 monthly variable)."""
 
 EXPERIMENT = "rcp45"
 FREQUENCY = ("mon",)
 
-ENABLE_FILE_SEARCH = False
+ENABLE_FILE_SEARCH = True
 """Whether to run Step 2 (variable-scoped file search) after the index search.
 
-**Off by default:** the index search + product-collision report is the demonstration.
-Set to `True` to also resolve each per-variable version's files — for CMIP5 this
-searches by the native table `dataset_id` **plus** the variable, so only `ta`'s files
-come back (not the whole table), and `number_of_files` becomes per-variable."""
+Enabled here so the download step has `File`/`FileAccess` rows to fetch — for CMIP5
+this searches by the native table `dataset_id` **plus** the variable, so only `tas`'s
+files come back (not the whole table), and `number_of_files` becomes per-variable."""
 
 FILE_SEARCH_WORKERS = 8
 """Parallel per-version file searches in the Step-2 `add_files` pass (HTTP I/O)."""
@@ -80,7 +79,7 @@ def rcp45_ta() -> UseCase:
         experiment_id=(EXPERIMENT,),
     )
     return UseCase(
-        name="cmip5_rcp45_ta",
+        name="cmip5_rcp45_tas",
         build_queries=lambda _client: [query],
         aggregate=None,
         description="All monthly ta datasets for CMIP5 experiment rcp45.",

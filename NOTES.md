@@ -1076,3 +1076,66 @@ Do not enact the plan.
 
 Please re-create the master_id in dataset for cmip5 based on all of the columns in dataset. This is now the id (key) used to link across other table for each unique dataset. For cmip5specifictable, we will need to include an 'id' column as the primary key to link to the unique dataset, then the master_id (or dataset_id) columns will be native to cmip5 (i.e the one that doesn't include variables, etc).
 Additionally, please instead of being deterministic for outputs (products) please just add the .1,.2.3 if outputs differ for otherwise unique datasets. We will want this to be as flexible as possible so that if there end up being other facets in cmip5/6/7 that may mean a dataset is not unique despite our dataset columns, then we will have definitions and provide users with a choice rather than this being specific to outputs. However, my question for you is, will this method work given there is the model that has .1 in the name? bcc____.1 ?
+
+### Day 4 (Thursday 6th August)
+
+Successful CMIP5 integration
+- async (only for CMIp6 because of facet labels - not translated between source_id to model etc)
+- But not needed - workaround for alternate MIP-eras
+- CMIP5 versioning sometimes in date format, sometimes in v1, v2, etc. This is now factored in. assuming that if have v1 and vYYYMMDD, that the date version is newest
+  - Can we make that assumption?
+
+Have done successful live search for CMIP5 data
+- Not doing parents because unreliable and we know the workflow from CMIP6.
+
+Moving on to downloads.
+
+We have built up a repository that successfully searches for CMIP5 and CMIP6 data across ESGF1 and ESGF-NG. This search step incorporates multiple potential use-cases, including simple use-cases (such as ssp245, tas, monthly), where we only need to hit the index node and store data in our database, and more complex use cases, where a user provides child and parent information and we need to connect to data nodes to get header information (because parent metadata is not in global attributes, as it may be for CMIP7).
+
+We now want to move on to the next step in our process: downloading. In the search step, we store the file URLs (in fsspec format). We do this for every use case, and for any use-case with parent information required, we will have already connected to data nodes to access parent information. The data node connection parallelisation already written into the search step may act as a guide as we go to download data. As with the search step, we will want to store detailed information on all data node attempts, successes, reasons for failure, time taken etcs.
+
+Please write a detailed plan of how to implement downloading. When we get to a live run test, we will only download a few select models, as I will be downloading to my local machine.
+
+Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
+Ask the questions one at a time, waiting for feedback on each question before continuing. Asking multiple questions at once is bewildering.
+If a fact can be found by exploring the codebase, look it up rather than asking me. The decisions, though, are mine — put each one to me and wait for my answer.
+Write a plan based on the outcome of this process.
+Do not enact the plan.
+
+#### Answers in planning
+By "transport" I narrowly meant the concrete code path that, for a download-to-local run, pulls bytes off the ESGF data node and lands them as a file on disk — the chunking, resume, checksum, and throughput-timing loop. That's a different thing from what URL format we store and expose, which is what you're describing.
+
+Your framing actually splits the design cleanly into two layers:
+
+1. The stored/exposed handle = an fsspec-format URL. This is the thing that keeps both doors open: a user can either (a) pull it to their local machine, or (b) hand the same URL to xarray/fsspec and interact with the data remotely, Pangeo-style, without ever fully downloading. You already have the column for this — FileAccess.fsspec_url (schema.py:442) — though right now it just holds a plain https://... string (the schema author even left a note questioning whether it must be literally fsspec-prefixed, schema.py:440).
+2. This step = the local-download consumer of that handle. It's one of the two paths in (1). The remote-interaction path isn't built now, but nothing we do here should preclude it.
+
+So the decision I was actually reaching for is narrower: when the local-download path consumes that fsspec URL, do we drive the fetch through fsspec's own machinery, or treat the URL as a plain string and stream it ourselves? Both ultimately hit the same https:// endpoint on the data node.
+
+- fsspec-driven (fsspec.open(fsspec_url) / get_file): maximally consistent with the unified-handle philosophy and shares one code path with the future remote-interaction mode. Slightly less first-class control over resume-from-partial and per-byte throughput accounting.
+- Self-streamed (httpx with Range, like preflight._probe_chunk already does): full control over .part resume, on-the-fly checksum, and precise MB/s measurement — but it's a second, download-only code path alongside the fsspec handle.
+
+My recommendation: keep the stored handle fsspec-format either way (that's your abstraction for local-vs-remote), and for this local-download step drive the fetch through fsspec, wrapped in the existing dispatch/health/retry stack — because it keeps a single access abstraction for both modes, which is exactly the openness you want. We can still measure bytes/time around the copy and lean on fsspec's simplecache/block machinery for resume.
+
+Does that match how you're thinking about it — fsspec as the one handle for both modes, with local-download as the first consumer — or do you want the download path to be self-streamed httpx under the hood for tighter control?
+
+- fsspec as the handle, but self-stream with httpx underneath
+
+The interview is complete and the plan is written to design/download-step-plan.md (alongside your other design docs). I did not implement anything.
+
+What we decided, in order
+
+1. Input — download = the searched set (get_dataset_records(TAG)); narrow at search time, but keep an optional source_id/latest-only filter so search and download stay decoupled.
+2. Handle vs mechanism — fsspec-format URL stays the stored handle (keeps local-download and future remote/Pangeo access open); the local step self-streams with httpx underneath.
+3. Grain/engine — file-grain work unit; generalize dispatch_reads/_Scheduler over a hashable key (backward-compatible) and add a non-collapsing file-grain candidate builder; reuse AIMD/eviction/affinity.
+4. Timeouts — httpx-native in-thread, with the subprocess kill kept as a pluggable future option (flagged as an open risk, not designed out).
+5. Health — separate throughput-based DownloadNodeHealthStat; don't inherit header dead-verdicts; dead-verdicts session-scoped only, never persisted across restarts.
+6. Layout — DRS tree under a configurable DOWNLOAD_ROOT via an era-aware path_for seam.
+7. Resume/verify — .part + atomic rename, Range-resume, checksum-gated skip, next-mirror-on-corruption.
+8. Persistence — three new tables: DownloadAttempt, DownloadNodeHealthStat, FileDownload (1:1 side table).
+9. Concurrency — reuse AIMD with conservative, user-overridable defaults; global max_workers as the real throttle; expected to evolve on live data.
+10. Layering — Option A: I/O in esgf/download.py, orchestrator in search/download.py, tables in db/, config in scripts/.
+
+Two cross-cutting checks I verified against the code so the design holds across your whole matrix:
+- CMIP5 works via an era-aware path_for that reads Cmip5VersionExtra.native_dataset_id (the CMIP6-shaped columns are overloaded for CMIP5).
+- ESGF1 vs ESGF-NG — file URLs land identically (both emit url|mime|HTTPServer), but NG sets checksum_type=None with a multihash file:checksum, so verification must be multihash-aware. That's the only backend-specific accommodation.

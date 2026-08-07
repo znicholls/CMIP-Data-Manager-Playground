@@ -12,13 +12,14 @@ from cmip_data_manager.esgf.dispatch import (
     concurrency_limit,
     dispatch_reads,
 )
+from cmip_data_manager.esgf.download import DownloadBlocked, DownloadHostFault
 from cmip_data_manager.esgf.headers import (
     HeaderMetadata,
     HeaderReadBlocked,
     HeaderReadHostFault,
     HeaderReadTimeout,
 )
-from cmip_data_manager.esgf.routing import SimulationCandidates
+from cmip_data_manager.esgf.routing import FileCandidates, SimulationCandidates
 
 
 def _cand(sim, group, host_urls):
@@ -239,7 +240,7 @@ def test_dispatch_reads_returns_header_from_best_host():
     s1 = ("A", "ssp245", "r1")
     result = dispatch_reads({s1: _cand(s1, "A", _hosts("nci", "ornl"))}, _reader())
     assert isinstance(result, DispatchResult)
-    assert result.headers[s1].get("served_by") == "nci"
+    assert result.results[s1].get("served_by") == "nci"
     assert result.failed == []
 
 
@@ -249,7 +250,7 @@ def test_dispatch_reads_requeues_past_a_dead_host():
         {s1: _cand(s1, "A", _hosts("dead", "good"))},
         _reader(fail_hosts=frozenset({"dead"})),
     )
-    assert result.headers[s1].get("served_by") == "good"
+    assert result.results[s1].get("served_by") == "good"
     assert result.failed == []
 
 
@@ -259,7 +260,7 @@ def test_dispatch_reads_records_a_fully_failed_simulation():
         {s1: _cand(s1, "A", _hosts("dead"))},
         _reader(fail_hosts=frozenset({"dead"})),
     )
-    assert result.headers == {}
+    assert result.results == {}
     assert result.failed == [s1]
 
 
@@ -276,14 +277,14 @@ def test_dispatch_reads_spills_second_simulation_to_alternative_node():
         initial_concurrency=concurrency_limit(2, {"nci": 1}),
         pinned_hosts=frozenset({"nci"}),  # keep the cap at 1 for a deterministic spill
     )
-    assert result.headers[s1].get("served_by") == "nci"
-    assert result.headers[s2].get("served_by") == "ornl"
+    assert result.results[s1].get("served_by") == "nci"
+    assert result.results[s2].get("served_by") == "ornl"
 
 
 def test_dispatch_reads_fails_an_unservable_simulation():
     s1 = ("A", "ssp245", "r1")
     result = dispatch_reads({s1: _cand(s1, "A", {})}, _reader())
-    assert result.headers == {}
+    assert result.results == {}
     assert result.failed == [s1]
 
 
@@ -404,7 +405,7 @@ def test_dispatch_still_tries_a_hosts_other_urls_after_a_plain_failure():
 
     result = dispatch_reads({s1: cand}, reader)
 
-    assert result.headers[s1].get("ok") == "1"  # read the 2nd URL after the 1st refused
+    assert result.results[s1].get("ok") == "1"  # read the 2nd URL after the 1st refused
 
 
 def test_dispatch_reads_backs_off_and_requeues_on_block():
@@ -421,7 +422,7 @@ def test_dispatch_reads_backs_off_and_requeues_on_block():
         reader,
         initial_concurrency=concurrency_limit(4),
     )
-    assert result.headers[s1].get("served_by") == "good"  # requeued past the block
+    assert result.results[s1].get("served_by") == "good"  # requeued past the block
     assert result.learned["busy"][1] == 2  # cap halved from 4 by the block
 
 
@@ -431,3 +432,35 @@ def test_dispatch_reads_reports_learned_caps_for_touched_hosts():
         {s1: _cand(s1, "A", _hosts("nci"))}, _reader(), initial_concurrency=lambda h: 2
     )
     assert result.learned["nci"] == (1, 2)  # one read ran; cap unchanged at 2
+
+
+# --- grain- and error-agnostic generalization --------------------------------
+
+
+def test_dispatch_reads_drives_file_grain_with_download_errors():
+    # Prove the generalized dispatcher is indifferent to work-item grain and error
+    # taxonomy: int (File.id) keys, FileCandidates, and download exceptions passed as
+    # block_errors/fault_errors.  A DownloadBlocked on the best host must back it off
+    # and requeue to the next mirror, exactly as HeaderReadBlocked does.
+    candidates = {
+        1: FileCandidates(
+            key=1,
+            group="ACCESS",
+            hosts=("bad", "good"),
+            urls_by_host={"bad": ("https://bad/1.nc",), "good": ("https://good/1.nc",)},
+        ),
+    }
+
+    def reader(url: str) -> str:
+        if "bad" in url:
+            raise DownloadBlocked(url, "429")
+        return url  # the "downloaded" value for this file
+
+    result = dispatch_reads(
+        candidates,
+        reader,
+        block_errors=(DownloadBlocked,),
+        fault_errors=(DownloadHostFault,),
+    )
+    assert result.results[1] == "https://good/1.nc"  # backed off bad, succeeded on good
+    assert result.failed == []

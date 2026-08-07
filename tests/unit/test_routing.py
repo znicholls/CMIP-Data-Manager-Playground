@@ -6,6 +6,7 @@ from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.routing import (
     SimulationCandidates,
     build_candidates,
+    build_file_candidates,
     hosts_to_simulations,
     simulation_candidates,
     source_id_affinity,
@@ -151,3 +152,62 @@ def test_hosts_to_simulations_inverts_and_clusters_by_affinity():
 def test_hosts_to_simulations_omits_hosts_with_no_work():
     unservable = SimulationCandidates(("A", "ssp245", "r1"), "A", (), {})
     assert hosts_to_simulations({unservable.simulation: unservable}) == {}
+
+
+# --- file-grain download candidates ------------------------------------------
+
+
+def _http_only(file_id: str, host: str) -> FileRecord:
+    """A file mirrored only as http:// (so its https twin is synthesised)."""
+    url = f"http://{host}/{file_id}.nc|application/netcdf|HTTPServer"
+    return FileRecord(id=file_id, dataset_id="d1", urls=(url,), raw={})
+
+
+def test_build_file_candidates_ranks_hosts_preferred_first():
+    files = {9: _file("tas", "d1", "ornl", "nci")}  # one file mirrored on two hosts
+    cands = build_file_candidates(files, preferred_hosts=("nci",))
+    assert cands[9].hosts == ("nci", "ornl")
+    assert cands[9].urls_by_host["nci"] == ("https://nci/tas.nc",)
+    assert cands[9].urls_by_host["ornl"] == ("https://ornl/tas.nc",)
+
+
+def test_build_file_candidates_is_one_work_item_per_file_no_collapse():
+    # Unlike simulation candidates, files sharing a host are NOT collapsed: every file
+    # is its own download, so each becomes its own work item keeping its own URL.
+    files = {
+        1: _file("tas_2000", "d1", "nci"),
+        2: _file("tas_2001", "d1", "nci"),
+    }
+    cands = build_file_candidates(files)
+    assert set(cands) == {1, 2}
+    assert cands[1].urls_by_host["nci"] == ("https://nci/tas_2000.nc",)
+    assert cands[2].urls_by_host["nci"] == ("https://nci/tas_2001.nc",)
+
+
+def test_build_file_candidates_keeps_https_twin_and_http_original():
+    cands = build_file_candidates({5: _http_only("f5", "liu")})
+    # the https twin is ranked ahead of the http original, and BOTH are kept for this
+    # one file (there is no within-host collapse in the download view).
+    assert cands[5].urls_by_host["liu"] == ("https://liu/f5.nc", "http://liu/f5.nc")
+
+
+def test_build_file_candidates_applies_group_ignore_and_empty():
+    files = {
+        1: _file("tas", "d1", "nci", "ornl"),  # mirrored on two hosts
+        2: _file("pr", "d2", "ornl"),  # only mirror is ornl
+    }
+    cands = build_file_candidates(
+        files,
+        group_by_key={1: "ACCESS", 2: "MIROC"},
+        ignore_hosts=frozenset({"ornl"}),
+    )
+    assert cands[1].group == "ACCESS"
+    assert cands[1].hosts == ("nci",)  # ornl excluded
+    assert cands[2].group == "MIROC"
+    assert cands[2].hosts == ()  # its only mirror was ignored -> no candidate
+    assert cands[2].urls_by_host == {}
+
+
+def test_build_file_candidates_defaults_group_to_none():
+    cands = build_file_candidates({1: _file("tas", "d1", "nci")})
+    assert cands[1].group is None  # no group_by_key entry

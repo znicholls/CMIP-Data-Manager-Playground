@@ -7,7 +7,7 @@ Where `read_first_readable` reads *one* simulation independently, this schedules
 is **best-node assignment with spill**:
 
 - each simulation is assigned to its best candidate host (preferred → healthy →
-  HTTPS, as ranked in `SimulationCandidates.hosts`) that is currently **under its
+  HTTPS, as ranked in `NodeCandidates.hosts`) that is currently **under its
   cap** — so a preferred/fast node (e.g. NCI) gets first refusal up to its cap;
 - if that host is saturated, the simulation **spills** to its next-best host that
   has a free slot rather than idling a capable node — but waits (does not spill)
@@ -36,22 +36,71 @@ on a **thread** pool, never a process pool.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Any, Generic, Protocol, TypeVar
 
 from cmip_data_manager.esgf.headers import (
     HeaderMetadata,
     HeaderReadBlocked,
     HeaderReadHostFault,
     HeaderReadTimeout,
-    SimulationKey,
 )
-from cmip_data_manager.esgf.routing import SimulationCandidates
 
 HeaderReader = Callable[[str], HeaderMetadata]
 """Reads one file's header from a URL (typically wrapped with timeout/retry)."""
+
+
+class _OrderableKey(Protocol):
+    """A hashable, sortable work-item key (a `SimulationKey` tuple, a `File.id`)."""
+
+    def __hash__(self) -> int: ...
+    def __lt__(self, other: Any, /) -> bool: ...
+
+
+class NodeCandidates(Protocol):
+    """
+    The structural view of a work item the dispatcher needs
+
+    Just its ranked candidate hosts and, per host, the URLs to try.
+    `routing.SimulationCandidates` (one header per simulation, hosts collapsed to a
+    single representative file) and `routing.FileCandidates` (one download per file,
+    no collapse) both satisfy it, so the dispatcher is indifferent to which grain it
+    is driving.  The work-item *key* is the mapping key, never read off the candidate.
+    """
+
+    @property
+    def group(self) -> Hashable:
+        """The affinity tag used to cluster a node's queue."""
+        ...
+
+    @property
+    def hosts(self) -> tuple[str, ...]:
+        """The candidate hosts, best-first."""
+        ...
+
+    @property
+    def urls_by_host(self) -> Mapping[str, tuple[str, ...]]:
+        """Each host's URLs to try, best-first."""
+        ...
+
+
+WorkKey = TypeVar("WorkKey", bound=_OrderableKey)
+"""A work-item key: a `SimulationKey` for headers, a `File.id` for downloads."""
+
+Result = TypeVar("Result")
+"""What one successful read/download yields (a `HeaderMetadata`, a `DownloadInfo`)."""
+
+DEFAULT_BLOCK_ERRORS: tuple[type[OSError], ...] = (HeaderReadBlocked,)
+"""Exceptions the dispatcher treats as a node-level *block* (halve the host's cap)."""
+
+DEFAULT_FAULT_ERRORS: tuple[type[OSError], ...] = (
+    HeaderReadTimeout,
+    HeaderReadHostFault,
+)
+"""Exceptions treated as a node-level *fault* (skip the host's remaining URLs)."""
 
 # QUESTION: would this be user specific? e.g. if running on cmip-cruncher server
 # with 64 CPUs could have more workers?
@@ -128,14 +177,14 @@ def concurrency_limit(
 
 
 @dataclass(frozen=True)
-class DispatchResult:
+class DispatchResult(Generic[WorkKey, Result]):
     """Outcome of a `dispatch_reads` pass."""
 
-    headers: dict[SimulationKey, HeaderMetadata] = field(default_factory=dict)
-    """The header read for each simulation that succeeded."""
+    results: dict[WorkKey, Result] = field(default_factory=dict)
+    """The value read/downloaded for each work item that succeeded."""
 
-    failed: list[SimulationKey] = field(default_factory=list)
-    """Simulations whose every candidate host failed (or that had no candidate)."""
+    failed: list[WorkKey] = field(default_factory=list)
+    """Work items whose every candidate host failed (or that had no candidate)."""
 
     learned: dict[str, tuple[int, int]] = field(default_factory=dict)
     """Per touched host, the `(max_safe_concurrency, last_concurrency)` learned."""
@@ -161,7 +210,7 @@ class _Outcome(Enum):
     """Any other failure (stall, crash, refusal) — requeue, no concurrency change."""
 
 
-class _Scheduler:
+class _Scheduler(Generic[WorkKey]):
     """
     The pure, single-threaded scheduling + concurrency-control core
 
@@ -175,7 +224,7 @@ class _Scheduler:
 
     def __init__(  # noqa: PLR0913 - scheduling + AIMD knobs, all keyword from callers
         self,
-        candidates: Mapping[SimulationKey, SimulationCandidates],
+        candidates: Mapping[WorkKey, NodeCandidates],
         *,
         initial_concurrency: Callable[[str], int],
         max_workers: int,
@@ -194,8 +243,8 @@ class _Scheduler:
         self._evict_max_success_rate = evict_max_success_rate
         self._pinned = pinned_hosts
 
-        self._remaining: dict[SimulationKey, list[str]] = {}
-        self._status: dict[SimulationKey, _Status] = {}
+        self._remaining: dict[WorkKey, list[str]] = {}
+        self._status: dict[WorkKey, _Status] = {}
         self._in_flight: dict[str, int] = {}
         self._global_in_flight = 0
 
@@ -205,7 +254,7 @@ class _Scheduler:
         self._success_total: dict[str, int] = {}  # total successes (for evict rate)
         self._max_safe: dict[str, int] = {}
         self._evicted: set[str] = set()
-        self.failed: list[SimulationKey] = []
+        self.failed: list[WorkKey] = []
 
         for simulation in self._priority_order(candidates):
             hosts = list(candidates[simulation].hosts)
@@ -219,10 +268,10 @@ class _Scheduler:
 
     @staticmethod
     def _priority_order(
-        candidates: Mapping[SimulationKey, SimulationCandidates],
-    ) -> list[SimulationKey]:
+        candidates: Mapping[WorkKey, NodeCandidates],
+    ) -> list[WorkKey]:
         """Order simulations so shared-affinity ones are adjacent (deterministic)."""
-        buckets: dict[object, list[SimulationKey]] = {}
+        buckets: dict[object, list[WorkKey]] = {}
         for simulation in sorted(candidates):
             buckets.setdefault(candidates[simulation].group, []).append(simulation)
         return [simulation for group in buckets.values() for simulation in group]
@@ -235,7 +284,7 @@ class _Scheduler:
             self._limit[host] = max(1, min(self._ceiling, self._initial(host)))
         return self._limit[host]
 
-    def next_assignment(self) -> tuple[SimulationKey, str] | None:
+    def next_assignment(self) -> tuple[WorkKey, str] | None:
         """
         Return the next `(simulation, host)` to read, or `None` if none can start
 
@@ -257,7 +306,7 @@ class _Scheduler:
                     return (simulation, host)
         return None
 
-    def on_success(self, simulation: SimulationKey, host: str) -> None:
+    def on_success(self, simulation: WorkKey, host: str) -> None:
         """Mark a simulation done, free the slot, and grow the cap on a streak."""
         # Concurrency actually achieved (this read still counts as in flight).
         self._max_safe[host] = max(self._max_safe.get(host, 0), self._in_flight[host])
@@ -274,7 +323,7 @@ class _Scheduler:
                 self._limit[host] += 1
                 self._successes[host] = 0
 
-    def on_block(self, simulation: SimulationKey, host: str) -> None:
+    def on_block(self, simulation: WorkKey, host: str) -> None:
         """Back the node off (halve its cap), count the failure, and requeue."""
         self._release(host)
         if host not in self._pinned:
@@ -282,7 +331,7 @@ class _Scheduler:
         self._register_failure(host)
         self._requeue(simulation, host)
 
-    def on_failure(self, simulation: SimulationKey, host: str) -> None:
+    def on_failure(self, simulation: WorkKey, host: str) -> None:
         """Count a (non-block) failure, evict on a streak, and requeue."""
         self._release(host)
         self._register_failure(host)
@@ -300,7 +349,7 @@ class _Scheduler:
             if rate <= self._evict_max_success_rate:
                 self._evict(host)
 
-    def _requeue(self, simulation: SimulationKey, host: str) -> None:
+    def _requeue(self, simulation: WorkKey, host: str) -> None:
         if host in self._remaining[simulation]:
             self._remaining[simulation].remove(host)
         if self._remaining[simulation]:
@@ -336,8 +385,8 @@ class _Scheduler:
 
 
 def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
-    candidates: Mapping[SimulationKey, SimulationCandidates],
-    reader: HeaderReader,
+    candidates: Mapping[WorkKey, NodeCandidates],
+    reader: Callable[[str], Result],
     *,
     initial_concurrency: Callable[[str], int] | None = None,
     pinned_hosts: frozenset[str] = frozenset(),
@@ -346,33 +395,39 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     increase_after: int = DEFAULT_INCREASE_AFTER,
     evict_after_attempts: int = DEFAULT_EVICT_AFTER_ATTEMPTS,
     evict_max_success_rate: float = DEFAULT_EVICT_MAX_SUCCESS_RATE,
-    on_success: Callable[[SimulationKey, HeaderMetadata], None] | None = None,
+    block_errors: tuple[type[OSError], ...] = DEFAULT_BLOCK_ERRORS,
+    fault_errors: tuple[type[OSError], ...] = DEFAULT_FAULT_ERRORS,
+    on_success: Callable[[WorkKey, Result], None] | None = None,
     on_flush: Callable[[], None] | None = None,
-) -> DispatchResult:
+) -> DispatchResult[WorkKey, Result]:
     """
-    Read one header per simulation, routed across data nodes with adaptive load
+    Process one work item per key, routed across data nodes with adaptive load
 
-    Drives a `_Scheduler`: it dispatches every currently-startable `(simulation,
-    host)` onto a thread pool, waits for the first read to finish, applies the
-    outcome (success, back-off-and-requeue on a block, or requeue on any other
-    failure), and repeats until nothing is pending or in flight.
+    Grain-neutral: with header candidates and a header reader it reads one header per
+    simulation; with file candidates and a download reader it fetches one file per
+    file.  Drives a `_Scheduler`: it dispatches every currently-startable `(key,
+    host)` onto a thread pool, waits for the first to finish, applies the outcome
+    (success, back-off-and-requeue on a block, or requeue on any other failure), and
+    repeats until nothing is pending or in flight.
 
-    Each dispatch reads the host's mirror URLs for the simulation in ranked order
-    (e.g. an `https` twin before its `http` original), taking the first that reads
-    and only then dropping the host.  A `HeaderReadBlocked` on any of them halves
-    the node's cap and stops immediately (node-level distress, not a per-URL fault);
-    any other `OSError` falls through to the host's next URL, and once all fail the
-    simulation requeues to its next host; a node whose success rate stays low over
-    enough attempts is evicted.
+    Each dispatch tries the host's mirror URLs for the item in ranked order (e.g. an
+    `https` twin before its `http` original), taking the first that succeeds and only
+    then dropping the host.  A `block_errors` exception on any of them halves the
+    node's cap and stops immediately (node-level distress, not a per-URL fault); a
+    `fault_errors` exception skips the host's remaining URLs (the node is
+    stalled/unreachable); any other `OSError` falls through to the host's next URL,
+    and once all fail the item requeues to its next host; a node whose success rate
+    stays low over enough attempts is evicted.
 
     Parameters
     ----------
     candidates
-        Per-simulation ranked candidates (e.g. from `build_candidates`).
+        Per-item ranked candidates (e.g. from `build_candidates` or
+        `build_file_candidates`).
 
     reader
-        Per-URL header read, already wrapped with timeout/recording/retry (and
-        `promote_blocks`, so a rate-limit surfaces as `HeaderReadBlocked`).
+        Per-URL read/download, already wrapped with timeout/recording/retry, that
+        raises the `block_errors`/`fault_errors` on node-level distress.
 
     initial_concurrency
         Per-host *starting* cap; defaults to `concurrency_limit()` (flat default).
@@ -387,12 +442,17 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     ceiling, increase_after, evict_after_attempts, evict_max_success_rate
         Adaptive-cap and eviction knobs (see the module docstring).
 
+    block_errors, fault_errors
+        Exception types that mark a *block* (back the host off) or a *node fault*
+        (skip the host's remaining URLs).  Default to the header exceptions; the
+        download path passes its own (e.g. `DownloadBlocked`, `DownloadHostFault`).
+
     on_success
-        Optional callback invoked the instant a simulation's header is read, with
-        `(simulation, metadata)`.  It runs in the single controller thread (the same
-        one draining completions), so a caller can persist each header **as it
-        arrives** without any locking — the reads run on the pool, but this and every
-        other DB write happen serially here.  Used for save-as-you-go persistence.
+        Optional callback invoked the instant a work item succeeds, with
+        `(key, value)`.  It runs in the single controller thread (the same one
+        draining completions), so a caller can persist each result **as it arrives**
+        without any locking — the reads run on the pool, but this and every other DB
+        write happen serially here.  Used for save-as-you-go persistence.
 
     on_flush
         Optional callback invoked once per drain iteration, after the just-completed
@@ -403,8 +463,8 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
     Returns
     -------
     :
-        The headers read, the simulations that failed on every candidate, and the
-        per-host caps learned (for persistence/seeding the next run).
+        The value for each item that succeeded, the items that failed on every
+        candidate, and the per-host caps learned (for persistence/seeding next run).
     """
     limit = (
         initial_concurrency if initial_concurrency is not None else concurrency_limit()
@@ -419,39 +479,37 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
         evict_max_success_rate=evict_max_success_rate,
         pinned_hosts=pinned_hosts,
     )
-    headers: dict[SimulationKey, HeaderMetadata] = {}
+    results: dict[WorkKey, Result] = {}
 
-    def read_on_host(
-        simulation: SimulationKey, host: str
-    ) -> tuple[_Outcome, HeaderMetadata | None]:
+    def read_on_host(simulation: WorkKey, host: str) -> tuple[_Outcome, Result | None]:
         # Try the host's mirror URLs in ranked order (e.g. an https twin ahead of its
-        # http original), falling through only on a *plain* failure.  Three outcomes
+        # http original), falling through only on a *plain* failure.  Two outcomes
         # stop the host immediately rather than hammering its remaining URLs:
         #   - a block (429/403/503) is node-level distress; back the host off;
-        #   - a stall (timeout) means the node is hanging on *every* read; and
-        #   - a host fault (SSL/cert, DNS, connect-timeout) means the node is
-        #     unreachable/misconfigured, so its other URLs fail identically.
-        # The header is one-per-simulation, so in each case its remaining URLs would
-        # only burn more time (the tail that held uc2 open); move to the next mirror.
-        # A *plain* failure (incl. connection refused) still falls through to the next
-        # URL — only unmistakable host-level failures short-circuit.
+        #   - a fault (stall/timeout, SSL/cert, DNS, connect-timeout) means the node
+        #     is hanging or unreachable, so its other URLs fail identically.
+        # In each case its remaining URLs would only burn more time (the tail that
+        # held uc2 open); move to the next mirror.  A *plain* failure (incl. connection
+        # refused) still falls through to the next URL — only unmistakable host-level
+        # failures short-circuit.
         outcome: _Outcome = _Outcome.FAILURE
         for url in candidates[simulation].urls_by_host[host]:
             try:
-                metadata = reader(url)
-            except HeaderReadBlocked:
+                value = reader(url)
+            except block_errors:
                 return (_Outcome.BLOCKED, None)
-            except (HeaderReadTimeout, HeaderReadHostFault):
+            except fault_errors:
                 return (_Outcome.FAILURE, None)  # node-level fault; skip its other URLs
             except OSError:
                 outcome = _Outcome.FAILURE
                 continue
-            return (_Outcome.SUCCESS, metadata)
+            return (_Outcome.SUCCESS, value)
         return (outcome, None)
 
-    Result = tuple[_Outcome, HeaderMetadata | None]
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        in_flight: dict[Future[Result], tuple[SimulationKey, str]] = {}
+        in_flight: dict[
+            Future[tuple[_Outcome, Result | None]], tuple[WorkKey, str]
+        ] = {}
         while True:
             assignment = scheduler.next_assignment()
             while assignment is not None:
@@ -466,12 +524,12 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
                 simulation, host = in_flight.pop(future)
-                outcome, metadata = future.result()
-                if outcome is _Outcome.SUCCESS and metadata is not None:
+                outcome, value = future.result()
+                if outcome is _Outcome.SUCCESS and value is not None:
                     scheduler.on_success(simulation, host)
-                    headers[simulation] = metadata
+                    results[simulation] = value
                     if on_success is not None:
-                        on_success(simulation, metadata)
+                        on_success(simulation, value)
                 elif outcome is _Outcome.BLOCKED:
                     scheduler.on_block(simulation, host)
                 else:
@@ -482,5 +540,5 @@ def dispatch_reads(  # noqa: PLR0913 - dispatch + AIMD knobs, all keyword-only
                 on_flush()
 
     return DispatchResult(
-        headers=headers, failed=scheduler.failed, learned=scheduler.learned()
+        results=results, failed=scheduler.failed, learned=scheduler.learned()
     )

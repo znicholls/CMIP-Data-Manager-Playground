@@ -5,11 +5,16 @@ from __future__ import annotations
 import pytest
 from sqlmodel import Session, select
 
-from cmip_data_manager.db.repository import FileSearchAttempt, HeaderAttempt
+from cmip_data_manager.db.repository import (
+    DownloadAttempt,
+    FileSearchAttempt,
+    HeaderAttempt,
+)
 from cmip_data_manager.db.schema import Cmip5VersionExtra
 from cmip_data_manager.esgf.cmip5 import reconstruct_ids
+from cmip_data_manager.esgf.download_health import DownloadNodeHealth, DownloadOutcome
 from cmip_data_manager.esgf.health import NodeHealth, ReadOutcome
-from cmip_data_manager.esgf.models import DatasetRecord
+from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 
 _V = "v20240101"
 
@@ -499,3 +504,229 @@ def test_header_attempt_summary_by_source_id_and_none_host(repository):
 def test_header_attempt_summary_rejects_bad_group_by(repository):
     with pytest.raises(ValueError, match="group_by"):
         repository.header_attempt_summary(group_by="variant_label")
+
+
+# --- download attempts, health and state -------------------------------------
+
+
+def _stored_file(repository, *, checksum="abc123", checksum_type="md5"):
+    """Create one `File` via the public API; return its id and a `FileAccess` id."""
+    repository.record_run([_rec("m")], endpoint_url="u", spec={}, tag="uc")
+    record = FileRecord(
+        id="file-tas",
+        dataset_id=f"{_inst('m')}|node1.org",
+        title="tas.nc",
+        size=1000,
+        checksum=checksum,
+        checksum_type=checksum_type,
+        urls=("https://node1.org/tas.nc|application/netcdf|HTTPServer",),
+        raw={},
+    )
+    repository.store_files({_inst("m"): [record]})
+    (stored,) = repository.get_version_files(_inst("m"))
+    return stored.id, stored.accesses[0].id
+
+
+def _dl_attempt(**overrides):
+    """Build a DownloadAttempt with sensible defaults for the log tests."""
+    fields = {
+        "outcome": "success",
+        "file_id": None,
+        "host": "good.node",
+        "url": "https://good.node/tas.nc",
+        "bytes_downloaded": 200_000_000,
+        "seconds": 2.0,
+        "throughput_mbps": 100.0,
+        "attempt_no": 1,
+        "resumed": False,
+    }
+    fields.update(overrides)
+    return DownloadAttempt(**fields)
+
+
+def test_record_download_attempts_is_append_only(repository):
+    assert repository.record_download_attempts([]) == 0  # nothing to write
+    n = repository.record_download_attempts(
+        [_dl_attempt(url="https://n/a.nc"), _dl_attempt(url="https://n/b.nc")]
+    )
+    assert n == 2
+    # Recording the same logical attempt again appends rather than upserting.
+    repository.record_download_attempts([_dl_attempt(url="https://n/a.nc")])
+    assert len(repository.get_download_attempts()) == 3
+
+
+def test_record_download_attempts_persists_bytes_resume_and_detail(repository):
+    repository.record_download_attempts(
+        [
+            _dl_attempt(
+                outcome="checksum_failed",
+                detail="md5 abc != def",
+                throughput_mbps=0.0,
+                resumed=True,
+            )
+        ]
+    )
+    (stored,) = repository.get_download_attempts()
+    assert stored.outcome == "checksum_failed"
+    assert stored.detail == "md5 abc != def"
+    assert stored.resumed is True
+    assert stored.bytes_downloaded == 200_000_000
+
+
+def test_get_download_attempts_filters(repository):
+    repository.record_download_attempts(
+        [
+            _dl_attempt(host="ornl", outcome="timeout"),
+            _dl_attempt(host="nci", outcome="success"),
+            _dl_attempt(host="ornl", outcome="host_fault"),
+        ]
+    )
+    by_host = repository.get_download_attempts(host="ornl")
+    assert len(by_host) == 2
+    only_timeout = repository.get_download_attempts(host="ornl", outcome="timeout")
+    assert [a.outcome for a in only_timeout] == ["timeout"]
+
+
+def test_get_download_attempts_by_file_id_and_newest_first(repository):
+    file_id, _ = _stored_file(repository)
+    repository.record_download_attempts(
+        [_dl_attempt(file_id=file_id, url="https://n/first.nc")]
+    )
+    repository.record_download_attempts(
+        [_dl_attempt(file_id=file_id, url="https://n/second.nc")]
+    )
+    repository.record_download_attempts(
+        [_dl_attempt(file_id=None, url="https://x/o.nc")]
+    )
+    for_file = repository.get_download_attempts(file_id=file_id)
+    assert [a.url for a in for_file] == ["https://n/second.nc", "https://n/first.nc"]
+
+
+def test_download_attempt_summary_rolls_up_by_host(repository):
+    repository.record_download_attempts(
+        [
+            _dl_attempt(host="ornl", outcome="success"),
+            _dl_attempt(host="ornl", outcome="success"),
+            _dl_attempt(host="ornl", outcome="checksum_failed"),
+            _dl_attempt(host=None, outcome="no_candidate"),
+        ]
+    )
+    summary = {s.key: s for s in repository.download_attempt_summary()}
+    assert summary["ornl"].attempts == 3
+    assert summary["ornl"].successes == 2
+    assert summary["ornl"].failures == 1
+    assert summary["ornl"].outcomes == {"success": 2, "checksum_failed": 1}
+    assert "(none)" in summary  # a null host groups under "(none)"
+    assert repository.download_attempt_summary()[0].key == "ornl"  # most attempts first
+
+
+def test_download_health_persists_and_reloads(repository):
+    health = DownloadNodeHealth()
+    ok = DownloadOutcome.SUCCESS
+    health.record("https://fast/a", ok, 2.0, num_bytes=200_000_000)
+    health.record("https://fast/b", ok, 2.0, num_bytes=200_000_000)
+    health.record("https://bad/f", DownloadOutcome.HOST_FAULT, 5.0)
+    assert repository.save_download_health(health) == 2
+
+    reloaded = repository.load_download_health()
+    fast = reloaded.stat("fast")
+    assert fast.successes == 2
+    assert fast.total_bytes == 400_000_000
+    assert reloaded.stat("bad").host_faults == 1
+
+
+def test_download_health_accumulates_and_persists_concurrency(repository):
+    health = DownloadNodeHealth()
+    health.record("https://n/f.nc", DownloadOutcome.CHECKSUM_FAILED, 1.0)
+    stat = health.stat("n")
+    stat.max_safe_concurrency = 3
+    stat.last_concurrency = 2
+    health.restore(stat)
+    repository.save_download_health(health)
+
+    # A later run loads, records more, saves back.
+    later = repository.load_download_health()
+    later.record("https://n/g.nc", DownloadOutcome.SUCCESS, 1.0, num_bytes=1_000_000)
+    repository.save_download_health(later)
+
+    final = repository.load_download_health().stat("n")
+    assert final.attempts == 2
+    assert final.checksum_failures == 1
+    assert final.successes == 1
+    assert final.max_safe_concurrency == 3
+    assert final.last_concurrency == 2
+
+
+def test_rank_download_nodes_by_throughput_and_reliability(repository):
+    health = DownloadNodeHealth()
+    ok = DownloadOutcome.SUCCESS
+    health.record("https://fast/f", ok, 2.0, num_bytes=200_000_000)
+    health.record("https://slow/f", ok, 20.0, num_bytes=200_000_000)
+    health.record("https://flaky/f", ok, 2.0, num_bytes=100_000_000)
+    health.record("https://flaky/g", DownloadOutcome.ERROR, 1.0)
+    repository.save_download_health(health)
+
+    by_throughput = [r.host for r in repository.rank_download_nodes_by_throughput()]
+    assert by_throughput[0] == "fast"  # highest MB/s first
+    assert by_throughput[-1] == "slow"  # lowest MB/s of those with successes
+    by_reliability = [r.host for r in repository.rank_download_nodes_by_reliability()]
+    assert by_reliability[-1] == "flaky"  # worst success rate ranks last
+
+
+def test_rank_download_by_throughput_excludes_nodes_without_success(repository):
+    health = DownloadNodeHealth()
+    health.record("https://dead/f.nc", DownloadOutcome.HOST_FAULT, 5.0)
+    repository.save_download_health(health)
+    assert repository.rank_download_nodes_by_throughput() == []  # no throughput
+    # ...but a never-succeeding node still appears in the reliability ranking.
+    assert [r.host for r in repository.rank_download_nodes_by_reliability()] == ["dead"]
+
+
+def test_mark_download_and_get_state(repository):
+    file_id, access_id = _stored_file(repository)
+    assert repository.get_download_state(file_id) is None  # nothing yet
+
+    repository.mark_download(
+        file_id=file_id,
+        status="complete",
+        local_path="/data/tas.nc",
+        size_bytes=1000,
+        verified=True,
+        verified_algo="md5",
+        download_from_access_key=access_id,
+        attempts=2,
+    )
+    state = repository.get_download_state(file_id)
+    assert state.status == "complete"
+    assert state.verified is True
+    assert state.verified_algo == "md5"
+    assert state.local_path == "/data/tas.nc"
+    assert state.download_from_access_key == access_id
+    assert state.completed_at is not None  # stamped by default
+
+
+def test_mark_download_upserts_on_reattempt(repository):
+    file_id, _ = _stored_file(repository)
+    repository.mark_download(file_id=file_id, status="failed", attempts=3)
+    repository.mark_download(
+        file_id=file_id,
+        status="complete",
+        local_path="/data/tas.nc",
+        size_bytes=1000,
+        verified=True,
+        verified_algo="md5",
+        attempts=4,
+    )
+    state = repository.get_download_state(file_id)
+    assert state.status == "complete"  # overwritten, not duplicated
+    assert state.attempts == 4
+
+
+def test_version_downloads_returns_per_version_state(repository):
+    file_id, _ = _stored_file(repository)
+    repository.mark_download(
+        file_id=file_id, status="complete", local_path="/data/tas.nc"
+    )
+    downloads = repository.version_downloads(_inst("m"))
+    assert [(d.file_id, d.status) for d in downloads] == [(file_id, "complete")]
+    assert repository.version_downloads("no-such-version") == []

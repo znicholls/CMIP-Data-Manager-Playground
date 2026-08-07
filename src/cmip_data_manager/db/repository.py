@@ -41,9 +41,12 @@ from cmip_data_manager.db.schema import (
     DatasetChange,
     DatasetNodeSpecificInfo,
     DatasetVersion,
+    DownloadNodeHealthStat,
     File,
     FileAccess,
     FileAccessAttempt,
+    FileDownload,
+    FileDownloadAttempt,
     HeaderReadAttempt,
     IndexNodeHealthStat,
     RunMembership,
@@ -51,6 +54,7 @@ from cmip_data_manager.db.schema import (
     version_ordinal,
 )
 from cmip_data_manager.esgf.cmip5 import cmip5_extra_fields
+from cmip_data_manager.esgf.download_health import DownloadNodeHealth, DownloadStat
 from cmip_data_manager.esgf.eras import get_profile
 from cmip_data_manager.esgf.headers import (
     HTTP_SERVICE,
@@ -175,6 +179,30 @@ class FileSearchAttempt:
     """The error/exception text for a failed attempt; `None` on `success`/`empty`."""
     seconds: float = 0.0
     attempt_no: int = 1
+
+
+@dataclass(frozen=True)
+class DownloadAttempt:
+    """
+    One file-download attempt to persist to the `FileDownloadAttempt` log
+
+    The write-side counterpart of the schema row: the download orchestrator builds one
+    of these per mirror URL it tries for a file (each `with_retry` sub-attempt, each
+    resumed continuation, each file that fully failed) and hands them to
+    `record_download_attempts`.
+    """
+
+    outcome: str
+    file_id: int | None = None
+    host: str | None = None
+    url: str | None = None
+    bytes_downloaded: int = 0
+    seconds: float = 0.0
+    throughput_mbps: float = 0.0
+    attempt_no: int = 1
+    resumed: bool = False
+    detail: str | None = None
+    """The error/exception text (or a note for a synthetic row); `None` on success."""
 
 
 @dataclass(frozen=True)
@@ -769,6 +797,349 @@ class Repository:
             for key, outcomes in buckets.items()
         ]
         return sorted(summaries, key=lambda s: (-s.attempts, s.key))
+
+    def record_download_attempts(self, attempts: Sequence[DownloadAttempt]) -> int:
+        """
+        Append per-attempt file-download records to the log
+
+        The download twin of `record_header_attempts`: append-only, so every download
+        attempt (including `with_retry` sub-attempts, resumed continuations, mirror
+        fallbacks and files that fully failed) becomes its own `FileDownloadAttempt`
+        row and the log builds a history across runs rather than being overwritten.
+
+        Parameters
+        ----------
+        attempts
+            The attempts to record.
+
+        Returns
+        -------
+        :
+            Number of rows written.
+        """
+        if not attempts:
+            return 0
+        with Session(self._engine) as session:
+            for attempt in attempts:
+                session.add(
+                    FileDownloadAttempt(
+                        file_id=attempt.file_id,
+                        host=attempt.host,
+                        url=attempt.url,
+                        outcome=attempt.outcome,
+                        bytes_downloaded=attempt.bytes_downloaded,
+                        seconds=attempt.seconds,
+                        throughput_mbps=attempt.throughput_mbps,
+                        attempt_no=attempt.attempt_no,
+                        resumed=attempt.resumed,
+                        detail=attempt.detail,
+                    )
+                )
+            session.commit()
+        return len(attempts)
+
+    def get_download_attempts(
+        self,
+        *,
+        host: str | None = None,
+        file_id: int | None = None,
+        outcome: str | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[FileDownloadAttempt]:
+        """
+        Return logged file-download attempts, filtered and newest-first
+
+        The queryable window onto the download attempt log (the twin of
+        `get_header_attempts`): any combination of the (indexed) filters narrows it, so
+        "how did node X do?" (`host=...`), "what happened to this file?"
+        (`file_id=...`) or "today's checksum failures" (`since=...,
+        outcome="checksum_failed"`) are each one call.
+
+        Parameters
+        ----------
+        host, file_id, outcome
+            Exact-match filters; omit any to leave that dimension unconstrained.
+
+        since
+            Keep only attempts recorded at or after this time.
+
+        limit
+            Cap on rows returned (the newest ones); unbounded if omitted.
+
+        Returns
+        -------
+        :
+            Matching attempts, most recent first.
+        """
+        statement = select(FileDownloadAttempt)
+        if host is not None:
+            statement = statement.where(FileDownloadAttempt.host == host)
+        if file_id is not None:
+            statement = statement.where(FileDownloadAttempt.file_id == file_id)
+        if outcome is not None:
+            statement = statement.where(FileDownloadAttempt.outcome == outcome)
+        if since is not None:
+            statement = statement.where(FileDownloadAttempt.created_at >= since)
+        statement = statement.order_by(col(FileDownloadAttempt.id).desc())
+        if limit is not None:
+            statement = statement.limit(limit)
+        with Session(self._engine) as session:
+            return list(session.exec(statement).all())
+
+    def download_attempt_summary(
+        self, *, since: datetime | None = None
+    ) -> list[AttemptSummary]:
+        """
+        Roll up logged download attempts by host
+
+        The download twin of `header_attempt_summary`: for each host, how many download
+        attempts were made, how many succeeded/failed, and the breakdown by outcome.
+        Pair with `since` for a single day's view.
+
+        Parameters
+        ----------
+        since
+            Only include attempts recorded at or after this time.
+
+        Returns
+        -------
+        :
+            One summary per host, ordered by most attempts first.
+        """
+        statement = select(FileDownloadAttempt)
+        if since is not None:
+            statement = statement.where(FileDownloadAttempt.created_at >= since)
+        with Session(self._engine) as session:
+            rows = session.exec(statement).all()
+        buckets: dict[str, dict[str, int]] = {}
+        for row in rows:
+            key = row.host or "(none)"
+            outcomes = buckets.setdefault(key, {})
+            outcomes[row.outcome] = outcomes.get(row.outcome, 0) + 1
+        summaries = [
+            AttemptSummary(
+                key=key,
+                attempts=sum(outcomes.values()),
+                successes=outcomes.get("success", 0),
+                failures=sum(outcomes.values()) - outcomes.get("success", 0),
+                outcomes=dict(outcomes),
+            )
+            for key, outcomes in buckets.items()
+        ]
+        return sorted(summaries, key=lambda s: (-s.attempts, s.key))
+
+    def save_download_health(self, health: DownloadNodeHealth) -> int:
+        """
+        Persist a download-health registry, upserting one row per host
+
+        The download twin of `save_node_health`: writes the current in-memory
+        throughput counters back to `DownloadNodeHealthStat` so download health
+        accumulates across runs.  Upserting the whole snapshot is idempotent, so the
+        download step can call this incrementally (save-as-you-go) — a crash keeps what
+        was learned so far.  Persisted download health is *ranking information only*: it
+        is never turned into a cross-restart ignore list (see `DownloadNodeHealth`).
+
+        Parameters
+        ----------
+        health
+            The registry to persist.
+
+        Returns
+        -------
+        :
+            Number of host rows written or updated.
+        """
+        snapshot = health.snapshot()
+        with Session(self._engine) as session:
+            for host, stat in snapshot.items():
+                existing = session.get(DownloadNodeHealthStat, host)
+                columns = _download_health_columns(stat)
+                if existing is None:
+                    session.add(DownloadNodeHealthStat(host=host, **columns))
+                else:
+                    for column, value in columns.items():
+                        setattr(existing, column, value)
+                    session.add(existing)
+            session.commit()
+        return len(snapshot)
+
+    def load_download_health(self) -> DownloadNodeHealth:
+        """
+        Rebuild an in-memory download-health registry from persisted rows
+
+        Returns
+        -------
+        :
+            A `DownloadNodeHealth` seeded with every stored host's counters (empty if
+            none have been persisted).
+        """
+        health = DownloadNodeHealth()
+        with Session(self._engine) as session:
+            for row in session.exec(select(DownloadNodeHealthStat)).all():
+                health.restore(_download_stat_from_row(row))
+        return health
+
+    def rank_download_nodes_by_throughput(self) -> list[DownloadNodeHealthStat]:
+        """
+        Return persisted hosts fastest-to-slowest by mean download throughput
+
+        Answers "rank the nodes by download speed (MB/s)" from the database directly —
+        the signal that matters for downloads, distinct from header-read latency.  Only
+        hosts with at least one success are included (a host that never succeeded has no
+        throughput); ordered by descending mean MB/s.
+
+        Returns
+        -------
+        :
+            The stored host rows with successes, fastest first.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(select(DownloadNodeHealthStat)).all()
+        with_throughput = [
+            row for row in rows if row.successes and row.total_success_seconds
+        ]
+        return sorted(
+            with_throughput,
+            key=lambda r: (
+                -(r.total_bytes / 1_000_000.0 / r.total_success_seconds),
+                r.host,
+            ),
+        )
+
+    def rank_download_nodes_by_reliability(self) -> list[DownloadNodeHealthStat]:
+        """
+        Return persisted hosts best-to-worst by download success rate
+
+        The download twin of `rank_nodes_by_reliability`.  Ordered by descending
+        `successes/attempts`, with more-tried hosts winning ties.
+
+        Returns
+        -------
+        :
+            The stored host rows, most reliable first.
+        """
+        with Session(self._engine) as session:
+            rows = session.exec(select(DownloadNodeHealthStat)).all()
+        return sorted(
+            rows,
+            key=lambda r: (
+                -(r.successes / r.attempts) if r.attempts else 0.0,
+                -r.attempts,
+                r.host,
+            ),
+        )
+
+    def mark_download(  # noqa: PLR0913 - a column per keyword; most default
+        self,
+        *,
+        file_id: int,
+        status: str,
+        local_path: str | None = None,
+        size_bytes: int | None = None,
+        verified: bool = False,
+        verified_algo: str | None = None,
+        download_from_access_key: int | None = None,
+        attempts: int = 0,
+        completed_at: datetime | None = None,
+    ) -> None:
+        """
+        Upsert the terminal download state of a file (`FileDownload`)
+
+        Written the instant a file reaches a terminal state (save-as-you-go), so a
+        killed run keeps every file it finished.  Re-marking the same `file_id`
+        overwrites its row (e.g. a later run completing a previously failed file).
+
+        Parameters
+        ----------
+        file_id
+            The `File.id` this state belongs to.
+
+        status
+            `complete`, `unverified`, `failed` or `skipped` (see `FileDownload`).
+
+        local_path
+            Absolute path the file was written to; `None` for a `failed` row.
+
+        size_bytes
+            Size of the file on disk in bytes.
+
+        verified, verified_algo
+            Whether the bytes were checked against a published checksum, and the
+            algorithm used.
+
+        download_from_access_key
+            Soft pointer to the `FileAccess.id` the winning download came from.
+
+        attempts
+            Total download attempts made for this file across all mirrors.
+
+        completed_at
+            When the file reached this state; defaults to now.
+        """
+        stamp = completed_at or datetime.now(timezone.utc)
+        columns = {
+            "local_path": local_path,
+            "status": status,
+            "size_bytes": size_bytes,
+            "verified": verified,
+            "verified_algo": verified_algo,
+            "download_from_access_key": download_from_access_key,
+            "attempts": attempts,
+            "completed_at": stamp,
+        }
+        with Session(self._engine) as session:
+            existing = session.get(FileDownload, file_id)
+            if existing is None:
+                session.add(FileDownload(file_id=file_id, **columns))
+            else:
+                for column, value in columns.items():
+                    setattr(existing, column, value)
+                session.add(existing)
+            session.commit()
+
+    def get_download_state(self, file_id: int) -> FileDownload | None:
+        """
+        Return the terminal download state for a file, or `None` if never attempted
+
+        Parameters
+        ----------
+        file_id
+            The `File.id` to look up.
+
+        Returns
+        -------
+        :
+            The stored `FileDownload` row, or `None`.
+        """
+        with Session(self._engine) as session:
+            return session.get(FileDownload, file_id)
+
+    def version_downloads(self, version_key: str) -> list[FileDownload]:
+        """
+        Return the download state of every file of a version that has one
+
+        Joins `FileDownload` to `File` on the version, so a caller can derive
+        version-level completeness (a version is complete when all its files have a
+        `complete` row) without that being stored anywhere.
+
+        Parameters
+        ----------
+        version_key
+            The `DatasetVersion.instance_id` whose files' download state is wanted.
+
+        Returns
+        -------
+        :
+            The `FileDownload` rows for this version's files (empty if none downloaded).
+        """
+        statement = (
+            select(FileDownload)
+            .join(File, col(File.id) == col(FileDownload.file_id))
+            .where(File.version_key == version_key)
+        )
+        with Session(self._engine) as session:
+            return list(session.exec(statement).all())
 
     def get_dataset_records(self, tag: str) -> list[DatasetRecord]:
         """
@@ -1610,4 +1981,42 @@ def _index_stat_from_row(row: IndexNodeHealthStat) -> IndexNodeStat:
         timeouts=row.timeouts,
         total_success_seconds=row.total_success_seconds,
         max_success_seconds=row.max_success_seconds,
+    )
+
+
+def _download_health_columns(stat: DownloadStat) -> dict[str, Any]:
+    """Return the storable columns of a download-health stat (excluding the host)."""
+    return {
+        "attempts": stat.attempts,
+        "successes": stat.successes,
+        "timeouts": stat.timeouts,
+        "blocks": stat.blocks,
+        "host_faults": stat.host_faults,
+        "checksum_failures": stat.checksum_failures,
+        "errors": stat.errors,
+        "total_bytes": stat.total_bytes,
+        "total_success_seconds": stat.total_success_seconds,
+        "max_success_seconds": stat.max_success_seconds,
+        "max_safe_concurrency": stat.max_safe_concurrency,
+        "last_concurrency": stat.last_concurrency,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def _download_stat_from_row(row: DownloadNodeHealthStat) -> DownloadStat:
+    """Rebuild an in-memory `DownloadStat` from a stored download-health row."""
+    return DownloadStat(
+        host=row.host,
+        attempts=row.attempts,
+        successes=row.successes,
+        timeouts=row.timeouts,
+        blocks=row.blocks,
+        host_faults=row.host_faults,
+        checksum_failures=row.checksum_failures,
+        errors=row.errors,
+        total_bytes=row.total_bytes,
+        total_success_seconds=row.total_success_seconds,
+        max_success_seconds=row.max_success_seconds,
+        max_safe_concurrency=row.max_safe_concurrency,
+        last_concurrency=row.last_concurrency,
     )

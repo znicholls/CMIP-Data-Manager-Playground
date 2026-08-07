@@ -375,7 +375,7 @@ def enrich_version_headers(  # noqa: PLR0913 - a DI seam; every parameter has a 
 
     if not persist_as_you_go:
         # Legacy batch path: nothing was written during the run, so persist it all now.
-        for sim, metadata in dispatched.headers.items():
+        for sim, metadata in dispatched.results.items():
             writer.promote(sim, metadata)
 
     for host, (max_safe, last) in dispatched.learned.items():

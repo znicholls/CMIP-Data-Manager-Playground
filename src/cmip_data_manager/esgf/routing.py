@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 from urllib.parse import urlparse
 
 from cmip_data_manager.esgf.headers import (
@@ -34,6 +35,9 @@ from cmip_data_manager.esgf.headers import (
     candidate_urls_for_files,
 )
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
+
+FileKey = TypeVar("FileKey", bound=Hashable)
+"""A download work-item key (whatever the caller chooses, e.g. a `File.id`)."""
 
 AffinityKey = Callable[[DatasetRecord], Hashable]
 """
@@ -88,6 +92,32 @@ class SimulationCandidates:
 
     urls_by_host: Mapping[str, tuple[str, ...]]
     """Each host's readable URLs, best-first (keys match `hosts`)."""
+
+
+@dataclass(frozen=True)
+class FileCandidates:
+    """
+    The data nodes that can serve one file's bytes, ranked best-first
+
+    The download counterpart of `SimulationCandidates`.  Where a header read needs only
+    *one* readable file per simulation — so each host is collapsed to a single
+    representative file — a download needs *this* file, so `urls_by_host[h]` keeps every
+    mirror URL for this file on host `h` (its `https` twin + `http` original) and there
+    is **no** cross-file collapse.  Structurally it matches `dispatch.NodeCandidates`,
+    so the same dispatcher drives it.
+    """
+
+    key: Hashable
+    """The work-item key this is for (e.g. a `File.id`)."""
+
+    group: Hashable
+    """The affinity tag (e.g. `source_id`) used to cluster a node's queue."""
+
+    hosts: tuple[str, ...]
+    """The candidate hosts, best-first (empty if no mirror is usable)."""
+
+    urls_by_host: Mapping[str, tuple[str, ...]]
+    """Each host's URLs for this file, best-first (keys match `hosts`)."""
 
 
 def _url_basename(url: str) -> str:
@@ -266,6 +296,83 @@ def build_candidates(  # noqa: PLR0913 - ordering controls, keyword-only, defaul
             preferred_hosts=preferred_hosts,
             ignore_hosts=ignore_hosts,
             host_rank=host_rank,
+        )
+    return candidates
+
+
+def build_file_candidates(
+    files_by_key: Mapping[FileKey, FileRecord],
+    *,
+    group_by_key: Mapping[FileKey, Hashable] | None = None,
+    preferred_hosts: Sequence[str] = (),
+    ignore_hosts: frozenset[str] = frozenset(),
+    host_rank: Callable[[str], tuple[float, float]] | None = None,
+) -> dict[FileKey, FileCandidates]:
+    """
+    Build ranked download candidates for every file to be fetched
+
+    The file-grain counterpart of `build_candidates`: one work item per *file* (keyed
+    however the caller chooses, e.g. by `File.id`), each ranked across the data nodes
+    that mirror it.  A file with no usable mirror is still included with empty `hosts`,
+    so the caller can record it as failed rather than lose it.  Unlike the header
+    builder there is **no** one-file-per-host collapse — every file must be downloaded.
+
+    Parameters
+    ----------
+    files_by_key
+        The file to download for each work-item key (its `HTTPServer` mirrors are
+        pooled and ranked, with `https` twins added).
+
+    group_by_key
+        Optional per-key affinity tag (e.g. `source_id`) so a node's queue keeps one
+        model's files together; keys absent here get no group.
+
+    preferred_hosts, ignore_hosts, host_rank
+        Ordering controls forwarded to `candidate_urls_for_files`.
+
+    Returns
+    -------
+    :
+        One `FileCandidates` per key in `files_by_key`.
+
+    Examples
+    --------
+    >>> from cmip_data_manager.esgf.models import FileRecord
+    >>> files = {
+    ...     7: FileRecord(
+    ...         id="f7",
+    ...         dataset_id="d1",
+    ...         urls=(
+    ...             "https://nci/tas.nc|application/netcdf|HTTPServer",
+    ...             "https://ornl/tas.nc|application/netcdf|HTTPServer",
+    ...         ),
+    ...         raw={},
+    ...     )
+    ... }
+    >>> cands = build_file_candidates(files, preferred_hosts=("nci",))
+    >>> cands[7].hosts
+    ('nci', 'ornl')
+    >>> cands[7].urls_by_host["nci"]
+    ('https://nci/tas.nc',)
+    """
+    groups = dict(group_by_key or {})
+    candidates: dict[FileKey, FileCandidates] = {}
+    for key, file in files_by_key.items():
+        ranked = candidate_urls_for_files(
+            [file],
+            preferred_hosts=preferred_hosts,
+            ignore_hosts=ignore_hosts,
+            host_rank=host_rank,
+        )
+        urls_by_host: dict[str, list[str]] = {}
+        for url in ranked:
+            host = urlparse(url).hostname or url
+            urls_by_host.setdefault(host, []).append(url)
+        candidates[key] = FileCandidates(
+            key=key,
+            group=groups.get(key),
+            hosts=tuple(urls_by_host),
+            urls_by_host={host: tuple(urls) for host, urls in urls_by_host.items()},
         )
     return candidates
 

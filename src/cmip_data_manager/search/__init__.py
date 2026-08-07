@@ -17,6 +17,11 @@ from cmip_data_manager.search.aggregate import (
     pairs_all_experiments,
     pairs_any_experiment,
 )
+from cmip_data_manager.search.download import (
+    DownloadResult,
+    download_files,
+    drs_path,
+)
 from cmip_data_manager.search.files import (
     AddFilesResult,
     FileSearchIncompleteError,
@@ -59,6 +64,7 @@ from cmip_data_manager.search.versions import (
 __all__ = [
     "AddFilesResult",
     "Cell",
+    "DownloadResult",
     "FileSearchIncompleteError",
     "ModelVariant",
     "PairMatch",
@@ -79,6 +85,8 @@ __all__ = [
     "build_cells",
     "declared_parent",
     "discover_experiments",
+    "download_files",
+    "drs_path",
     "enrich_version_headers",
     "fetch_records",
     "latest_version",

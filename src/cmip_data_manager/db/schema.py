@@ -658,3 +658,175 @@ class FileAccessAttempt(SQLModel, table=True):
 
     attempt_no: int = 1
     """1-based ordinal of this attempt among the backoff retries on this endpoint."""
+
+
+class FileDownloadAttempt(SQLModel, table=True):
+    """
+    One file-download attempt against a data node — an append-only log
+
+    The download twin of `HeaderReadAttempt`/`FileAccessAttempt`.  Where
+    `DownloadNodeHealthStat` keeps per-host *aggregates* and `FileDownload` keeps only
+    the *winning* download, this is the raw, timestamped per-attempt fact table — every
+    mirror URL tried for every file, in order, with its outcome, bytes transferred,
+    duration and measured throughput, including `with_retry` sub-attempts, resumed
+    (`Range`) continuations and files that fully failed.  It is append-only (never
+    upserted), so it accumulates a history across runs.
+
+    It underpins two things the aggregate cannot:
+
+    - **diagnosis** — for a file that could not be downloaded, exactly which nodes and
+      URLs were attempted and how each ended (`timeout`, `blocked`, `host_fault`,
+      `checksum_failed`, `error`);
+    - **ad-hoc questions** — because `created_at`, `host`, `file_id` and `outcome` are
+      all indexed, a plain `GROUP BY` answers "how fast did node X serve today?",
+      "which files failed their checksum?", or "which nodes are worth preferring?".
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+    file_id: int | None = Field(default=None, foreign_key="file.id", index=True)
+    """`File.id` this attempt tried to download; `None` on a `no_candidate` record."""
+
+    host: str | None = Field(default=None, index=True)
+    """Data node the attempt hit; `None` on a `no_candidate` record."""
+
+    url: str | None = None
+    """Exact mirror URL attempted; `None` on a `no_candidate` record."""
+
+    outcome: str = Field(index=True)
+    """`success`, `timeout`, `blocked` (HTTP 429/403/503), `host_fault` (SSL/DNS/connect
+    failure), `checksum_failed` (bytes arrived but the digest mismatched), `error`,
+    `no_candidate` (no mirror was indexed), or `stranded` (a mirror existed but its host
+    was evicted before this file was tried)."""
+
+    detail: str | None = None
+    """Underlying error/exception text for a failed attempt (connection error, an
+    expected/actual checksum mismatch, …), or a short note for a synthetic
+    `no_candidate` / `stranded` row; `None` on success."""
+
+    bytes_downloaded: int = 0
+    """Bytes transferred this attempt (a resumed attempt counts only the bytes it added
+    on top of the pre-existing `.part`)."""
+
+    seconds: float = 0.0
+    """Wall-clock duration of the attempt (`0` for a `no_candidate` record)."""
+
+    throughput_mbps: float = 0.0
+    """Measured throughput in MB/s (`bytes_downloaded / seconds`, MB = 1e6 bytes) — the
+    download-speed signal a header read cannot provide.  `0` when no bytes moved."""
+
+    attempt_no: int = 1
+    """1-based ordinal of this attempt among retries of the same `(host, url)`."""
+
+    resumed: bool = False
+    """Whether this attempt continued a partial `.part` file via an HTTP `Range` request
+    rather than starting from byte 0."""
+
+
+class DownloadNodeHealthStat(SQLModel, table=True):
+    """
+    Persisted per-data-node *download* outcomes — separate from header-read health
+
+    The download twin of `DataNodeHealthStat`, kept deliberately separate because a
+    header read and a full-file download measure different things: a header read moves a
+    few KB and times *latency*, whereas a download moves the whole (often multi-GB) file
+    and the signal that matters is *throughput* (MB/s).  A node that is "dead" for
+    header reads can download perfectly well, so download health must **not** inherit
+    header verdicts — it is learned from downloads alone.
+
+    One row per host, carrying accumulated counters and byte/second totals so download
+    node health survives across runs and can be ranked by throughput or reliability with
+    a plain `ORDER BY`.  A run loads these into an in-memory registry, records fresh
+    outcomes against them, and writes them back (incrementally, so a crash keeps what
+    was learned).  Persisted health is *informational ranking only*: it is never turned
+    into a cross-restart ignore list — every run re-probes every node from scratch,
+    because data nodes are a moving target.
+    """
+
+    host: str = Field(primary_key=True)
+    attempts: int = 0
+    successes: int = 0
+    timeouts: int = 0
+    blocks: int = 0
+    """Downloads ending in a node-level block/rate-limit (HTTP 429/403/503)."""
+
+    host_faults: int = 0
+    """Downloads ending in a host fault (SSL/DNS/connect failure — node unreachable)."""
+
+    checksum_failures: int = 0
+    """Downloads whose bytes arrived but failed checksum verification — a node-quality
+    signal distinct from a transient transfer error."""
+
+    errors: int = 0
+    """Downloads ending in any other transient error."""
+
+    total_bytes: int = 0
+    """Summed bytes of successful downloads (numerator of the mean throughput)."""
+
+    total_success_seconds: float = 0.0
+    """Summed duration of successful downloads (denominator of the mean throughput)."""
+
+    max_success_seconds: float = 0.0
+    """Slowest successful download seen."""
+
+    max_safe_concurrency: int = 0
+    """Highest per-node connection count seen downloading cleanly (0 = not learned)."""
+
+    last_concurrency: int = 0
+    """Per-node connection count this host converged on last run (0 = not learned)."""
+
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class FileDownload(SQLModel, table=True):
+    """
+    Terminal download state for a `File`, one row per downloaded file (1:1 side table)
+
+    The download step's state table, following the per-concern 1:1 side-table pattern of
+    `Cmip5VersionExtra`: the node-independent `File` stays search-focused, and the "have
+    we downloaded this, where did it land, did it verify" facts live here, keyed on
+    `File.id`.  Written the instant a file completes (save-as-you-go), so a killed run
+    keeps every file it finished.  Only the *winning* download is recorded here; every
+    attempt (including failures) lives on the append-only `FileDownloadAttempt` log.
+
+    Version-level completeness is **not** stored — it is *derived* (a version is
+    complete when all its `File`s have a `complete` row here), so a failed file is just
+    a failed file and never blocks its siblings.
+    """
+
+    file_id: int = Field(foreign_key="file.id", primary_key=True)
+    """Foreign key to the owning `File.id` (1:1)."""
+
+    local_path: str | None = None
+    """Absolute path the file was written to (its DRS location under the download root);
+    `None` until a download completes."""
+
+    status: str = Field(index=True)
+    """`complete` (downloaded and, where a checksum existed, verified), `unverified`
+    (downloaded but no usable checksum to verify against), `failed` (all mirrors
+    exhausted), or `skipped` (already present and verified before this run)."""
+
+    size_bytes: int | None = None
+    """Size of the downloaded file on disk, in bytes."""
+
+    verified: bool = False
+    """Whether the on-disk bytes were checked against a published checksum."""
+
+    verified_algo: str | None = None
+    """The digest algorithm actually used to verify (`md5`/`sha256`/…), resolved from
+    `File.checksum_type` (ESGF1) or decoded from a STAC multihash (ESGF-NG); `None` when
+    the file could not be verified."""
+
+    download_from_access_key: int | None = Field(default=None, index=True)
+    """
+    Soft pointer (indexed, **not** a foreign key) to the `FileAccess.id` the winning
+    download came from — which mirror/node served it.  Provenance only, mirroring
+    `File.header_from_access_key`.
+    """
+
+    attempts: int = 0
+    """Total download attempts made for this file across all mirrors (quick triage
+    without scanning the `DownloadAttempt` log)."""
+
+    completed_at: datetime | None = None

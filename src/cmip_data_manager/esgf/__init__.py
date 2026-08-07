@@ -63,8 +63,10 @@ from cmip_data_manager.esgf.parents import (
 from cmip_data_manager.esgf.query import FacetQuery
 from cmip_data_manager.esgf.routing import (
     AffinityKey,
+    FileCandidates,
     SimulationCandidates,
     build_candidates,
+    build_file_candidates,
     hosts_to_simulations,
     simulation_candidates,
     source_id_affinity,
@@ -77,6 +79,7 @@ __all__ = [
     "DatasetRecord",
     "ESGFSearchClient",
     "FacetQuery",
+    "FileCandidates",
     "FileRecord",
     "HeaderKey",
     "HeaderMetadata",
@@ -93,6 +96,7 @@ __all__ = [
     "SearchOutcome",
     "SimulationCandidates",
     "build_candidates",
+    "build_file_candidates",
     "candidate_urls_for_files",
     "classify_search_error",
     "exponential_backoff",
