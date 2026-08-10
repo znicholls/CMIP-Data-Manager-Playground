@@ -231,6 +231,13 @@ class DatasetRecord(BaseModel):
         version, so its `id` is the `instance_id`; there is no data node or replica
         dimension (`data_node`/`replica` are `None` — files/hosts live in `assets`).
 
+        `table_id` falls back to the **branding suffix**
+        (`variable_branding_suffix`) when a collection has no `table_id`: CMIP7 replaces
+        the CMOR table with the branding suffix (`tavg-h2m-hxy-u`) as the
+        variable-identity discriminator, so it lands in the same column and every
+        downstream reader (identity, `simulation_key`, version grain) keeps working.
+        The fallback is inert for eras that do carry `table_id` (CMIP6).
+
         Parameters
         ----------
         feature
@@ -263,7 +270,7 @@ class DatasetRecord(BaseModel):
             variant_label=facet("variant_label"),
             variable_id=facet("variable_id"),
             frequency=facet("frequency"),
-            table_id=facet("table_id"),
+            table_id=facet("table_id") or facet("variable_branding_suffix"),
             grid_label=facet("grid_label"),
             nominal_resolution=facet("nominal_resolution"),
             version=_single_str(props, "version"),

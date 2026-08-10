@@ -27,6 +27,10 @@ from cmip_data_manager.search.files import (
     FileSearchIncompleteError,
     add_files,
 )
+from cmip_data_manager.search.files_ng import (
+    add_files_auto,
+    add_files_from_assets,
+)
 from cmip_data_manager.search.parent_walk import (
     ParentExperimentMissingError,
     ParentNotAncestor,
@@ -82,6 +86,8 @@ __all__ = [
     "VersionEnrichResult",
     "VersionSelection",
     "add_files",
+    "add_files_auto",
+    "add_files_from_assets",
     "build_cells",
     "declared_parent",
     "discover_experiments",

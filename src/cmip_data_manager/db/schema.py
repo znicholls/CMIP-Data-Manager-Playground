@@ -367,6 +367,63 @@ class Cmip5VersionExtra(SQLModel, table=True):
     drive the variable-filtered Step-2 file search."""
 
 
+class Cmip7VersionExtra(SQLModel, table=True):
+    """
+    CMIP7-only facets promoted from raw JSON, one row per CMIP7 `DatasetVersion`
+
+    The CMIP7 counterpart of `Cmip5VersionExtra` (the per-era 1:1 side table from
+    `design/multi-mip-era-search-plan.md` §6): the canonical `Dataset`/`DatasetVersion`
+    stay era-agnostic, and CMIP7's extra facets that have **no** canonical column live
+    here, keyed on the version's id.  Only written for `mip_era == "CMIP7"`.
+
+    CMIP7 replaces CMIP6's CMOR `table_id` with a *branded variable*: the
+    `branding_suffix` (`tavg-h2m-hxy-u`) is the variable-identity discriminator and is
+    folded into the canonical `table_id` column (so identity/`simulation_key` keep
+    working), while the components that split it — the sampling `*_label`s, the
+    `region`, the full `branded_variable`, plus `license_id`/`data_specs_version` — have
+    no canonical home and are promoted here so a use case can filter on them (e.g.
+    `region='glb'` vs a masked region) without re-parsing the raw STAC feature.  No
+    disambiguation column is needed: the DRS id already embeds the branding + region, so
+    two branded variables of one variable are already distinct versions.
+    """
+
+    version_key: str = Field(foreign_key="datasetversion.instance_id", primary_key=True)
+    """Foreign key to the owning `DatasetVersion.instance_id` (1:1)."""
+
+    branding_suffix: str | None = Field(default=None, index=True)
+    """The CMIP7 branding suffix (`tavg-h2m-hxy-u`); also folded into `table_id`.
+    Kept here indexed so the branding is filterable without touching the raw JSON."""
+
+    branded_variable: str | None = None
+    """The full branded variable name (`variable_id` + branding suffix, e.g.
+    `tas_tavg-h2m-hxy-u`)."""
+
+    region: str | None = Field(default=None, index=True)
+    """The domain the data is reported over (`glb`, `ata`, …); part of the DRS id but
+    not a canonical column, so promoted here for filtering."""
+
+    temporal_label: str | None = None
+    """Method of sampling in time (`tavg`, `tpt`, `tclm`) — a branding component."""
+
+    vertical_label: str | None = None
+    """Method of sampling in the vertical (`h2m`, …) — a branding component."""
+
+    horizontal_label: str | None = None
+    """Method of sampling in the horizontal (`hxy`, …) — a branding component."""
+
+    area_label: str | None = None
+    """Identifier of unmasked areas (`u`, …) — a branding component."""
+
+    license_id: str | None = None
+    """Creative-commons licence identifier (`CC-BY-4.0`); new in CMIP7."""
+
+    data_specs_version: str | None = None
+    """Version of the MIP requirements governing the dataset (`MIP-DS7.1.0.0`)."""
+
+    realm: str | None = None
+    """The modelling realm(s) (`atmos`, `ocean`, …), for provenance."""
+
+
 class File(SQLModel, table=True):
     """
     A cached, node-independent file belonging to a `DatasetVersion`

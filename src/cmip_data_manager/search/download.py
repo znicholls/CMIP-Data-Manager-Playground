@@ -164,10 +164,12 @@ def drs_path(root: Path, record: DatasetRecord, filename: str) -> Path:
 
     CMIP6 is laid out from the stored facets
     (`mip_era/activity/institution/source/experiment/variant/table/variable/grid/
-    vVERSION/filename`); CMIP5 is rebuilt from its native DRS id
-    (`raw["instance_id"]`), whose dotted segments are the directory tree.  A missing
-    CMIP6 facet becomes `"unknown"` rather than breaking the path (override the seam
-    for a bespoke layout).
+    vVERSION/filename`); CMIP5 **and CMIP7** are rebuilt from their native DRS id (the
+    STAC feature id / `raw["instance_id"]`), whose dotted segments are the directory
+    tree — for CMIP7 that id already embeds the branding suffix and region, so the tree
+    is correct without a synthetic `table` slot or an activity lookup the STAC record
+    does not surface as a column.  A missing CMIP6 facet becomes `"unknown"` rather than
+    breaking the path (override the seam for a bespoke layout).
 
     Parameters
     ----------
@@ -189,6 +191,12 @@ def drs_path(root: Path, record: DatasetRecord, filename: str) -> Path:
     if era.upper() == "CMIP5":
         native = _scalar(record.raw.get("instance_id")) or record.instance_key
         parts = [segment for segment in native.split(".") if segment]
+        return root.joinpath(*parts, filename)
+    if era.upper() == "CMIP7":
+        # The STAC feature id is the versioned CMIP7 DRS (`MIP-DRS7.CMIP7.<activity>.
+        # <institution>.<source>.<experiment>.<variant>.<region>.<frequency>.<variable>.
+        # <branding_suffix>.<grid>.vVERSION`); its dotted segments are the tree.
+        parts = [segment for segment in record.instance_key.split(".") if segment]
         return root.joinpath(*parts, filename)
     activity = (
         _scalar(record.raw.get("activity_drs"))

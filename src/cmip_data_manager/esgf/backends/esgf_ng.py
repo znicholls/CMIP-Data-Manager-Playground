@@ -40,6 +40,7 @@ from cmip_data_manager.esgf.backends.base import (
     Page,
     UnsupportedOnBackend,
 )
+from cmip_data_manager.esgf.eras import CMIP6_PROFILE, EraProfile
 from cmip_data_manager.esgf.models import DatasetRecord, FileRecord
 from cmip_data_manager.esgf.query import FacetQuery
 
@@ -104,6 +105,15 @@ class EsgfNgBackend:
     lowercase_collection: bool = False
     """Lower-case the `collections=` value (west's collection ids are lower-case)."""
 
+    era: EraProfile = CMIP6_PROFILE
+    """The MIP era this backend is bound to (default `CMIP6_PROFILE`).
+
+    The STAC dialect needs no facet-name translation — the collection prefix in the
+    item properties already carries canonical names — so the profile is used only to
+    **stamp `mip_era`** on each parsed record (`"CMIP7"` for a CMIP7 search), which the
+    STAC feature itself does not spell in a column the record reads.  The collection
+    selector still comes from the query's `project`, independent of this."""
+
     supports_file_search: bool = False
     """No file search: a STAC item carries its files as `assets` (see `search_files`,
     which raises `UnsupportedOnBackend`).  Left `False`; not meant to be overridden."""
@@ -147,8 +157,10 @@ class EsgfNgBackend:
         return [doc]
 
     def parse_dataset(self, doc: dict[str, Any]) -> DatasetRecord:
-        """Turn one STAC feature into a `DatasetRecord` (raw kept verbatim)."""
-        return DatasetRecord.from_stac(doc)
+        """Turn one STAC feature into a `DatasetRecord` (raw verbatim, era stamped)."""
+        return DatasetRecord.from_stac(doc).model_copy(
+            update={"mip_era": self.era.mip_era}
+        )
 
     def parse_file(self, doc: dict[str, Any]) -> FileRecord:
         """File records come from item `assets`, not a file search (a later step)."""

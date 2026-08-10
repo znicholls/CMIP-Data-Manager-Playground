@@ -8,6 +8,7 @@ from cmip_data_manager.esgf.backends.base import Flavour
 from cmip_data_manager.esgf.eras import (
     CMIP5_PROFILE,
     CMIP6_PROFILE,
+    CMIP7_PROFILE,
     ERA_PROFILES,
     get_profile,
 )
@@ -96,7 +97,25 @@ def test_cmip5_reconstructs_ids_cmip6_does_not():
 def test_get_profile_and_registry():
     assert get_profile("CMIP5") is CMIP5_PROFILE
     assert get_profile("CMIP6") is CMIP6_PROFILE
-    assert set(ERA_PROFILES) == {"CMIP5", "CMIP6"}
+    assert get_profile("CMIP7") is CMIP7_PROFILE
+    assert set(ERA_PROFILES) == {"CMIP5", "CMIP6", "CMIP7"}
+
+
+def test_cmip7_is_esgf_ng_only_and_needs_no_name_translation():
+    # CMIP7 is served only over ESGF-NG (STAC); never over ESGF1/Solr.
+    assert CMIP7_PROFILE.supported_flavours == frozenset(
+        {Flavour.ESGF_NG_EAST, Flavour.ESGF_NG_WEST}
+    )
+    assert Flavour.ESGF1 not in CMIP7_PROFILE.supported_flavours
+    # The STAC properties already carry canonical names, so the field map is identity
+    # and the ids need no reconstruction.
+    assert CMIP7_PROFILE.field_map == {}
+    assert CMIP7_PROFILE.reconstruct is None
+    assert CMIP7_PROFILE.multi_variable is False
+    # table_id has no CMIP7 equivalent (branding suffix takes its column) ...
+    assert "table_id" in CMIP7_PROFILE.absent_facets
+    # ... and parents are read from the record first (no header round-trip).
+    assert CMIP7_PROFILE.parent_strategy[0] == "record"
 
 
 def test_get_profile_unknown_era_raises_with_help():

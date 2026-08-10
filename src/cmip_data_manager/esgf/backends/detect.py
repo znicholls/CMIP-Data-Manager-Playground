@@ -176,9 +176,10 @@ def backend_for(flavour: Flavour, *, era: EraProfile = CMIP6_PROFILE) -> SearchB
         The dialect an endpoint speaks.
 
     era
-        The MIP-era profile to bind to the backend (defaults to `CMIP6_PROFILE`).  Only
-        the ESGF1 backend is era-aware; the ESGF-NG backends take their collection from
-        the query's `project`.
+        The MIP-era profile to bind to the backend (defaults to `CMIP6_PROFILE`).  The
+        ESGF-NG backends take their collection from the query's `project` and need no
+        facet-name translation, but still carry the era to **stamp `mip_era`** on each
+        record (so a CMIP7 STAC search is tagged `"CMIP7"`).
 
     Returns
     -------
@@ -189,15 +190,16 @@ def backend_for(flavour: Flavour, *, era: EraProfile = CMIP6_PROFILE) -> SearchB
     Raises
     ------
     UnsupportedOnBackend
-        If `flavour` is not one the era can be served over (e.g. CMIP5 on ESGF-NG).
+        If `flavour` is not one the era can be served over (e.g. CMIP5 on ESGF-NG, or
+        CMIP7 on ESGF1).
     """
     if flavour not in era.supported_flavours:
         raise UnsupportedOnBackend(f"mip_era={era.mip_era}", flavour)
     if flavour is Flavour.ESGF1:
         return Esgf1Backend(era=era)
     if flavour is Flavour.ESGF_NG_WEST:
-        return EsgfNgBackend(flavour=flavour, lowercase_collection=True)
-    return EsgfNgBackend(flavour=Flavour.ESGF_NG_EAST)
+        return EsgfNgBackend(flavour=flavour, lowercase_collection=True, era=era)
+    return EsgfNgBackend(flavour=Flavour.ESGF_NG_EAST, era=era)
 
 
 def resolve_backend(  # noqa: PLR0913 - a DI seam; every parameter has a default

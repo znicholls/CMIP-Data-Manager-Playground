@@ -36,6 +36,7 @@ from sqlmodel import Session, col, select
 
 from cmip_data_manager.db.schema import (
     Cmip5VersionExtra,
+    Cmip7VersionExtra,
     DataNodeHealthStat,
     Dataset,
     DatasetChange,
@@ -54,6 +55,7 @@ from cmip_data_manager.db.schema import (
     version_ordinal,
 )
 from cmip_data_manager.esgf.cmip5 import cmip5_extra_fields
+from cmip_data_manager.esgf.cmip7 import cmip7_extra_fields
 from cmip_data_manager.esgf.download_health import DownloadNodeHealth, DownloadStat
 from cmip_data_manager.esgf.eras import get_profile
 from cmip_data_manager.esgf.headers import (
@@ -1655,6 +1657,21 @@ class Repository:
             session.add(existing)
         if records[0].mip_era == "CMIP5":
             self._upsert_cmip5_extra(session, version_id, records[0])
+        elif records[0].mip_era == "CMIP7":
+            self._upsert_cmip7_extra(session, version_id, records[0])
+
+    def _upsert_cmip7_extra(
+        self, session: Session, version_id: str, record: DatasetRecord
+    ) -> None:
+        """Upsert the CMIP7-only side row (branding suffix, labels, region, licence)."""
+        fields = cmip7_extra_fields(record)
+        existing = session.get(Cmip7VersionExtra, version_id)
+        if existing is None:
+            session.add(Cmip7VersionExtra(version_key=version_id, **fields))
+            return
+        for key, value in fields.items():
+            setattr(existing, key, value)
+        session.add(existing)
 
     def _upsert_cmip5_extra(
         self, session: Session, version_id: str, record: DatasetRecord

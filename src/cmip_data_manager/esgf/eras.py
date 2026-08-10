@@ -349,8 +349,33 @@ CMIP5_PROFILE = EraProfile(
 """CMIP5: ESGF1-only, CMIP5-native names, id reconstruction, override-led parents."""
 
 
+CMIP7_PROFILE = EraProfile(
+    mip_era="CMIP7",
+    project_facet="CMIP7",
+    # CMIP7 is served only over ESGF-NG (STAC); there is no CMIP7-on-ESGF1.
+    supported_flavours=frozenset({Flavour.ESGF_NG_EAST, Flavour.ESGF_NG_WEST}),
+    # No name translation: the STAC properties already use the canonical (CMIP6) facet
+    # names under the collection prefix (`cmip7:source_id`), which `from_stac` strips.
+    # (`field_map` only drives the ESGF1/Solr backend, which CMIP7 never uses.)
+    field_map={},
+    # CMIP7 drops `table_id` — variable identity is the branding suffix
+    # (`variable_branding_suffix`), which `from_stac` folds into the `table_id` column —
+    # and has no sub-experiment concept.
+    absent_facets=frozenset({"table_id", "sub_experiment_id"}),
+    # Parent metadata is carried in the STAC item properties (`cmip7:parent_*`), so it
+    # is read straight from the search record with **no** file-header round-trip; the
+    # `header`/`override` layers remain as fallbacks for the (deferred) parent walk.
+    parent_strategy=("record", "header", "override"),
+    reconstruct=None,
+    multi_variable=False,
+)
+"""CMIP7: ESGF-NG-only, CMIP6-identical names, branding-suffix variable identity,
+record-carried parents."""
+
+
 ERA_PROFILES: dict[str, EraProfile] = {
-    profile.mip_era: profile for profile in (CMIP5_PROFILE, CMIP6_PROFILE)
+    profile.mip_era: profile
+    for profile in (CMIP5_PROFILE, CMIP6_PROFILE, CMIP7_PROFILE)
 }
 """Registry of known era profiles, keyed by `mip_era`."""
 
@@ -391,6 +416,7 @@ __all__ = [
     "CANONICAL_FACETS",
     "CMIP5_PROFILE",
     "CMIP6_PROFILE",
+    "CMIP7_PROFILE",
     "ERA_PROFILES",
     "EraProfile",
     "get_profile",
